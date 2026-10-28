@@ -43,6 +43,8 @@ packages = ["src/cfdagent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/unit"]
+# Tests bind-mounted into the Docker image must import /work/src, not the copy installed in the image.
+pythonpath = ["src"]
 markers = [
     "integration: tests that need external tools (Docker, OpenFOAM, Gmsh) or services",
     "e2e: end-to-end runs of the full pipeline",

@@ -69,14 +69,29 @@ The main session coordinates: it plans, delegates, and makes sure nothing merges
 ```bash
 uv sync                                              # create the environment
 uv run pytest                                        # unit tests (default: tests/unit)
-uv run pytest -m integration                         # integration tests (need the image)
 uv run ruff check . && uv run ruff format --check .  # lint and format check
 uv run pre-commit run --all-files                    # ruff, gitleaks, line endings
 
-docker build -f docker/Dockerfile -t cfdagent:dev .  # build the image
-# run integration tests inside the image (repository mounted at /work)
-docker run --rm -v "$PWD":/work -w /work cfdagent:dev python -m pytest -m integration tests/integration
+docker build -f docker/Dockerfile -t cfdagent:dev .  # build the image (OpenFOAM ESI, Gmsh, CadQuery, PyVista)
+# integration tests run inside the image, with the repository bind-mounted at /work
+docker run --rm -v "$PWD:/work" -w /work cfdagent:dev pytest -m integration tests/integration
 ```
+
+Integration tests need the image; on the host `uv run pytest -m integration` collects nothing (default `testpaths` is `tests/unit`), and `tests/integration` is skipped there because `WM_PROJECT_VERSION` is unset.
+
+**Docker on the Windows laptop.** The command above works as written in PowerShell with `$PWD` written as `${PWD}`:
+
+```powershell
+docker run --rm -v "${PWD}:/work" -w /work cfdagent:dev pytest -m integration tests/integration
+```
+
+In Git Bash, MSYS rewrites `/work` into `C:/Program Files/Git/work` and Docker rejects the working directory. Prefix the command with `MSYS_NO_PATHCONV=1` (or `export MSYS_NO_PATHCONV=1` once per shell):
+
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/work" -w /work cfdagent:dev pytest -m integration tests/integration
+```
+
+Image notes: OpenFOAM ESI is sourced for `docker run <image> <cmd>` (entrypoint), `docker exec ... bash -c` (`BASH_ENV`) and interactive shells. The container user is `cfd` (uid 1000); the bind-mounted repository may belong to another uid (GitHub runner 1001), so tests must write only to pytest's `tmp_path`, never into `/work`. `cfdagent` is also installed in the image, but pytest puts `/work/src` first (`pythonpath = ["src"]`), so mounted sources win. PyVista renders off-screen through EGL (Mesa software rasteriser); no X server or GPU is needed.
 
 On the Windows laptop Azure CLI is not on PATH: `C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd`. Every `az` call triggers a permission prompt (safety net); read-only calls are fine, and anything that creates, changes or deletes resources needs the owner's explicit chat approval first.
 
