@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "cfd-agent"
+type: software
+authors:
+  - alias: mkrajew
+license: MIT
+repository-code: "https://github.com/mkrajew/cfd-agent"
+version: 0.0.1

@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cfd-agent"
+version = "0.0.1"
+description = "LLM agents that run full CFD simulations (CadQuery, Gmsh, OpenFOAM) from a plain-language task."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "pydantic>=2",
+    "numpy",
+    "typer",
+    "openai",
+    "azure-identity",
+    "azure-storage-blob",
+]
+
+[project.optional-dependencies]
+# Installed in the Docker image; not required on the host.
+toolchain = [
+    "cadquery",
+    "gmsh",
+    "pyvista",
+    "matplotlib",
+]
+
+[project.urls]
+Repository = "https://github.com/mkrajew/cfd-agent"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+    "pre-commit",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cfdagent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]
+markers = [
+    "integration: tests that need external tools (Docker, OpenFOAM, Gmsh) or services",
+    "e2e: end-to-end runs of the full pipeline",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

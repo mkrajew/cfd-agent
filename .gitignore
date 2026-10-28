@@ -1,0 +1,21 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# Secrets
+.env
+
+# CFD run outputs
+runs/
+*.msh
+postProcessing/
+processor*/
+
+# Local scratch workspace (never commit)
+.superpowers/
