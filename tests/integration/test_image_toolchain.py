@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import subprocess
 import sys
 
 import pytest
@@ -39,10 +40,17 @@ def test_python_toolchain_imports():
     assert sys.version_info[:2] == (3, 12)
 
 
-def test_cfdagent_installed_in_image():
-    import cfdagent
-
-    assert cfdagent.__version__
+def test_cfdagent_installed_in_image(tmp_path):
+    # pytest puts the mounted /work/src first (pythonpath), so check in a clean interpreter:
+    # -I ignores PYTHONPATH and the current directory, tmp_path is outside the repository.
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", "import cfdagent; print(cfdagent.__file__)"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.strip().startswith("/opt/venv/"), result.stdout
 
 
 def test_runs_as_non_root():
