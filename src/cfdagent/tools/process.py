@@ -29,6 +29,7 @@ ALLOWED_EXECUTABLES: frozenset[str] = frozenset(
         "reconstructPar",
         "postProcess",
         "foamListTimes",
+        "mpirun",
     }
 )
 

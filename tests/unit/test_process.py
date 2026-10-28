@@ -39,6 +39,7 @@ def test_allowlist_contents():
             "reconstructPar",
             "postProcess",
             "foamListTimes",
+            "mpirun",
         }
     )
 
