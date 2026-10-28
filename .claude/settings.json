@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run:*)",
+      "Bash(docker build:*)",
+      "Bash(docker run:*)",
+      "Bash(git:*)"
+    ],
+    "ask": [
+      "Bash(git push:*)",
+      "Bash(az *create*)",
+      "Bash(az *deploy*)",
+      "Bash(az *delete*)",
+      "Bash(az *update*)",
+      "Bash(az *start*)",
+      "Bash(*az.cmd *create*)",
+      "Bash(*az.cmd *deploy*)",
+      "Bash(*az.cmd *delete*)",
+      "Bash(*az.cmd *update*)",
+      "Bash(*az.cmd *start*)"
+    ],
+    "deny": []
+  }
+}
