@@ -1,5 +1,6 @@
 import json
 import re
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -38,14 +39,71 @@ def test_all_agents_defined_with_frontmatter():
         assert "model" not in fm
 
 
-def test_settings_json_guards_azure_and_push():
+def _rules(kind: str) -> list[tuple[str, str]]:
+    """Return (tool, pattern) pairs for one permission list of .claude/settings.json."""
     settings = json.loads((REPO_ROOT / ".claude" / "settings.json").read_text(encoding="utf-8"))
-    perms = settings["permissions"]
-    assert "Bash(uv run:*)" in perms["allow"]
-    assert "Bash(git push:*)" in perms["ask"]
-    assert not any("git push" in rule for rule in perms["allow"])
-    for verb in ("create", "deploy", "delete", "update", "start"):
-        assert any("az " in rule and verb in rule for rule in perms["ask"]), verb
+    rules = []
+    for rule in settings["permissions"][kind]:
+        match = re.fullmatch(r"(\w+)\((.*)\)", rule)
+        assert match, rule
+        rules.append((match.group(1), match.group(2)))
+    return rules
+
+
+def _matches(kind: str, tool: str, command: str) -> bool:
+    """Simulate wildcard matching of a command against the rules of one permission list."""
+    return any(t == tool and fnmatchcase(command, pat) for t, pat in _rules(kind))
+
+
+AZ_CMD = r'"C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd" vm create'
+PUSH_COMMANDS = ["git push", "git push origin main", "git -C /x push origin main"]
+AZ_COMMANDS = ["az vm create -g x", AZ_CMD, "az deployment group what-if -g x", f"& {AZ_CMD}"]
+
+
+def test_no_allow_rule_matches_git_push():
+    for tool in ("Bash", "PowerShell"):
+        for command in PUSH_COMMANDS:
+            assert not _matches("allow", tool, command), (tool, command)
+            assert _matches("ask", tool, command), (tool, command)
+
+
+def test_every_az_invocation_asks_and_is_never_allowed():
+    for command in AZ_COMMANDS:
+        assert _matches("ask", "Bash", command), command
+        assert not _matches("allow", "Bash", command), command
+    assert _matches("ask", "PowerShell", f"& {AZ_CMD}")
+    assert _matches("ask", "PowerShell", "az vm create -g x")
+
+
+def test_project_commands_are_allowed():
+    for tool in ("Bash", "PowerShell"):
+        for command in (
+            "uv run pytest",
+            "docker build -f docker/Dockerfile -t cfdagent:dev .",
+            "docker run --rm -v /w:/work cfdagent:dev python -m pytest",
+            "git status",
+            "git commit -m x",
+        ):
+            assert _matches("allow", tool, command), (tool, command)
+    assert not _matches("allow", "Bash", "docker run --rm alpine sh")
+    assert not _matches("allow", "Bash", "git config user.name x")
+
+
+def test_dangerous_commands_are_denied():
+    denied = [
+        "docker run --rm --privileged cfdagent:dev sh",
+        "docker run -v /var/run/docker.sock:/s cfdagent:dev sh",
+        "docker run --network host cfdagent:dev sh",
+        "docker build --push -t x .",
+        "git reset --hard HEAD~1",
+        "git clean -fd",
+        "git config user.name x",
+        "git commit --no-verify -m x",
+    ]
+    for tool in ("Bash", "PowerShell"):
+        for command in denied:
+            assert _matches("deny", tool, command), (tool, command)
+    assert any("--privileged" in pat for _, pat in _rules("deny"))
 
 
 def test_journal_entries_follow_format():

@@ -4,9 +4,9 @@ Rules for anything under `infra/`: Bicep, VM scripts, budget and shutdown policy
 
 ## Approval rule
 
-**No Azure resource is created, changed, started or deleted without the owner's explicit approval in chat.** Commands containing `create`, `deploy`, `delete`, `update` or `start` ask for permission in `.claude/settings.json`; approving a prompt is not a substitute for asking the owner first. Read-only commands (`list`, `show`, `what-if`, `validate`) are fine.
+**Creating, changing or deleting Azure resources always needs the owner's explicit approval in chat first.** Every `az` invocation triggers a permission prompt in `.claude/settings.json`; that prompt is a safety net that the owner answers, not a substitute for asking first. Read-only commands (`list`, `show`, `what-if`, `validate`) are fine.
 
-Inside an approved spending envelope, VM start/stop and running tests or benchmarks need no per-action approval. Creating or changing resources, and any campaign estimated above $5, always need approval.
+Inside an owner-approved spending envelope, starting, stopping or deallocating the project VM and running tests or benchmarks need no extra chat approval. Creating, changing or deleting resources, and any campaign estimated above $5, always need explicit chat approval first.
 
 ## Subscription limits (verified 2026-10-27)
 

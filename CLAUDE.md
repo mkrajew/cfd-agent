@@ -41,7 +41,7 @@ Where to look in the design: constraints section 3, pipeline and gates 6.2, clou
 1. **TDD.** Write a failing test first, watch it fail, implement, watch it pass. Unit tests use no real LLM and cost nothing.
 2. **PR flow.** Conventional commits (`feat:`, `fix:`, `docs:`, `chore:`, `infra:`), branches `feat/...`, `fix/...`, `infra/...`, `docs/...`. Every task lands as a pull request with a description (what, why, how verified, Azure cost impact) and green CI. **The owner merges**; never merge or push to `main` yourself once branch protection exists. Do not push without being asked. Commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`; PR descriptions end with `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
 3. **Review before PR.** Run `code-reviewer` on the diff (with the spec only, not your reasoning). Prompt, knowledge-note and tool-code changes also need `cfd-reviewer`. A `changes` or `reject` verdict blocks the PR.
-4. **No Azure spending without approval.** Never create, change, start or delete an Azure resource without the owner's explicit approval in chat. Approved envelope for M0-M2 is at most $30; inside it, VM start/stop and running tests or benchmarks need no per-action approval. Any campaign estimated above $5 needs approval. Every infra change comes with a cost estimate.
+4. **No Azure spending without approval.** Creating, changing or deleting Azure resources, and any campaign estimated above $5, always needs the owner's explicit approval in chat first. Inside an owner-approved spending envelope (M0-M2: at most $30), starting, stopping or deallocating the project VM and running tests or benchmarks need no extra chat approval; the permission prompt from `.claude/settings.json` is a safety net that the owner answers. Every infra change comes with a cost estimate.
 5. **No secrets.** No keys, tokens, passwords, subscription IDs, IP addresses or e-mail addresses in the repository. Parameters that need them read environment variables. Authentication is keyless (managed identity, Entra ID). gitleaks runs in pre-commit.
 6. **Generality rule.** Prompts, knowledge notes and tool code contain only general CFD/OpenFOAM knowledge, never anything specific to a test case. Tool code in `src/` must not mention cavity, pipe or cylinder. Improvements found while debugging are phrased as general rules. Case-specific content lives only in `benchmarks/` and `tests/fixtures/`. `cfd-reviewer` blocks violations.
 7. **Blind evaluation.** Agents must never be able to read `benchmarks/` reference data or acceptance criteria during a run. In M0 keep them out of `src/cfdagent/knowledge/`.
@@ -78,7 +78,7 @@ docker build -f docker/Dockerfile -t cfdagent:dev .  # build the image
 docker run --rm -v "$PWD":/work -w /work cfdagent:dev python -m pytest -m integration tests/integration
 ```
 
-On the Windows laptop Azure CLI is not on PATH: `C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd`. Only read-only `az` commands may be run without the owner's approval.
+On the Windows laptop Azure CLI is not on PATH: `C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd`. Every `az` call triggers a permission prompt (safety net); read-only calls are fine, and anything that creates, changes or deletes resources needs the owner's explicit chat approval first.
 
 ## Session routine
 
