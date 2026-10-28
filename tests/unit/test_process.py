@@ -1,6 +1,7 @@
 """Allowlisted tool runner: no shell, one merged log file, timeouts."""
 
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -73,6 +74,24 @@ def test_runs_in_cwd(tmp_path):
     code = "import os; print(os.getcwd())"
     result = run_tool(["python", "-c", code], cwd=tmp_path, log_path=tmp_path / "log.txt")
     assert tmp_path.name in result.tail
+
+
+def test_pwd_environment_follows_cwd(tmp_path, monkeypatch):
+    # OpenFOAM utilities warn "PWD is not the cwd()" when the inherited PWD is stale.
+    monkeypatch.setenv("PWD", "/somewhere/else")
+    code = "import os; print('PWD=' + os.environ['PWD'])"
+    result = run_tool(["python", "-c", code], cwd=tmp_path, log_path=tmp_path / "log.txt")
+    assert f"PWD={tmp_path}" in result.tail
+
+
+def test_relative_cwd_is_resolved(tmp_path, monkeypatch):
+    (tmp_path / "sub").mkdir()
+    monkeypatch.chdir(tmp_path)
+    code = "import os; print('PWD=' + os.environ['PWD']); print('CWD=' + os.getcwd())"
+    result = run_tool(["python", "-c", code], cwd=Path("sub"), log_path=tmp_path / "log.txt")
+    expected = (tmp_path / "sub").resolve()
+    assert f"PWD={expected}" in result.tail
+    assert f"CWD={expected}" in result.tail
 
 
 def test_nonzero_exit_is_not_ok(tmp_path):

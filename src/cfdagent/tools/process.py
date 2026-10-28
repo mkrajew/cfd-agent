@@ -96,6 +96,7 @@ def run_tool(
             f"executable {name!r} is not allowed; allowed: {sorted(ALLOWED_EXECUTABLES)}"
         )
 
+    cwd = Path(cwd).resolve()
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -118,6 +119,8 @@ def run_tool(
         proc = subprocess.Popen(
             [exe, *argv[1:]],
             cwd=cwd,
+            # A shell updates PWD on cd; without this OpenFOAM utilities warn about a stale PWD.
+            env={**os.environ, "PWD": str(cwd)},
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,
