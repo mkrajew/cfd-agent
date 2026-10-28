@@ -155,6 +155,29 @@ def test_criterion_validation_rules():
         )
 
 
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf"), float("nan")])
+def test_criterion_rejects_non_finite_config_values(bad):
+    # Non-finite config values would make a criterion fail open (e.g. threshold=inf always passes).
+    with pytest.raises(ValidationError):
+        scalar_criterion(threshold=bad)
+    with pytest.raises(ValidationError):
+        scalar_criterion(normalise_by=bad)
+    with pytest.raises(ValidationError):
+        scalar_criterion(reference_value=bad)
+    with pytest.raises(ValidationError):
+        profile_criterion(threshold=bad)
+    with pytest.raises(ValidationError):
+        profile_criterion(normalise_by=bad)
+    with pytest.raises(ValidationError):
+        scalar_criterion(
+            metric="in_range", threshold=None, reference_value=None, reference_range=(0.1, bad)
+        )
+    with pytest.raises(ValidationError):
+        scalar_criterion(
+            metric="in_range", threshold=None, reference_value=None, reference_range=(bad, 0.2)
+        )
+
+
 # --------------------------------------------------------------------------- score
 
 
@@ -410,3 +433,18 @@ def test_load_registry_rejects_duplicate_ids(tmp_path):
 def test_load_registry_missing_root_directory_raises(tmp_path):
     with pytest.raises(RegistryError, match="does not exist"):
         load_registry(tmp_path / "nope")
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ("threshold = 0.1", "threshold = inf"),
+        ("normalise_by = 2.0", "normalise_by = inf"),
+        ("reference_range = [1.0, 2.0]", "reference_range = [1.0, nan]"),
+    ],
+)
+def test_load_registry_rejects_non_finite_values(tmp_path, old, new):
+    directory = write_benchmark(tmp_path, "alpha")
+    edit_toml(directory, old, new)
+    with pytest.raises(RegistryError, match="alpha"):
+        load_registry(tmp_path)

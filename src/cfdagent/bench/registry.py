@@ -27,7 +27,7 @@ class RegistryError(ValueError):
 class Criterion(BaseModel):
     """One acceptance criterion: a simulated quantity compared with reference data."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     quantity: str  # key in quantities.json
     kind: Literal["profile", "scalar"]
