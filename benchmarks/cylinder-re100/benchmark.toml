@@ -1,0 +1,22 @@
+id = "cylinder-re100"
+family = "cylinder-crossflow"
+task_file = "task.md"
+citation = "Unsteady 2D flow past an isolated circular cylinder in an unbounded stream, Re = U*D/nu = 100 (periodic vortex shedding). Strouhal number: Williamson, C. H. K. (1988), Phys. Fluids 31(10), 2742-2744 and (1989), J. Fluid Mech. 206, 579-627, parallel-shedding fit St = -3.3265/Re + 0.1816 + 1.6e-4*Re = 0.1643; Park, J., Kwon, K. and Choi, H. (1998), KSME Int. J. 12(6), 1200-1205 (0.165). Time-mean drag coefficient: Park et al. (1998) 1.33; other converged 2D computations on large domains give 1.325-1.34. Values were taken from secondary comparison tables, not from the original papers."
+
+# St: literature 0.164-0.166, widened by 0.004 (about 2.5%) for the finite record length of the
+# shedding signal and a small residual blockage. Passes if 0.160 <= St <= 0.170.
+# Reference mean Cd = 1.34 (large-domain 2D results 1.325-1.34); the threshold 0.05 covers
+# 1.27-1.41, which also contains the experimental values of about 1.39-1.40 quoted in the literature.
+
+[[criteria]]
+quantity = "strouhal"
+kind = "scalar"
+metric = "in_range"
+reference_range = [0.160, 0.170]
+
+[[criteria]]
+quantity = "cd_mean"
+kind = "scalar"
+metric = "rel_error"
+threshold = 0.05
+reference_value = 1.34
