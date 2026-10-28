@@ -1,0 +1,37 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volVectorField;
+    object      U;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// Initial condition: fluid at rest; the lid starts the flow impulsively at t = 0.
+dimensions      [0 1 -1 0 0 0 0];
+
+internalField   uniform (0 0 0);
+
+boundaryField
+{
+    // Lid: moves in its own plane in +x at the lid speed (1 m/s).
+    movingWall
+    {
+        type            fixedValue;
+        value           uniform (1 0 0);
+    }
+
+    // The other three walls: no-slip, at rest.
+    fixedWalls
+    {
+        type            noSlip;
+    }
+
+    // One cell in z: the 2D case has no flow through the front and back planes.
+    frontAndBack
+    {
+        type            empty;
+    }
+}
+
+// ************************************************************************* //

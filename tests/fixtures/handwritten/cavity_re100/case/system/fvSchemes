@@ -1,0 +1,47 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      fvSchemes;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// First-order implicit Euler in time: only the steady state matters here, and at steady state
+// the time discretisation error vanishes.
+ddtSchemes
+{
+    default         Euler;
+}
+
+gradSchemes
+{
+    default         Gauss linear;
+    grad(p)         Gauss linear;
+}
+
+// Central differencing (second order). Allowed because the cell Reynolds number is below 2
+// (see deltaT in controlDict), so it does not oscillate.
+divSchemes
+{
+    default         none;
+    div(phi,U)      Gauss linear;
+}
+
+// The mesh is a uniform orthogonal grid: no non-orthogonal correction is needed.
+laplacianSchemes
+{
+    default         Gauss linear orthogonal;
+}
+
+interpolationSchemes
+{
+    default         linear;
+}
+
+snGradSchemes
+{
+    default         orthogonal;
+}
+
+// ************************************************************************* //
