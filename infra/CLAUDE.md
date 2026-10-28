@@ -29,7 +29,7 @@ Inside an owner-approved spending envelope, starting, stopping or deallocating t
 
 ## Cost estimate rule
 
-Every infra change is accompanied by a cost estimate in the commit or PR description: hourly and monthly cost of each new or changed resource, taken from the Azure retail price API (`italynorth`), and its effect on the envelope.
+Every infra change is accompanied by a cost estimate in the commit or PR description: hourly and monthly cost of each new or changed resource, taken from the Azure retail price API for the resource's own region (VM, network and storage: `belgiumcentral`; AI Services: `italynorth`), and its effect on the envelope.
 
 Reference prices: VM `Standard_D4as_v4` (belgiumcentral) $0.208/h; `gpt-oss-120b` $0.15 per 1M input tokens and $0.60 per 1M output tokens.
 

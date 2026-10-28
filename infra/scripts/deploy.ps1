@@ -36,6 +36,17 @@ function Get-Az {
 }
 $az = Get-Az
 
+function Assert-SingleIPv4([string]$Value) {
+    # A single IPv4 address only: no CIDR, no wildcard, no service tag such as Internet.
+    $parsed = $null
+    if (-not [System.Net.IPAddress]::TryParse($Value, [ref]$parsed) -or
+        $parsed.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -or
+        $parsed.ToString() -ne $Value -or
+        $Value -eq '0.0.0.0') {
+        throw "Not a single public IPv4 address: '$Value'. SSH may only be opened to one address."
+    }
+}
+
 $infra = Split-Path -Parent $PSScriptRoot
 $template = Join-Path $infra 'main.bicep'
 $parameters = Join-Path $infra 'main.bicepparam'
@@ -46,6 +57,7 @@ if (-not $env:CFDAGENT_BUDGET_EMAIL) {
 if (-not $env:CFDAGENT_OWNER_IP) {
     $env:CFDAGENT_OWNER_IP = (Invoke-RestMethod -Uri 'https://api.ipify.org').Trim()
 }
+Assert-SingleIPv4 $env:CFDAGENT_OWNER_IP
 if (-not $env:CFDAGENT_SSH_PUBLIC_KEY) {
     $keyFile = Join-Path $HOME '.ssh\id_cfdagent.pub'
     $env:CFDAGENT_SSH_PUBLIC_KEY = (Get-Content -Raw $keyFile).Trim()

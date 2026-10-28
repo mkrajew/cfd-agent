@@ -11,7 +11,7 @@ owner's explicit approval**, and every change carries a cost estimate.
 | Resource group | `rg-cfdagent` in `italynorth` |
 | Network (`vmLocation`) | VNet `vnet-cfdagent`, NSG `nsg-cfdagent` (SSH 22 only from `ownerIp`), Standard static public IP `pip-cfdagent` |
 | VM (`vmLocation`) | `vm-cfdagent`, `Standard_D4as_v4` (4 vCPU, 16 GB), Ubuntu 24.04 LTS (Canonical `ubuntu-24_04-lts` / `server`, Gen2), SSH key only, system-assigned identity, 64 GiB StandardSSD_LRS OS disk |
-| Daily shutdown | systemd timer on the VM, 23:00 `Europe/Warsaw` (parameters `shutdownTime`, `shutdownTimeZone`) |
+| Daily shutdown | systemd timer on the VM, 23:00 `Europe/Warsaw` (parameters `shutdownTime`, `shutdownTimeZone`; applied only when the VM is created, see "Redeploying") |
 | Idle shutdown | systemd timer every 5 min; deallocates after 30 idle minutes (see below) |
 | Storage (`vmLocation`) | StorageV2, LRS, Hot, shared keys disabled, TLS 1.2, no public blob access, container `runs`, lifecycle: Cool after 30 days |
 | AI Services | account `cfdagent-ai-<hash>` (custom subdomain) with deployments `gpt-oss-120b` and `Llama-3.3-70B-Instruct` (GlobalStandard, pay per token) |
@@ -45,7 +45,7 @@ Outputs: `vmPublicIp`, `aiEndpoint` (OpenAI v1 base URL `https://<account>.servi
 
 | Variable | Meaning | `deploy.ps1` default |
 |---|---|---|
-| `CFDAGENT_OWNER_IP` | public IPv4 allowed to SSH | current address from `api.ipify.org` |
+| `CFDAGENT_OWNER_IP` | one public IPv4 address allowed to SSH (no CIDR, `*` or `Internet`; the NSG rule uses `<address>/32`; the scripts reject anything else) | current address from `api.ipify.org` |
 | `CFDAGENT_SSH_PUBLIC_KEY` | SSH public key of the admin user | contents of `~/.ssh/id_cfdagent.pub` |
 | `CFDAGENT_OWNER_OBJECT_ID` | owner's Entra object id | `az ad signed-in-user show --query id -o tsv` |
 | `CFDAGENT_BUDGET_EMAIL` | budget alert address | none, must be set |
@@ -87,6 +87,45 @@ The decision logic is tested without Azure by `tests/unit/test_idle_shutdown.py`
 stub commands (`who`, `ss`, `pgrep`, `docker`, `curl`, `wall`) first on `PATH`, plus `--dry-run`. The test is
 skipped on Windows and runs in CI and in the Linux image. `shellcheck infra/vm/*.sh` runs in CI and in
 pre-commit.
+
+`cfdagent-idle-shutdown --check` gets an IMDS token and reads the VM through ARM. It proves the identity, the
+role assignment and the network path without deallocating anything. Every deallocation (idle, `--force` from the
+daily timer) is tried 3 times with a growing pause; a failure is logged (`IMDS token failed (HTTP n)` or
+`ARM returned n: <body>`, never the token), the script exits non-zero and keeps its state, so the next timer run
+tries again. Read the log with `journalctl -u cfdagent-idle-shutdown -u cfdagent-daily-shutdown`.
+
+## Verifying a fresh deployment
+
+Over SSH on the VM (`ssh cfdagent`), after the first boot:
+
+```bash
+systemctl list-timers 'cfdagent-*'          # both timers listed with a next run time
+sudo cfdagent-idle-shutdown --dry-run       # prints the decision, no Azure call
+sudo cfdagent-idle-shutdown --check         # expects: check ok (role assignments may take a few minutes)
+docker image ls ghcr.io/mkrajew/cfd-agent   # pre-pulled image, if the package is public
+sudo tail -n 50 /var/log/cloud-init-output.log   # package install, timers, image pull
+cloud-init status --long
+```
+
+From the owner's machine: `az vm get-instance-view` shows the VM running,
+`ssh cfdagent docker run --rm ghcr.io/mkrajew/cfd-agent:latest icoFoam -help` works, and
+`az consumption budget show --budget-name budget-cfdagent` exists. Then `infra/scripts/vm-down.ps1` must end in
+`VM deallocated`.
+
+## Redeploying and tearing down
+
+- **`customData` is create-time.** cloud-init runs once and Azure does not allow changing `customData` on an existing
+  VM. A redeploy that changes `idle-shutdown.sh`, the units, `shutdownTime` or `shutdownTimeZone` therefore fails
+  or has no effect on the running VM. Either copy the new files over SSH (`scp`, then `sudo systemctl
+  daemon-reload && sudo systemctl restart cfdagent-*.timer`) or recreate the VM (delete it and its OS disk, then
+  deploy again; the static IP keeps its address if the IP resource is kept).
+- **Soft-deleted AI account.** Deleting the resource group soft-deletes the Cognitive Services account and keeps
+  its custom subdomain reserved. Before deploying again, purge it:
+  `az cognitiveservices account list-deleted`, then
+  `az cognitiveservices account purge --location italynorth --resource-group rg-cfdagent --name <account>`.
+  Otherwise the next deployment fails with a subdomain conflict. Deleting needs the owner's approval.
+- **Budget start date** defaults to the first day of the current month at deployment time, so a later redeploy moves
+  it to the new month.
 
 ## Cost estimate (Azure retail prices API, belgiumcentral, checked 2026-10-28)
 

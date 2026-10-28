@@ -28,7 +28,7 @@ param vmLocation string = 'belgiumcentral'
 @description('Resource group that holds everything except the budget.')
 param resourceGroupName string = 'rg-cfdagent'
 
-@description('Public IPv4 address (or CIDR) allowed to reach SSH. Passed at deploy time, never committed.')
+@description('Single public IPv4 address allowed to reach SSH (no CIDR, no keywords). The NSG rule uses ownerIp/32, so a value such as *, Internet or 0.0.0.0/0 produces an invalid prefix and is rejected. Passed at deploy time, never committed.')
 @minLength(7)
 param ownerIp string
 
@@ -101,8 +101,8 @@ param disableLocalAuth bool = false
 @description('Monthly budget in USD.')
 param budgetAmount int = 100
 
-@description('First day of the month in which the budget starts (yyyy-MM-dd).')
-param budgetStartDate string = '2026-10-01'
+@description('Start of the budget: the first day of the current month, computed at deployment time (a past start outside the current month is rejected by the Consumption API).')
+param budgetStartDate string = '${utcNow('yyyy-MM')}-01T00:00:00Z'
 
 var tags = {
   project: 'cfd-agent'

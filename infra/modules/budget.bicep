@@ -7,7 +7,7 @@ param budgetAmount int
 @description('Notification address. Passed at deploy time, never committed.')
 param budgetEmail string
 
-@description('First day of the month in which the budget starts (yyyy-MM-dd).')
+@description('First day of the current month, yyyy-MM-ddT00:00:00Z.')
 param startDate string
 
 var thresholds = [

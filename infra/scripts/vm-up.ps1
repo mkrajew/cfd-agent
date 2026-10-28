@@ -24,10 +24,22 @@ function Get-Az {
 }
 $az = Get-Az
 
+function Assert-SingleIPv4([string]$Value) {
+    # A single IPv4 address only: no CIDR, no wildcard, no service tag such as Internet.
+    $parsed = $null
+    if (-not [System.Net.IPAddress]::TryParse($Value, [ref]$parsed) -or
+        $parsed.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -or
+        $parsed.ToString() -ne $Value -or
+        $Value -eq '0.0.0.0') {
+        throw "Not a single public IPv4 address: '$Value'. SSH may only be opened to one address."
+    }
+}
+
 if ($UpdateIp) {
     $ip = (Invoke-RestMethod -Uri 'https://api.ipify.org').Trim()
+    Assert-SingleIPv4 $ip
     & $az network nsg rule update --resource-group $ResourceGroup --nsg-name nsg-cfdagent `
-        --name Allow-SSH-Owner --source-address-prefixes $ip --output none
+        --name Allow-SSH-Owner --source-address-prefixes "$ip/32" --output none
     if ($LASTEXITCODE -ne 0) { throw 'Updating the NSG rule failed.' }
     Write-Host "SSH rule now allows $ip"
 }

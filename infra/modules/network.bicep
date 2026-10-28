@@ -2,7 +2,7 @@
 param location string
 param tags object
 
-@description('Public IPv4 address (or CIDR) allowed to reach SSH.')
+@description('Single public IPv4 address allowed to reach SSH; the rule source is ownerIp/32.')
 param ownerIp string
 
 var vnetName = 'vnet-cfdagent'
@@ -24,7 +24,7 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
           direction: 'Inbound'
           access: 'Allow'
           protocol: 'Tcp'
-          sourceAddressPrefix: ownerIp
+          sourceAddressPrefix: '${ownerIp}/32'
           sourcePortRange: '*'
           destinationAddressPrefix: '*'
           destinationPortRange: '22'
