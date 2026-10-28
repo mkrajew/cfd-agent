@@ -1,6 +1,7 @@
 """Mesh stage and mesh gate: Gmsh script -> MSH 2.2 -> OpenFOAM polyMesh -> checkMesh gate."""
 
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -288,3 +289,135 @@ def test_stale_mesh_is_not_mistaken_for_output(tmp_path):
     script = tmp_path / "noop_mesh.py"
     script.write_text("pass\n", encoding="utf-8")
     assert not run_mesh_script(script, workdir).ok
+
+
+# --- long patch names, relative paths, tool failures, and the remaining gate conditions -----------
+
+
+def _copy_case(source: Path, tmp_path: Path) -> Path:
+    case_dir = tmp_path / "case"
+    shutil.copytree(source, case_dir)
+    return case_dir
+
+
+def _cavity_manifest_with(patches_extra=(), drop=()):
+    base = {
+        "movingWall": ("wall", [_plane("y", 1.0)]),
+        "fixedWalls": ("wall", [_plane("x", 0.0), _plane("x", 1.0), _plane("y", 0.0)]),
+        "frontAndBack": ("empty", [_plane("z", 0.0), _plane("z", 0.1)]),
+    }
+    patches = [
+        BoundaryPatch(name=n, type=t, locators=loc) for n, (t, loc) in base.items() if n not in drop
+    ]
+    return BoundaryManifest(dimensionality="2D", patches=patches + list(patches_extra))
+
+
+def test_long_patch_name_passes_gate(tmp_path):
+    """checkMesh abuts names of 20+ characters to the face count; the gate must not care."""
+    long_name = "fixedWallsWithALongName"  # 23 characters
+    assert len(long_name) >= 20
+    assert run_geometry_script(CAVITY / "geometry.py", tmp_path).ok
+    manifest_path = tmp_path / MANIFEST_FILE_NAME
+    manifest_path.write_text(
+        manifest_path.read_text(encoding="utf-8").replace("fixedWalls", long_name), encoding="utf-8"
+    )
+    assert run_mesh_script(CAVITY / "mesh.py", tmp_path).ok
+    case_dir = tmp_path / "case"
+    assert convert_to_foam(tmp_path / "mesh.msh", case_dir).ok
+    manifest = BoundaryManifest.from_file(manifest_path)
+    apply_patch_types(case_dir, manifest)
+    gate, report = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    assert gate.ok, gate.errors
+    assert report is not None
+    assert report.patches == {"movingWall": 64, long_name: 192, "frontAndBack": 2 * 64 * 64}
+
+
+def test_relative_case_dir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    manifest, case_dir = _make_case(CAVITY, Path("work"), CAVITY_BBOX)
+    assert not case_dir.is_absolute()
+    gate, report = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    assert gate.ok, gate.errors
+    assert report is not None and report.n_cells == 64 * 64
+    other = BoundaryManifest(
+        dimensionality="3D",
+        patches=[BoundaryPatch(name="fixedWalls", type="symmetry", locators=[_plane("x", 0.0)])],
+    )
+    apply_patch_types(case_dir, other)
+    assert _patch_value(case_dir.resolve(), "fixedWalls", "type") == "symmetry"
+
+
+def test_foamdictionary_failure_is_not_reported_as_absent_patch(cavity, tmp_path):
+    _, source = cavity
+    case_dir = _copy_case(source, tmp_path)
+    boundary = case_dir / "constant" / "polyMesh" / "boundary"
+    boundary.write_text("this is { not a ( boundary file", encoding="utf-8")
+    manifest = _cavity_manifest_with()
+    with pytest.raises(MeshError) as exc:
+        apply_patch_types(case_dir, manifest)
+    assert "not in" not in str(exc.value)
+    assert "foamDictionary" in str(exc.value)
+
+
+def test_check_mesh_rejects_failed_mesh_checks(cavity, tmp_path):
+    """Move one interior point of a copied polyMesh (as the failed-log fixture was made)."""
+    manifest, source = cavity
+    case_dir = _copy_case(source, tmp_path)
+    points = case_dir / "constant" / "polyMesh" / "points"
+    lines = points.read_text(encoding="utf-8").split("\n")
+    for i, line in enumerate(lines):
+        parts = line.strip("()").split()
+        if len(parts) == 3 and line.startswith("(") and line.endswith(")"):
+            x, y, z = map(float, parts)
+            if abs(x - 0.5) < 0.01 and abs(y - 0.5) < 0.01 and abs(z) < 1e-9:
+                lines[i] = f"({x + 0.2} {y + 0.2} {z})"
+                break
+    else:
+        pytest.fail("no interior point found in the polyMesh points file")
+    points.write_text("\n".join(lines), encoding="utf-8")
+
+    gate, report = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    assert not gate.ok
+    assert any("failed mesh check" in e for e in gate.errors)
+    assert report is not None and report.failed_checks >= 1
+
+
+def test_check_mesh_rejects_manifest_patch_missing_from_mesh(cavity):
+    _, case_dir = cavity
+    outlet = BoundaryPatch(name="outlet", type="patch", locators=[_plane("x", 1.0)])
+    gate, _ = check_mesh(case_dir, _cavity_manifest_with(patches_extra=[outlet]), CAVITY_BBOX)
+    assert not gate.ok
+    assert any("missing ['outlet']" in e for e in gate.errors)
+
+
+def test_check_mesh_rejects_mesh_patch_missing_from_manifest(cavity):
+    _, case_dir = cavity
+    gate, _ = check_mesh(case_dir, _cavity_manifest_with(drop={"fixedWalls"}), CAVITY_BBOX)
+    assert not gate.ok
+    assert any("unexpected ['fixedWalls']" in e for e in gate.errors)
+
+
+def test_check_mesh_rejects_zero_face_patch(cavity, tmp_path):
+    _, source = cavity
+    case_dir = _copy_case(source, tmp_path)
+    boundary = case_dir / "constant" / "polyMesh" / "boundary"
+    text = boundary.read_text(encoding="utf-8")
+    # A legal but empty patch appended after the last real one, starting at the last face.
+    last_face = max(
+        int(start) + int(n)
+        for n, start in re.findall(r"nFaces\s+(\d+);\s+startFace\s+(\d+);", text)
+    )
+    ghost = (
+        "    ghost\n    {\n        type patch;\n        nFaces 0;\n"
+        f"        startFace {last_face};\n    }}\n"
+    )
+    text = re.sub(r"^3(?=\s*(//.*)?\n\()", "4", text, count=1, flags=re.MULTILINE)
+    close = text.rindex("\n)")
+    boundary.write_text(text[: close + 1] + ghost + text[close + 1 :], encoding="utf-8")
+
+    ghost_patch = BoundaryPatch(name="ghost", type="patch", locators=[_plane("x", 0.0)])
+    manifest = _cavity_manifest_with(patches_extra=[ghost_patch])
+    gate, report = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    assert not gate.ok
+    assert any("'ghost' has 0 faces" in e for e in gate.errors)
+    assert report is not None and report.patches["ghost"] == 0

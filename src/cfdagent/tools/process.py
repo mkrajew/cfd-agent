@@ -96,6 +96,7 @@ def run_tool(
             f"executable {name!r} is not allowed; allowed: {sorted(ALLOWED_EXECUTABLES)}"
         )
 
+    cwd = Path(cwd).resolve()
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 

@@ -98,7 +98,10 @@ _ASPECT_RE = re.compile(rf"Max aspect ratio\s*=\s*({_NUMBER})", re.IGNORECASE)
 _FAILED_RE = re.compile(r"Failed (\d+) mesh checks?\.")
 _OK_RE = re.compile(r"^\s*Mesh OK\.", re.MULTILINE)
 _PATCH_HEADER_RE = re.compile(r"^\s*Patch\s+Faces\s+Points\b", re.MULTILINE)
+_BOUNDARY_COUNT_RE = re.compile(r"^\s*boundary patches:\s+(\d+)\s*$", re.MULTILINE)
 _PATCH_ROW_RE = re.compile(r"^\s+(\S+)\s+(\d+)\s+(\d+)\s+\S")
+# checkMesh prints the name in a 20-column field, so a longer name abuts the face count.
+_PATCH_ROW_ABUTTING_RE = re.compile(r"^\s+(\S*?\D)(\d+)\s+(\d+)\s+\S")
 
 
 def _last_float(regex: re.Pattern[str], text: str) -> float:
@@ -106,7 +109,13 @@ def _last_float(regex: re.Pattern[str], text: str) -> float:
     return float(matches[-1]) if matches else math.nan
 
 
-def _parse_patch_table(text: str) -> dict[str, int]:
+def _parse_patch_table(text: str, expected_rows: int) -> dict[str, int]:
+    """Read the patch topology table; the row count must equal ``expected_rows``.
+
+    A name of 20 or more characters that ends in a digit cannot be told apart from the face count
+    that follows it, so such a row may be split wrongly. ``check_mesh`` therefore takes patch names
+    and face counts from the ``boundary`` file instead of this table.
+    """
     header = _PATCH_HEADER_RE.search(text)
     if header is None:
         raise ValueError("not checkMesh output: no patch topology table found")
@@ -114,13 +123,18 @@ def _parse_patch_table(text: str) -> dict[str, int]:
     for line in text[header.end() :].splitlines()[1:]:
         if not line.strip():
             break
-        row = _PATCH_ROW_RE.match(line)
+        row = _PATCH_ROW_RE.match(line) or _PATCH_ROW_ABUTTING_RE.match(line)
         if row is None:
             break
         name = row.group(1)
         if name == '".*"':  # the summary row over all patches
             continue
         patches[name] = int(row.group(2))
+    if len(patches) != expected_rows:
+        raise ValueError(
+            f"checkMesh output lists {expected_rows} boundary patches but {len(patches)} rows "
+            "of the patch table could be read"
+        )
     return patches
 
 
@@ -140,7 +154,10 @@ def parse_checkmesh(log_text: str) -> CheckMeshReport:
     directions = _SOLUTION_DIRS_RE.search(log_text)
     if directions is None:
         raise ValueError("incomplete checkMesh output: no solution directions line")
-    patches = _parse_patch_table(log_text)
+    n_patches = _BOUNDARY_COUNT_RE.search(log_text)
+    if n_patches is None:
+        raise ValueError("incomplete checkMesh output: no 'boundary patches:' line")
+    patches = _parse_patch_table(log_text, int(n_patches.group(1)))
 
     failed = _FAILED_RE.search(log_text)
     if failed is not None:
@@ -254,6 +271,27 @@ def _boundary_file(case_dir: Path) -> Path:
     return Path(case_dir) / "constant" / "polyMesh" / "boundary"
 
 
+_PATCH_BLOCK_RE = re.compile(r"^\s*([^\s{}()]+)\s*\{([^{}]*)\}", re.MULTILINE)
+_NFACES_RE = re.compile(r"\bnFaces\s+(\d+)\s*;")
+
+
+def _read_boundary_patches(case_dir: Path) -> dict[str, int]:
+    """Patch name -> ``nFaces`` read from ``constant/polyMesh/boundary``, in file order."""
+    boundary = _boundary_file(case_dir)
+    try:
+        text = boundary.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise MeshError(f"{boundary} could not be read: {exc}") from exc
+    body = text.split("FoamFile", 1)[-1].split("}", 1)[-1]  # skip the FoamFile header block
+    patches: dict[str, int] = {}
+    for name, block in _PATCH_BLOCK_RE.findall(body):
+        n_faces = _NFACES_RE.search(block)
+        if n_faces is None:
+            raise MeshError(f"patch '{name}' in {boundary} has no nFaces entry")
+        patches[name] = int(n_faces.group(1))
+    return patches
+
+
 def _foam_dictionary(case_dir: Path, *args: str) -> ToolResult:
     return run_tool(
         ["foamDictionary", str(_boundary_file(case_dir)), *args],
@@ -264,11 +302,19 @@ def _foam_dictionary(case_dir: Path, *args: str) -> ToolResult:
 
 
 def _read_entry(case_dir: Path, entry: str) -> str | None:
-    """Entry value as printed by ``foamDictionary -value``; ``None`` if the entry is absent."""
+    """Entry value as printed by ``foamDictionary -value``; ``None`` if the entry is absent.
+
+    Any other foamDictionary failure (unreadable file, timeout, parse error) raises ``MeshError``
+    and is never reported as an absent entry.
+    """
     result = _foam_dictionary(case_dir, "-entry", entry, "-value")
+    log = result.log_path.read_text(encoding="utf-8", errors="replace")
     if not result.ok:
-        return None
-    return result.log_path.read_text(encoding="utf-8", errors="replace").strip()
+        if "Cannot find entry" in log:
+            return None
+        reason = "timed out" if result.timed_out else f"exited with code {result.returncode}"
+        raise MeshError(f"foamDictionary {reason} reading {entry}:\n{result.tail}")
+    return log.strip()
 
 
 def apply_patch_types(case_dir: Path, manifest: BoundaryManifest) -> None:
@@ -283,7 +329,7 @@ def apply_patch_types(case_dir: Path, manifest: BoundaryManifest) -> None:
     fails. Boundary patches that are not in the manifest (e.g. ``defaultFaces``) are not touched;
     ``check_mesh`` rejects them.
     """
-    case_dir = Path(case_dir)
+    case_dir = Path(case_dir).resolve()
     boundary = _boundary_file(case_dir)
     if not boundary.is_file():
         raise MeshError(f"{boundary} does not exist; run convert_to_foam first")
@@ -370,7 +416,7 @@ def check_mesh(
     Returns the gate result and the parsed report (``None`` if checkMesh did not run to a
     parseable end). The checkMesh output is kept in ``checkMesh.log`` in ``case_dir``.
     """
-    case_dir = Path(case_dir)
+    case_dir = Path(case_dir).resolve()
     if len(expected_bbox) != 6:
         return (
             GateResult(
@@ -391,7 +437,19 @@ def check_mesh(
             False, [f"checkMesh output could not be parsed ({exc}):\n{result.tail}"]
         ), None
 
+    # Patch names and face counts come from the boundary file: the checkMesh table cannot be read
+    # reliably for names of 20 or more characters.
+    try:
+        file_patches = _read_boundary_patches(case_dir)
+    except MeshError as exc:
+        return GateResult(False, [str(exc)]), report
     errors: list[str] = []
+    if len(file_patches) != len(report.patches):
+        errors.append(
+            f"checkMesh lists {len(report.patches)} boundary patches but the boundary file "
+            f"defines {len(file_patches)}"
+        )
+    report = dataclasses.replace(report, patches=file_patches)
 
     if report.failed_checks > 0:
         flagged = [ln.strip() for ln in log_text.splitlines() if ln.lstrip().startswith("***")]
@@ -431,7 +489,11 @@ def check_mesh(
     for patch in manifest.patches:
         if patch.name not in report.patches:
             continue  # already reported as a missing patch
-        actual_type = _read_entry(case_dir, f"entry0/{patch.name}/type")
+        try:
+            actual_type = _read_entry(case_dir, f"entry0/{patch.name}/type")
+        except MeshError as exc:
+            errors.append(f"patch type of '{patch.name}' could not be read: {exc}")
+            continue
         if actual_type != patch.type:
             errors.append(
                 f"patch '{patch.name}' has type {actual_type!r} in constant/polyMesh/boundary, "
