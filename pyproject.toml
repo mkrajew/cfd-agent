@@ -51,6 +51,8 @@ markers = [
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]
+# Ruff 0.17 also formats Python blocks inside Markdown; keep it Python-only like the pre-commit hooks.
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]

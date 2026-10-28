@@ -1,0 +1,11 @@
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  # The docker ecosystem (directory /docker) is added together with the Dockerfile in Task 4.
