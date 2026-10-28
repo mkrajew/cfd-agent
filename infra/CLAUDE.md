@@ -12,7 +12,7 @@ Inside an owner-approved spending envelope, starting, stopping or deallocating t
 
 - Subscription "Azure for Students", **$100 credit**.
 - Allowed regions (policy): `italynorth` (default), `spaincentral`, `belgiumcentral`, `denmarkeast`, `austriaeast`. Anything else is rejected.
-- Compute quota: **6 vCPU per region**, **at most 4 vCPU per VM family**; spot/low-priority 3 vCPU. The VM is `Standard_F4s_v2` (4 vCPU), Ubuntu 24.04.
+- Compute quota: **6 vCPU per region**, **at most 4 vCPU per VM family**; spot/low-priority 3 vCPU. The VM is `Standard_D4as_v4` (4 vCPU, 16 GB) in `belgiumcentral`, Ubuntu 24.04 (owner decision 2026-10-28: italynorth has no usable 4-vCPU size, `Standard_F4s_v2` is unavailable there and in most allowed regions).
 - **No GPU**: quota 0 for every GPU family; increase requests were rejected. Do not design anything that needs a GPU.
 - LLMs run serverless in Azure AI Foundry (pay per token). `gpt-oss-120b` is verified working; `gpt-oss-20b` is not deployable.
 - Resource group `rg-cfdagent` in `italynorth`. The probe group `rg-cfdagent-probe` is deleted only after the IaC-managed environment exists and the owner approves.
@@ -20,7 +20,7 @@ Inside an owner-approved spending envelope, starting, stopping or deallocating t
 
 ## Mandatory safeguards
 
-- **Daily auto-shutdown** of the VM (time as a parameter, Europe/Warsaw).
+- **Daily auto-shutdown** of the VM (time as a parameter, Europe/Warsaw). `Microsoft.DevTestLab/schedules` is not offered in any allowed region, so it is a systemd timer on the VM.
 - **Idle shutdown:** on-VM timer deallocates the VM after 30 minutes with no SSH session and no running `cfdagent`; its identity may deallocate only that VM.
 - **Budget:** subscription budget of $100 with alerts at 25, 50, 75 and 90 percent; the notification address is a parameter, never a literal in the repository.
 - SSH (22) only from the owner's IP, passed as a parameter; key authentication only.
@@ -31,6 +31,6 @@ Inside an owner-approved spending envelope, starting, stopping or deallocating t
 
 Every infra change is accompanied by a cost estimate in the commit or PR description: hourly and monthly cost of each new or changed resource, taken from the Azure retail price API (`italynorth`), and its effect on the envelope.
 
-Reference prices: VM `Standard_F4s_v2` about $0.194/h; `gpt-oss-120b` $0.15 per 1M input tokens and $0.60 per 1M output tokens.
+Reference prices: VM `Standard_D4as_v4` (belgiumcentral) $0.208/h; `gpt-oss-120b` $0.15 per 1M input tokens and $0.60 per 1M output tokens.
 
 Envelopes (owner's decision, 2026-10-28): M0-M2 development at most $30; M3 campaign at most $45; reserve about $25 is never spent without a separate decision. Track spend from run records and report it at each milestone.

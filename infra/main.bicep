@@ -13,9 +13,9 @@ targetScope = 'subscription'
 ])
 param location string = 'italynorth'
 
-@description('''Region of the VM, its network and the storage account. Standard_F4s_v2 is not available to this
-subscription in italynorth (restriction NotAvailableForSubscription, checked 2026-10-28); denmarkeast is the only
-allowed region where it is unrestricted and has quota.''')
+@description('''Region of the VM, its network and the storage account. No 4-vCPU size with quota is available to this
+subscription in italynorth (NotAvailableForSubscription or quota 0, checked 2026-10-28); owner decision 2026-10-28:
+belgiumcentral with Standard_D4as_v4.''')
 @allowed([
   'italynorth'
   'spaincentral'
@@ -23,7 +23,7 @@ allowed region where it is unrestricted and has quota.''')
   'denmarkeast'
   'austriaeast'
 ])
-param vmLocation string = 'denmarkeast'
+param vmLocation string = 'belgiumcentral'
 
 @description('Resource group that holds everything except the budget.')
 param resourceGroupName string = 'rg-cfdagent'
@@ -56,8 +56,8 @@ param shutdownTimeZone string = 'Europe/Warsaw'
 @description('Linux administrator user name.')
 param adminUsername string = 'azureuser'
 
-@description('VM size. Student quota allows at most 4 vCPU per family.')
-param vmSize string = 'Standard_F4s_v2'
+@description('VM size. Student quota allows at most 4 vCPU per family. Standard_D4as_v4: 4 vCPU (AMD, 2 cores with SMT), 16 GB.')
+param vmSize string = 'Standard_D4as_v4'
 
 @description('OS disk size in GiB. 64 GiB StandardSSD (E6) leaves room for the image (about 10 GB unpacked) and runs.')
 param osDiskSizeGB int = 64

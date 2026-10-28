@@ -10,7 +10,7 @@ owner's explicit approval**, and every change carries a cost estimate.
 |---|---|
 | Resource group | `rg-cfdagent` in `italynorth` |
 | Network (`vmLocation`) | VNet `vnet-cfdagent`, NSG `nsg-cfdagent` (SSH 22 only from `ownerIp`), Standard static public IP `pip-cfdagent` |
-| VM (`vmLocation`) | `vm-cfdagent`, `Standard_F4s_v2`, Ubuntu 24.04 LTS (Canonical `ubuntu-24_04-lts` / `server`, Gen2), SSH key only, system-assigned identity, 64 GiB StandardSSD_LRS OS disk |
+| VM (`vmLocation`) | `vm-cfdagent`, `Standard_D4as_v4` (4 vCPU, 16 GB), Ubuntu 24.04 LTS (Canonical `ubuntu-24_04-lts` / `server`, Gen2), SSH key only, system-assigned identity, 64 GiB StandardSSD_LRS OS disk |
 | Daily shutdown | systemd timer on the VM, 23:00 `Europe/Warsaw` (parameters `shutdownTime`, `shutdownTimeZone`) |
 | Idle shutdown | systemd timer every 5 min; deallocates after 30 idle minutes (see below) |
 | Storage (`vmLocation`) | StorageV2, LRS, Hot, shared keys disabled, TLS 1.2, no public blob access, container `runs`, lifecycle: Cool after 30 days |
@@ -23,10 +23,12 @@ Outputs: `vmPublicIp`, `aiEndpoint` (OpenAI v1 base URL `https://<account>.servi
 
 ### Decisions that differ from the first sketch
 
-- **VM region.** `Standard_F4s_v2` (and every other size that fits the 4-vCPU quota) is `NotAvailableForSubscription` in
-  `italynorth` for this subscription; checked with `az vm list-skus --all` on 2026-10-28. Among the allowed
-  regions it is unrestricted only in `denmarkeast`, so network, VM and storage use `vmLocation`
-  (default `denmarkeast`). The resource group and the AI account stay in `italynorth`.
+- **VM region and size (owner decision 2026-10-28).** `italynorth` has no usable 4-vCPU size for this
+  subscription (`Standard_F4s_v2` is `NotAvailableForSubscription`, the available v7 sizes have quota 0;
+  checked with `az vm list-skus --all` and `az vm list-usage`). Network, VM and storage therefore use
+  `vmLocation` (default `belgiumcentral`) with `Standard_D4as_v4`. The resource group and the AI account
+  stay in `italynorth`. Alternatives that were considered: `Standard_F4s_v2` in `denmarkeast` (0.27 USD/h),
+  `Standard_D4s_v4` in `spaincentral` (0.214 USD/h).
 - **Daily shutdown on the VM.** `Microsoft.DevTestLab/schedules` is not offered in any allowed region, so the
   daily shutdown is a systemd timer (`cfdagent-daily-shutdown.timer`) that runs the same deallocate call
   with `--force`.
@@ -86,11 +88,11 @@ stub commands (`who`, `ss`, `pgrep`, `docker`, `curl`, `wall`) first on `PATH`, 
 skipped on Windows and runs in CI and in the Linux image. `shellcheck infra/vm/*.sh` runs in CI and in
 pre-commit.
 
-## Cost estimate (Azure retail prices API, checked 2026-10-28)
+## Cost estimate (Azure retail prices API, belgiumcentral, checked 2026-10-28)
 
 | Item | Price | Per month |
 |---|---|---|
-| VM `Standard_F4s_v2` running | 0.194 USD/h (italynorth list price; the API has no `denmarkeast` meter for Fsv2, the same price is assumed) | only while running |
+| VM `Standard_D4as_v4` Linux running (belgiumcentral) | 0.208 USD/h | only while running |
 | OS disk StandardSSD E6 (64 GiB) | 4.80 USD/month plus about 0.0026 USD per 10K operations | 4.80 |
 | Public IP, Standard static IPv4 | 0.005 USD/h, **billed also while the VM is deallocated** | 3.65 |
 | Storage Hot LRS | about 0.02 USD/GB/month | under 0.2 for the first GB-scale runs |

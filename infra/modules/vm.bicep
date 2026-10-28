@@ -44,6 +44,8 @@ resource nic 'Microsoft.Network/networkInterfaces@2024-05-01' = {
   location: location
   tags: tags
   properties: {
+    // Supported by Standard_D4as_v4 (AcceleratedNetworkingEnabled capability), no extra charge.
+    enableAcceleratedNetworking: true
     ipConfigurations: [
       {
         name: 'ipconfig1'
