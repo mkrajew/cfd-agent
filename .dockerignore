@@ -1,0 +1,27 @@
+# Keep the build context small and free of local state.
+.git
+.github
+.venv
+.superpowers
+.claude
+.pytest_cache
+.ruff_cache
+.mypy_cache
+__pycache__
+*.py[cod]
+*.egg-info
+dist
+build
+.env
+.env.*
+
+# Simulation outputs never go into an image or into git.
+runs
+*.msh
+postProcessing
+processor*
+
+# Docs and infra are not needed to build the image.
+docs
+infra
+tests

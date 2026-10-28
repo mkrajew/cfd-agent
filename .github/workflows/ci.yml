@@ -4,13 +4,15 @@ on:
   pull_request:
   push:
     branches: [main]
+    tags: ["v*"]
 
 permissions:
   contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Never cancel runs on main or on tags: a cancelled run would skip the publish job.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   lint:
@@ -54,3 +56,91 @@ jobs:
         run: uv sync --locked
       - name: Unit tests
         run: uv run pytest
+
+  image:
+    name: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          tags: cfdagent:dev
+          # Unpublished build: write the image to a tar file that the next jobs load.
+          outputs: type=docker,dest=${{ runner.temp }}/cfdagent-image.tar
+          cache-from: type=gha,scope=cfdagent-image
+          cache-to: type=gha,mode=max,scope=cfdagent-image
+      - name: Upload image
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfdagent-image
+          path: ${{ runner.temp }}/cfdagent-image.tar
+          compression-level: 1
+          retention-days: 1
+          if-no-files-found: error
+
+  integration:
+    name: integration
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with:
+          name: cfdagent-image
+          path: ${{ runner.temp }}
+      - name: Load image
+        run: docker load --input "${RUNNER_TEMP}/cfdagent-image.tar"
+      - name: Integration tests
+        # The checkout is owned by the runner user (uid 1001); the container user (uid 1000) only
+        # reads it. Tests write to pytest's tmp_path, not to /work.
+        run: docker run --rm -v "$PWD:/work" -w /work cfdagent:dev pytest -m integration tests/integration
+
+  publish:
+    name: publish
+    # Only on pushes to main and on version tags, after everything else is green.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs: [lint, unit, image, integration]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/mkrajew/cfd-agent
+    steps:
+      - name: Download image
+        uses: actions/download-artifact@v4
+        with:
+          name: cfdagent-image
+          path: ${{ runner.temp }}
+      - name: Load image
+        run: docker load --input "${RUNNER_TEMP}/cfdagent-image.tar"
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
+            type=semver,pattern={{version}}
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push the tested image
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          for tag in ${TAGS}; do
+            docker tag cfdagent:dev "${tag}"
+            docker push "${tag}"
+          done

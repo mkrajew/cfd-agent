@@ -8,4 +8,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
-  # The docker ecosystem (directory /docker) is added together with the Dockerfile in Task 4.
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
