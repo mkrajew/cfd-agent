@@ -1,0 +1,27 @@
+id = "cavity-re100"
+family = "lid-driven-cavity"
+task_file = "task.md"
+citation = "Ghia, U., Ghia, K. N. and Shin, C. T. (1982), High-Re solutions for incompressible flow using the Navier-Stokes equations and a multigrid method, J. Comput. Phys. 48(3), 387-411, doi:10.1016/0021-9991(82)90058-4. Re = 100 column of Table I (u along the vertical line through the geometric centre, p. 398) and Table II (v along the horizontal line through the geometric centre, p. 399); 129x129 grid solution, 17 points per profile including the wall points."
+
+# Both profiles are in units of the lid speed (1 m/s in task.md), so normalise_by is 1.
+# The simulated line must run wall to wall (0 <= x <= 1): the scorer refuses to extrapolate.
+# Threshold 0.05 (the brief's default). A quick streamfunction-vorticity check (not OpenFOAM) gave
+# max errors against this reference of 0.08-0.11 on 10x10 cells, 0.024-0.036 on 20x20 and 0.003-0.016
+# on 40x40 (central and first-order upwind), so 0.05 accepts a 20x20 mesh and rejects a 10x10 one.
+# The reference uncertainty is far below 0.001.
+
+[[criteria]]
+quantity = "u_vertical_centreline"
+kind = "profile"
+metric = "max_abs_error"
+threshold = 0.05
+reference_file = "reference/u_vertical_centreline.csv"
+normalise_by = 1.0
+
+[[criteria]]
+quantity = "v_horizontal_centreline"
+kind = "profile"
+metric = "max_abs_error"
+threshold = 0.05
+reference_file = "reference/v_horizontal_centreline.csv"
+normalise_by = 1.0

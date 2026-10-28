@@ -1,0 +1,23 @@
+id = "cylinder-re20"
+family = "cylinder-crossflow"
+task_file = "task.md"
+citation = "Steady 2D flow past an isolated circular cylinder in an unbounded stream, Re = U*D/nu = 20. Drag coefficient: Dennis, S. C. R. and Chang, G.-Z. (1970), J. Fluid Mech. 42(3), 471-489 (2.045); Fornberg, B. (1980), J. Fluid Mech. 98(4), 819-855 (2.000); Park, J., Kwon, K. and Choi, H. (1998), KSME Int. J. 12(6), 1200-1205 (2.01); Tritton, D. J. (1959), J. Fluid Mech. 6(4), 547-567 (about 2.09, experiment). Recirculation length measured from the rear surface of the cylinder: Coutanceau, M. and Bouard, R. (1977), J. Fluid Mech. 79(2), 231-256 (0.93 D, experiment); Fornberg (1980) 0.91 D. Values were taken from secondary comparison tables, not from the original papers."
+
+# Reference Cd = 2.05: midpoint of the literature spread 2.00-2.09 (equal to Dennis & Chang, 2.045).
+# Threshold 0.05 covers 1.95-2.15: spread of the references (about +-2%) plus discretisation error.
+# Reference L/D = 0.93 (Coutanceau & Bouard); numerical literature 0.91-0.945.
+# Threshold 0.10 covers 0.84-1.02: L is read off a discrete field and depends on mesh and domain.
+
+[[criteria]]
+quantity = "cd"
+kind = "scalar"
+metric = "rel_error"
+threshold = 0.05
+reference_value = 2.05
+
+[[criteria]]
+quantity = "recirculation_length_over_d"
+kind = "scalar"
+metric = "rel_error"
+threshold = 0.10
+reference_value = 0.93
