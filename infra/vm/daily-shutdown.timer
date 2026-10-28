@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily shutdown of the VM
+
+[Timer]
+# Substituted by infra/modules/vm.bicep from the shutdownTime and shutdownTimeZone parameters.
+OnCalendar=__ON_CALENDAR__
+Persistent=false
+
+[Install]
+WantedBy=timers.target

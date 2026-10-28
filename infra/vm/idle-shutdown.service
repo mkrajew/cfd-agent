@@ -1,0 +1,8 @@
+[Unit]
+Description=Deallocate this VM after 30 idle minutes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cfdagent-idle-shutdown

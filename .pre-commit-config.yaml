@@ -16,6 +16,11 @@ repos:
     hooks:
       - id: mixed-line-ending
         args: [--fix=lf]
+        exclude: \.ps1$ # PowerShell scripts keep CRLF (.gitattributes)
       - id: end-of-file-fixer
       - id: check-yaml
       - id: check-toml
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck

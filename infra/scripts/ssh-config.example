@@ -1,0 +1,8 @@
+# Copy into ~/.ssh/config and replace HostName with the vmPublicIp deployment output
+# (also printed by vm-up.ps1). The address is static, so it changes only if the IP resource is recreated.
+Host cfdagent
+    HostName REPLACE_WITH_VM_PUBLIC_IP
+    User azureuser
+    IdentityFile ~/.ssh/id_cfdagent
+    IdentitiesOnly yes
+    ServerAliveInterval 30

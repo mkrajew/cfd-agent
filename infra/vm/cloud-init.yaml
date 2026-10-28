@@ -1,0 +1,45 @@
+#cloud-config
+# Template: infra/modules/vm.bicep substitutes the __PLACEHOLDERS__ before the VM is created.
+package_update: true
+package_upgrade: false
+packages:
+  - docker.io
+  - curl
+  - python3
+
+write_files:
+  - path: /usr/local/sbin/cfdagent-idle-shutdown
+    permissions: "0755"
+    owner: root:root
+    encoding: b64
+    content: __B64_IDLE_SCRIPT__
+  - path: /etc/systemd/system/cfdagent-idle-shutdown.service
+    permissions: "0644"
+    owner: root:root
+    encoding: b64
+    content: __B64_IDLE_SERVICE__
+  - path: /etc/systemd/system/cfdagent-idle-shutdown.timer
+    permissions: "0644"
+    owner: root:root
+    encoding: b64
+    content: __B64_IDLE_TIMER__
+  - path: /etc/systemd/system/cfdagent-daily-shutdown.service
+    permissions: "0644"
+    owner: root:root
+    encoding: b64
+    content: __B64_DAILY_SERVICE__
+  - path: /etc/systemd/system/cfdagent-daily-shutdown.timer
+    permissions: "0644"
+    owner: root:root
+    encoding: b64
+    content: __B64_DAILY_TIMER__
+
+runcmd:
+  - [mkdir, -p, /var/lib/cfdagent]
+  - [systemctl, enable, --now, docker]
+  - [usermod, -aG, docker, "__ADMIN_USER__"]
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, cfdagent-idle-shutdown.timer]
+  - [systemctl, enable, --now, cfdagent-daily-shutdown.timer]
+  # The pull is best effort: it fails until the image is published and public.
+  - [sh, -c, "docker pull __CONTAINER_IMAGE__ || echo 'image pre-pull failed; pull it manually'"]
