@@ -75,6 +75,14 @@ def test_runs_in_cwd(tmp_path):
     assert tmp_path.name in result.tail
 
 
+def test_pwd_environment_follows_cwd(tmp_path, monkeypatch):
+    # OpenFOAM utilities warn "PWD is not the cwd()" when the inherited PWD is stale.
+    monkeypatch.setenv("PWD", "/somewhere/else")
+    code = "import os; print('PWD=' + os.environ['PWD'])"
+    result = run_tool(["python", "-c", code], cwd=tmp_path, log_path=tmp_path / "log.txt")
+    assert f"PWD={tmp_path}" in result.tail
+
+
 def test_nonzero_exit_is_not_ok(tmp_path):
     result = run_tool(
         ["python", "-c", "import sys; sys.exit(3)"], cwd=tmp_path, log_path=tmp_path / "log.txt"

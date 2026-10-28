@@ -118,6 +118,8 @@ def run_tool(
         proc = subprocess.Popen(
             [exe, *argv[1:]],
             cwd=cwd,
+            # A shell updates PWD on cd; without this OpenFOAM utilities warn about a stale PWD.
+            env={**os.environ, "PWD": str(cwd)},
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,
