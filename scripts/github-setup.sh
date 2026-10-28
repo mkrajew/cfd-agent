@@ -49,26 +49,26 @@ ensure_milestone() {
 }
 
 ensure_milestone "M0 Foundations" \
-  "Repo, CI, Docker image, Bicep infra, LLM capability spike, benchmark references. Done when cavity passes CadQuery > Gmsh > OpenFOAM > post-processing from hand-written scripts, locally and on the VM."
+  "Repo, CI, Docker image (OpenFOAM ESI + Gmsh + CadQuery + Python stack), Bicep infra, LLM capability spike for all three candidate models, benchmark references and thresholds fixed. Done when cavity passes CadQuery > Gmsh > OpenFOAM > post-processing from hand-written scripts, no LLM, locally and on the VM."
 ensure_milestone "M1 First autonomous run" \
   "Orchestrator, agents 1-6, CLI, Blob upload, run record. Done when cavity Re = 100 goes from text to results with no human intervention."
 ensure_milestone "M2 Robustness + full benchmark set" \
-  "Fix loops, Critic, Scorer, knowledge base; generality test set prepared but not run. Done when pipe and cylinder (Re 20, Re 100) pass."
+  "Fix loops, Critic, Scorer, knowledge base; generality test set prepared (owner's task texts, references, criteria) but not run. Done when pipe and cylinder (Re 20, Re 100) pass."
 ensure_milestone "M3 Experiment campaign" \
-  "Frozen release, cfdagent bench, first runs of the generality test set. Done when statistics are ready for the report."
+  "Frozen release; cfdagent bench; first runs of the generality test set; experiment matrix in design spec section 14.1. Done when statistics are ready for the report."
 ensure_milestone "M4 Report" \
-  "Research report. Done when the PDF is approved by the owner."
+  "Report process in design spec section 11. Done when the PDF is approved by the owner."
 
 # --- Branch protection on main --------------------------------------------------------------
 # PR required with 0 approvals, required checks lint and unit, no force push, no deletion.
-# Administrators are not enforced, so the owner can still fix a broken pipeline directly.
+# Run this after the last bootstrap push: afterwards main only changes via PRs, admins included.
 gh api --method PUT "repos/${REPO}/branches/main/protection" --input - --silent <<'JSON'
 {
   "required_status_checks": {
     "strict": false,
     "contexts": ["lint", "unit"]
   },
-  "enforce_admins": false,
+  "enforce_admins": true,
   "required_pull_request_reviews": {
     "required_approving_review_count": 0
   },
