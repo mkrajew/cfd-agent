@@ -1,0 +1,149 @@
+/*---------------------------------------------------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2512                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+Build  : _87ed40d2-20251219 OPENFOAM=2512 version=2512
+Arch   : "LSB;label=32;scalar=64"
+Exec   : icoFoam
+Date   : Oct 28 2026
+Time   : 19:41:51
+Host   : 70a6b7f5fbd1
+PID    : 511
+I/O    : uncollated
+Case   : /work/fatal
+nProcs : 1
+trapFpe: Floating point exception trapping enabled (FOAM_SIGFPE).
+memory pool : not available
+fileModificationChecking : Monitoring run-time modified files using timeStampMaster (fileModificationSkew 5, maxFileModificationPolls 20)
+allowSystemOperations : Allowing user-supplied system call operations
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Create time
+
+Create mesh for time = 0
+
+
+PISO: Operating solver in PISO mode
+
+Reading transportProperties
+
+Reading field p
+
+Reading field U
+
+
+
+--> FOAM FATAL IO ERROR: (openfoam-2512)
+Unknown patchField type noSlipp for patch type wall
+
+Valid patchField types :
+
+94
+(
+SRFFreestreamVelocity
+SRFVelocity
+SRFWallVelocity
+acousticWaveTransmissive
+activeBaffleVelocity
+activePressureForceBaffleVelocity
+advective
+calculated
+codedFixedValue
+codedMixed
+cyclic
+cyclicACMI
+cyclicAMI
+cyclicSlip
+cylindricalInletVelocity
+directionMixed
+empty
+exprFixedValue
+exprMixed
+extrapolatedCalculated
+fixedGradient
+fixedInternalValue
+fixedJump
+fixedJumpAMI
+fixedMean
+fixedMeanOutletInlet
+fixedNormalInletOutletVelocity
+fixedNormalSlip
+fixedProfile
+fixedValue
+flowRateInletVelocity
+flowRateOutletVelocity
+fluxCorrectedVelocity
+freestream
+freestreamVelocity
+inletOutlet
+interstitialInletVelocity
+mapped
+mappedField
+mappedFixedInternalValue
+mappedFixedPushedInternalValue
+mappedFlowRate
+mappedMixed
+mappedMixedField
+mappedVelocityFlux
+matchedFlowRateOutletVelocity
+mixed
+movingWallVelocity
+noSlip
+nonuniformTransformCyclic
+outletInlet
+outletMappedUniformInlet
+outletPhaseMeanVelocity
+partialSlip
+permeableAlphaPressureInletOutletVelocity
+pressureDirectedInletOutletVelocity
+pressureDirectedInletVelocity
+pressureInletOutletParSlipVelocity
+pressureInletOutletVelocity
+pressureInletUniformVelocity
+pressureInletVelocity
+pressureNormalInletOutletVelocity
+pressurePIDControlInletVelocity
+processor
+processorCyclic
+rotatingPressureInletOutletVelocity
+rotatingWallVelocity
+scaledFixedValue
+sliced
+slip
+supersonicFreestream
+surfaceNormalFixedValue
+swirlFanVelocity
+swirlFlowRateInletVelocity
+swirlInletVelocity
+symmetry
+symmetryPlane
+timeVaryingMappedFixedValue
+translatingWallVelocity
+turbulentDFSEMInlet
+turbulentDigitalFilterInlet
+turbulentInlet
+uniformFixedGradient
+uniformFixedValue
+uniformInletOutlet
+uniformJump
+uniformJumpAMI
+uniformMixed
+uniformNormalFixedValue
+variableHeightFlowRateInletVelocity
+waveTransmissive
+wedge
+zeroGradient
+zeroValue
+)
+
+
+file: 0/U/boundaryField/fixedWalls at line 31.
+
+    From static Foam::tmp<Foam::fvPatchField<Type> > Foam::fvPatchField<Type>::New(const Foam::fvPatch&, const Foam::DimensionedField<Type, Foam::volMesh>&, const Foam::dictionary&) [with Type = Foam::Vector<double>]
+    in file ./src/finiteVolume/lnInclude/fvPatchFieldNew.C at line 124.
+
+FOAM exiting
+

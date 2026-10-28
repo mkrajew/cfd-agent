@@ -1,0 +1,97 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      controlDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+application     icoFoam;
+
+startFrom       startTime;
+
+startTime       0;
+
+stopAt          endTime;
+
+// Time step from a Courant-number target of 0.5 (the PISO loop lags the flux by one step, so Co
+// has to stay of order 1 or below; 0.5 leaves a margin):
+//   mesh: 64 x 64 cells over L = 1 m  ->  dx = L/64 = 0.015625 m   (see mesh.py)
+//   fastest flow: the lid speed U = 1 m/s bounds |u| anywhere in the cavity
+//   Co = |u| dt / dx <= 0.5   ->   dt <= 0.5 * 0.015625 / 1 = 0.0078 s
+// dt = 0.005 s gives Co <= 0.32 (the log reports the actual maximum).
+// Cell Reynolds number U dx / nu = 1.6 < 2, which is what makes central differencing for the
+// convection term (fvSchemes) free of wiggles.
+deltaT          0.005;
+
+// Time to steady state. The viscous diffusion time L^2/nu = 100 s and the convective time
+// L/U = 1 s are only upper and lower bounds; what matters is how fast the start-up transient
+// of this flow decays. Measured on this setup, the change of the sampled centreline profiles per
+// 5 s write interval shrinks by a factor of about 15 every 5 s (time constant 1.9 s):
+// 1.7e-2 (t = 10 s), 1.1e-3 (15 s), 7.5e-5 (20 s), ... 6e-8 (35 s) in units of the lid speed.
+// endTime = 40 s (21 time constants, 8000 steps) ends with a change of about 1e-8 between the
+// last two write times, far below the 0.1 % steadiness criterion.
+endTime         40;
+
+writeControl    timeStep;
+
+// Write every 1000 steps = 5 s, so that the sampled profiles of the last two write times can be
+// compared.
+writeInterval   1000;
+
+purgeWrite      0;
+
+writeFormat     ascii;
+
+writePrecision  8;
+
+writeCompression off;
+
+timeFormat      general;
+
+timePrecision   6;
+
+runTimeModifiable false;
+
+functions
+{
+    // Centrelines through the geometric centre of the cavity, sampled over the FULL range
+    // [0, 1] so that the end points lie on the walls. z = 0.05 is mid-thickness of the single
+    // cell layer (0 <= z <= 0.1). 129 points: spacing 1/128 = dx/2.
+    // cellPoint interpolation: the profile follows linear interpolation of point values, and
+    // the point values on a wall are the boundary-condition values, so the end points carry the
+    // wall values (u = 1 on the lid, 0 on the fixed walls) without anything being added later.
+    centrelines
+    {
+        type                sets;
+        libs                (sampling);
+        writeControl        writeTime;
+        interpolationScheme cellPoint;
+        setFormat           raw;
+        fields              (U);
+
+        sets
+        (
+            verticalCentreline
+            {
+                type        uniform;
+                axis        y;
+                start       (0.5 0 0.05);
+                end         (0.5 1 0.05);
+                nPoints     129;
+            }
+
+            horizontalCentreline
+            {
+                type        uniform;
+                axis        x;
+                start       (0 0.5 0.05);
+                end         (1 0.5 0.05);
+                nPoints     129;
+            }
+        );
+    }
+}
+
+// ************************************************************************* //

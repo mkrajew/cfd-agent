@@ -1,0 +1,14 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      transportProperties;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// Kinematic viscosity [m^2/s]. With density 1 kg/m^3 this is the dynamic viscosity 0.01 Pa s.
+// Re = U L / nu = 1 m/s * 1 m / 0.01 m^2/s = 100.
+nu              0.01;
+
+// ************************************************************************* //
