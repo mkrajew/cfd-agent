@@ -44,6 +44,8 @@ packages = ["src/cfdagent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/unit"]
+# A misspelled or unregistered marker must be an error: a mis-marked test could silently never run.
+addopts = "--strict-markers"
 # Tests bind-mounted into the Docker image must import /work/src, not the copy installed in the image.
 pythonpath = ["src"]
 markers = [
