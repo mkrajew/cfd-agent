@@ -16,6 +16,7 @@ from cfdagent.tools.geometry import check_geometry, run_geometry_script
 from cfdagent.tools.mesh import (
     CheckMeshReport,
     MeshError,
+    MeshThresholds,
     apply_patch_types,
     check_mesh,
     convert_to_foam,
@@ -199,7 +200,7 @@ def test_check_mesh_rejects_default_faces(tmp_path):
     assert report.patches["defaultFaces"] > 0
 
 
-def test_cylinder_channel_mesh_passes_gate(tmp_path):
+def test_check_mesh_passes_one_layer_cylinder(tmp_path):
     manifest, case_dir = _make_case(CYLINDER, tmp_path, CYLINDER_BBOX)
     gate = check_mesh(case_dir, manifest, CYLINDER_BBOX)
     report = gate.data
@@ -209,8 +210,85 @@ def test_cylinder_channel_mesh_passes_gate(tmp_path):
     assert report.solution_directions == 2
     assert report.failed_checks == 0
     assert report.n_cells > 500
+    assert report.patches["frontAndBack"] == 2 * report.n_cells  # one cell thick
     assert _patch_value(case_dir, "cylinder", "type") == "wall"
     assert _patch_value(case_dir, "inlet", "type") == "patch"
+
+
+def test_check_mesh_rejects_two_layer_2d_mesh(tmp_path):
+    """Two cells through the thickness still has 2 solution directions, but is not 2D-valid."""
+    source = (CYLINDER / "mesh.py").read_text(encoding="utf-8")
+    assert "numElements=[1]" in source
+    script = tmp_path / "two_layer_mesh.py"
+    script.write_text(source.replace("numElements=[1]", "numElements=[2]"), encoding="utf-8")
+    work = tmp_path / "w"
+    assert run_geometry_script(CYLINDER / "geometry.py", work).ok
+    meshed = run_mesh_script(script, work)
+    assert meshed.ok, meshed.tail
+    case_dir = work / "case"
+    assert convert_to_foam(work / "mesh.msh", case_dir).ok
+    manifest = BoundaryManifest.from_file(work / MANIFEST_FILE_NAME)
+    apply_patch_types(case_dir, manifest)
+
+    gate = check_mesh(case_dir, manifest, CYLINDER_BBOX)
+    report = gate.data
+    assert not gate.ok
+    assert report is not None and report.solution_directions == 2
+    assert report.patches["frontAndBack"] == report.n_cells  # one cell thick would give 2 * n
+    assert any("thick" in e and "frontAndBack" in e for e in gate.errors)
+
+
+def test_check_mesh_applies_quality_thresholds(cavity):
+    manifest, case_dir = cavity
+    gate = check_mesh(
+        case_dir, manifest, CAVITY_BBOX, thresholds=MeshThresholds(max_aspect_ratio=0.5)
+    )
+    assert not gate.ok
+    assert any("aspect ratio" in e for e in gate.errors)
+    assert check_mesh(case_dir, manifest, CAVITY_BBOX, thresholds=MeshThresholds()).ok
+
+
+def test_check_mesh_rejects_misplaced_patch(cavity):
+    """Patch names that do not sit where the manifest locators say (e.g. swapped) are rejected."""
+    _, case_dir = cavity
+    swapped = BoundaryManifest(
+        dimensionality="2D",
+        patches=[
+            BoundaryPatch(name="movingWall", type="wall", locators=[_plane("y", 0.0)]),
+            BoundaryPatch(
+                name="fixedWalls",
+                type="wall",
+                locators=[_plane("x", 0.0), _plane("x", 1.0), _plane("y", 1.0)],
+            ),
+            BoundaryPatch(
+                name="frontAndBack", type="empty", locators=[_plane("z", 0.0), _plane("z", 0.1)]
+            ),
+        ],
+    )
+    gate = check_mesh(case_dir, swapped, CAVITY_BBOX)
+    assert not gate.ok
+    assert any("movingWall" in e and "locator" in e for e in gate.errors)
+    assert any("fixedWalls" in e and "locator" in e for e in gate.errors)
+    assert not any("frontAndBack" in e for e in gate.errors)
+
+
+def test_case_dir_has_no_skeleton_files_after_check(tmp_path):
+    manifest, case_dir = _make_case(CAVITY, tmp_path, CAVITY_BBOX)
+    assert not (case_dir / "system").exists()
+    gate = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    assert gate.ok, gate.errors
+    assert not (case_dir / "system").exists()
+    assert sorted(p.name for p in case_dir.iterdir() if p.is_dir()) == ["constant"]
+
+
+def test_failed_conversion_leaves_no_polymesh(tmp_path):
+    bad = tmp_path / "bad.msh"
+    bad.write_text("$MeshFormat\n2.2 0 8\n$EndMeshFormat\n", encoding="utf-8")
+    case_dir = tmp_path / "case"
+    result = convert_to_foam(bad, case_dir)
+    assert not result.ok
+    assert not (case_dir / "constant" / "polyMesh").exists()
+    assert not (case_dir / "system").exists()
 
 
 @pytest.mark.parametrize(

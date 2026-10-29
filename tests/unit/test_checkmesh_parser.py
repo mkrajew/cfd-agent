@@ -1,11 +1,17 @@
 """Parsing of OpenFOAM checkMesh output, using logs captured inside the Docker image."""
 
+import dataclasses
 import math
 from pathlib import Path
 
 import pytest
 
-from cfdagent.tools.mesh import CheckMeshReport, parse_checkmesh
+from cfdagent.tools.mesh import (
+    CheckMeshReport,
+    MeshThresholds,
+    parse_checkmesh,
+    quality_errors,
+)
 
 LOGS = Path(__file__).parents[1] / "fixtures" / "logs"
 
@@ -101,3 +107,78 @@ def test_patch_row_count_must_match_boundary_patches_line():
         parse_checkmesh(text.replace(row + "\n", ""))
     with pytest.raises(ValueError, match="patch"):
         parse_checkmesh(text.replace("boundary patches: 3", "boundary patches: 4"))
+
+
+def test_patch_names_with_shared_long_prefix_are_not_collapsed():
+    """Real checkMesh output: names of 20+ characters ending in a digit abut the face count.
+
+    'shared_long_prefix_in_1' and '..._in_2' print as '..._in_11' and '..._in_21'; the two rows
+    must both be counted, not merged into one dict key (which looked like a missing patch).
+    """
+    report = parse_checkmesh(_read("checkMesh_long_names.log"))
+    assert report.n_patch_rows == 4
+    assert report.n_cells == 1
+    assert report.patches["walls"] == 2
+    assert report.patches["frontAndBack"] == 2
+
+
+def test_aspect_ratio_with_colon_is_parsed():
+    text = _read("checkMesh_ok.log").replace(
+        "Max aspect ratio = 1 OK.", "Max aspect ratio: 12.5 OK."
+    )
+    assert parse_checkmesh(text).max_aspect_ratio == 12.5
+
+
+def test_skewness_with_colon_is_parsed():
+    text = _read("checkMesh_ok.log").replace("Max skewness = 1.66533e-14", "Max skewness: 0.25")
+    assert parse_checkmesh(text).max_skewness == 0.25
+
+
+def _report(**changes):
+    return dataclasses.replace(parse_checkmesh(_read("checkMesh_ok.log")), **changes)
+
+
+def test_quality_within_defaults_passes():
+    assert quality_errors(_report(), MeshThresholds()) == []
+
+
+def test_default_thresholds():
+    t = MeshThresholds()
+    assert (t.max_non_orthogonality, t.max_skewness, t.max_aspect_ratio) == (70.0, 4.0, 1000.0)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        t.max_skewness = 5.0  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "word"),
+    [
+        ("max_non_orthogonality", 70.5, "non-orthogonality"),
+        ("max_skewness", 4.5, "skewness"),
+        ("max_aspect_ratio", 1500.0, "aspect ratio"),
+    ],
+)
+def test_quality_threshold_exceeded_fails(field, value, word):
+    errors = quality_errors(_report(**{field: value}), MeshThresholds())
+    assert len(errors) == 1 and word in errors[0]
+
+
+def test_quality_exactly_at_threshold_passes():
+    report = _report(max_non_orthogonality=70.0, max_skewness=4.0, max_aspect_ratio=1000.0)
+    assert quality_errors(report, MeshThresholds()) == []
+
+
+def test_custom_thresholds_are_used():
+    errors = quality_errors(_report(max_aspect_ratio=2.0), MeshThresholds(max_aspect_ratio=1.5))
+    assert len(errors) == 1
+
+
+def test_nan_aspect_ratio_fails():
+    # checkMesh skips the aspect-ratio check after open cells; an unknown value never passes.
+    errors = quality_errors(_report(max_aspect_ratio=math.nan), MeshThresholds())
+    assert len(errors) == 1 and "aspect ratio" in errors[0] and "not reported" in errors[0]
+
+
+def test_nan_everything_reports_every_metric():
+    nan = math.nan
+    report = _report(max_non_orthogonality=nan, max_skewness=nan, max_aspect_ratio=nan)
+    assert len(quality_errors(report, MeshThresholds())) == 3

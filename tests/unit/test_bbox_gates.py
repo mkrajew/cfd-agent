@@ -3,6 +3,7 @@
 External tools are replaced by stubs, so these tests run without OpenFOAM or CadQuery.
 """
 
+import contextlib
 import math
 import sys
 import types
@@ -219,6 +220,9 @@ def _stub_checkmesh(monkeypatch, tmp_path, bbox_line=OK_BBOX_LINE):
 
     patch_types = {"movingWall": "wall", "fixedWalls": "wall", "frontAndBack": "empty"}
     monkeypatch.setattr(mesh, "run_tool", fake_run_tool)
+    # No OpenFOAM and no polyMesh here: the scratch case and the face-placement check are stubbed.
+    monkeypatch.setattr(mesh, "_scratch_case", lambda _source: contextlib.nullcontext(tmp_path))
+    monkeypatch.setattr(mesh, "placement_errors", lambda *_args: [])
     monkeypatch.setattr(
         mesh,
         "_read_boundary_patches",
