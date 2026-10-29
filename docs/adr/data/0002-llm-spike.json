@@ -1,0 +1,440 @@
+{
+  "gpt-oss-120b": {
+    "date": "2026-10-29",
+    "route": "openai-v1",
+    "auth_mode": "entra",
+    "repeats": 3,
+    "max_tokens": 1024,
+    "pass_counts": {
+      "auth": 3,
+      "tools": 3,
+      "structured": 3,
+      "reasoning": 3
+    },
+    "runs": [
+      {
+        "repeat": 1,
+        "auth": {
+          "ok": true,
+          "seconds": 2.09,
+          "passed": true,
+          "usage": {
+            "prompt_tokens": 71,
+            "completion_tokens": 32,
+            "reasoning_tokens": null
+          }
+        },
+        "tools": {
+          "ok": true,
+          "seconds": 0.94,
+          "passed": true,
+          "tool_calls": [
+            {
+              "name": "calculator",
+              "arguments": {
+                "expression": "1*1/100"
+              }
+            }
+          ],
+          "content_excerpt": "",
+          "usage": {
+            "prompt_tokens": 159,
+            "completion_tokens": 175,
+            "reasoning_tokens": null
+          }
+        },
+        "structured": {
+          "ok": true,
+          "seconds": 1.57,
+          "passed": true,
+          "usage": {
+            "prompt_tokens": 111,
+            "completion_tokens": 168,
+            "reasoning_tokens": null
+          }
+        },
+        "reasoning": {
+          "status": "pass",
+          "passed": true,
+          "efforts": {
+            "low": {
+              "ok": true,
+              "seconds": 1.02,
+              "accepted": true,
+              "usage": {
+                "prompt_tokens": 98,
+                "completion_tokens": 295,
+                "reasoning_tokens": null
+              }
+            },
+            "high": {
+              "ok": true,
+              "seconds": 1.03,
+              "accepted": true,
+              "usage": {
+                "prompt_tokens": 98,
+                "completion_tokens": 537,
+                "reasoning_tokens": null
+              }
+            }
+          }
+        }
+      },
+      {
+        "repeat": 2,
+        "auth": {
+          "ok": true,
+          "seconds": 0.33,
+          "passed": true,
+          "usage": {
+            "prompt_tokens": 71,
+            "completion_tokens": 36,
+            "reasoning_tokens": null
+          }
+        },
+        "tools": {
+          "ok": true,
+          "seconds": 0.58,
+          "passed": true,
+          "tool_calls": [
+            {
+              "name": "calculator",
+              "arguments": {
+                "expression": "1*1/100"
+              }
+            }
+          ],
+          "content_excerpt": "",
+          "usage": {
+            "prompt_tokens": 159,
+            "completion_tokens": 127,
+            "reasoning_tokens": null
+          }
+        },
+        "structured": {
+          "ok": true,
+          "seconds": 1.48,
+          "passed": true,
+          "usage": {
+            "prompt_tokens": 111,
+            "completion_tokens": 306,
+            "reasoning_tokens": null
+          }
+        },
+        "reasoning": {
+          "status": "pass",
+          "passed": true,
+          "efforts": {
+            "low": {
+              "ok": true,
+              "seconds": 0.61,
+              "accepted": true,
+              "usage": {
+                "prompt_tokens": 98,
+                "completion_tokens": 274,
+                "reasoning_tokens": null
+              }
+            },
+            "high": {
+              "ok": true,
+              "seconds": 1.07,
+              "accepted": true,
+              "usage": {
+                "prompt_tokens": 98,
+                "completion_tokens": 554,
+                "reasoning_tokens": null
+              }
+            }
+          }
+        }
+      },
+      {
+        "repeat": 3,
+        "auth": {
+          "ok": true,
+          "seconds": 0.41,
+          "passed": true,
+          "usage": {
+            "prompt_tokens": 71,
+            "completion_tokens": 39,
+            "reasoning_tokens": null
+          }
+        },
+        "tools": {
+          "ok": true,
+          "seconds": 0.87,
+          "passed": true,
+          "tool_calls": [
+            {
+              "name": "calculator",
+              "arguments": {
+                "expression": "1*1/100"
+              }
+            }
+          ],
+          "content_excerpt": "",
+          "usage": {
+            "prompt_tokens": 159,
+            "completion_tokens": 131,
+            "reasoning_tokens": null
+          }
+        },
+        "structured": {
+          "ok": true,
+          "seconds": 0.99,
+          "passed": true,
+          "usage": {
+            "prompt_tokens": 111,
+            "completion_tokens": 146,
+            "reasoning_tokens": null
+          }
+        },
+        "reasoning": {
+          "status": "pass",
+          "passed": true,
+          "efforts": {
+            "low": {
+              "ok": true,
+              "seconds": 0.73,
+              "accepted": true,
+              "usage": {
+                "prompt_tokens": 98,
+                "completion_tokens": 346,
+                "reasoning_tokens": null
+              }
+            },
+            "high": {
+              "ok": true,
+              "seconds": 1.73,
+              "accepted": true,
+              "usage": {
+                "prompt_tokens": 98,
+                "completion_tokens": 675,
+                "reasoning_tokens": null
+              }
+            }
+          }
+        }
+      }
+    ]
+  },
+  "Llama-3.3-70B-Instruct": {
+    "date": "2026-10-29",
+    "route": "openai-v1",
+    "auth_mode": "entra",
+    "repeats": 3,
+    "max_tokens": 1024,
+    "pass_counts": {
+      "auth": 3,
+      "tools": 3,
+      "structured": 3,
+      "reasoning": 3
+    },
+    "runs": [
+      {
+        "repeat": 1,
+        "auth": {
+          "ok": true,
+          "seconds": 1.87,
+          "passed": true,
+          "usage": {
+            "prompt_tokens": 39,
+            "completion_tokens": 2,
+            "reasoning_tokens": null
+          }
+        },
+        "tools": {
+          "ok": true,
+          "seconds": 0.47,
+          "passed": true,
+          "tool_calls": [
+            {
+              "name": "calculator",
+              "arguments": {
+                "expression": "1 / 100"
+              }
+            }
+          ],
+          "content_excerpt": "",
+          "usage": {
+            "prompt_tokens": 230,
+            "completion_tokens": 25,
+            "reasoning_tokens": null
+          }
+        },
+        "structured": {
+          "ok": true,
+          "seconds": 0.68,
+          "passed": true,
+          "usage": {
+            "prompt_tokens": 80,
+            "completion_tokens": 22,
+            "reasoning_tokens": null
+          }
+        },
+        "reasoning": {
+          "status": "pass",
+          "passed": true,
+          "efforts": {
+            "low": {
+              "ok": true,
+              "seconds": 1.81,
+              "accepted": true,
+              "usage": {
+                "prompt_tokens": 66,
+                "completion_tokens": 274,
+                "reasoning_tokens": null
+              }
+            },
+            "high": {
+              "ok": true,
+              "seconds": 1.72,
+              "accepted": true,
+              "usage": {
+                "prompt_tokens": 66,
+                "completion_tokens": 250,
+                "reasoning_tokens": null
+              }
+            }
+          }
+        }
+      },
+      {
+        "repeat": 2,
+        "auth": {
+          "ok": true,
+          "seconds": 0.25,
+          "passed": true,
+          "usage": {
+            "prompt_tokens": 39,
+            "completion_tokens": 2,
+            "reasoning_tokens": null
+          }
+        },
+        "tools": {
+          "ok": true,
+          "seconds": 0.33,
+          "passed": true,
+          "tool_calls": [
+            {
+              "name": "calculator",
+              "arguments": {
+                "expression": "1/(100*1)"
+              }
+            }
+          ],
+          "content_excerpt": "",
+          "usage": {
+            "prompt_tokens": 230,
+            "completion_tokens": 27,
+            "reasoning_tokens": null
+          }
+        },
+        "structured": {
+          "ok": true,
+          "seconds": 0.53,
+          "passed": true,
+          "usage": {
+            "prompt_tokens": 80,
+            "completion_tokens": 24,
+            "reasoning_tokens": null
+          }
+        },
+        "reasoning": {
+          "status": "pass",
+          "passed": true,
+          "efforts": {
+            "low": {
+              "ok": true,
+              "seconds": 1.77,
+              "accepted": true,
+              "usage": {
+                "prompt_tokens": 66,
+                "completion_tokens": 298,
+                "reasoning_tokens": null
+              }
+            },
+            "high": {
+              "ok": true,
+              "seconds": 2.24,
+              "accepted": true,
+              "usage": {
+                "prompt_tokens": 66,
+                "completion_tokens": 261,
+                "reasoning_tokens": null
+              }
+            }
+          }
+        }
+      },
+      {
+        "repeat": 3,
+        "auth": {
+          "ok": true,
+          "seconds": 0.26,
+          "passed": true,
+          "usage": {
+            "prompt_tokens": 39,
+            "completion_tokens": 2,
+            "reasoning_tokens": null
+          }
+        },
+        "tools": {
+          "ok": true,
+          "seconds": 0.36,
+          "passed": true,
+          "tool_calls": [
+            {
+              "name": "calculator",
+              "arguments": {
+                "expression": "1/(100*1*1)"
+              }
+            }
+          ],
+          "content_excerpt": "",
+          "usage": {
+            "prompt_tokens": 230,
+            "completion_tokens": 29,
+            "reasoning_tokens": null
+          }
+        },
+        "structured": {
+          "ok": true,
+          "seconds": 1.16,
+          "passed": true,
+          "usage": {
+            "prompt_tokens": 80,
+            "completion_tokens": 22,
+            "reasoning_tokens": null
+          }
+        },
+        "reasoning": {
+          "status": "pass",
+          "passed": true,
+          "efforts": {
+            "low": {
+              "ok": true,
+              "seconds": 1.53,
+              "accepted": true,
+              "usage": {
+                "prompt_tokens": 66,
+                "completion_tokens": 231,
+                "reasoning_tokens": null
+              }
+            },
+            "high": {
+              "ok": true,
+              "seconds": 1.92,
+              "accepted": true,
+              "usage": {
+                "prompt_tokens": 66,
+                "completion_tokens": 270,
+                "reasoning_tokens": null
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}
