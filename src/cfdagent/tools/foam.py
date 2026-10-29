@@ -25,7 +25,7 @@ import shutil
 import stat
 import tempfile
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from cfdagent.errors import AgentInputError, ToolFailure
@@ -203,7 +203,9 @@ def reach_problem(
         )
     tol = _print_tolerance(end, case_end_time, time_precision)
     step = max(delta_t if delta_t is not None and math.isfinite(delta_t) else 0.0, 0.0)
-    step = max(step, summary.last_step or 0.0)
+    last_step = summary.last_step
+    if last_step is not None and math.isfinite(last_step) and last_step > 0:
+        step = max(step, last_step)  # a non-finite or negative step in the log is ignored
     if (
         summary.converged_at is not None
         and math.isfinite(summary.converged_at)
@@ -598,24 +600,36 @@ def _is_out_of_space(exc: OSError) -> bool:
     return exc.errno == errno.ENOSPC or "No space left" in str(exc)
 
 
-def _remove_scratch(path: str) -> None:
+def _remove_scratch(path: str) -> str | None:
     """Delete the scratch directory; a read-only directory in the copy must not leak it.
 
-    A failing removal is retried after making the entry and its parent writable; if it still
-    fails the leftover is ignored (it must not hide the result or the error of the trial).
+    A failing removal is retried after making the failing entry and its parent writable, but only
+    for directories inside the scratch tree: the parent of the scratch root (for example a
+    user-owned TMPDIR) is never touched. If the directory still exists afterwards its path is
+    returned (the leftover must not hide the result or the error of the trial), otherwise None.
     """
+    root = os.path.realpath(path)
+
+    def inside(candidate: str) -> bool:
+        return os.path.commonpath([root, os.path.realpath(candidate)]) == root
 
     def make_writable_and_retry(function, failed_path, _exc) -> None:
         try:
             parent = os.path.dirname(failed_path)
-            os.chmod(parent, stat.S_IRWXU)
-            if os.path.isdir(failed_path) and not os.path.islink(failed_path):
+            if inside(parent):
+                os.chmod(parent, stat.S_IRWXU)
+            if (
+                inside(failed_path)
+                and os.path.isdir(failed_path)
+                and not os.path.islink(failed_path)
+            ):
                 os.chmod(failed_path, stat.S_IRWXU)
             function(failed_path)
-        except OSError:
+        except (OSError, ValueError):
             pass
 
     shutil.rmtree(path, onexc=make_writable_and_retry)
+    return path if os.path.lexists(path) else None
 
 
 def _trial_control_number(scratch: Path, entry: str) -> float:
@@ -719,6 +733,10 @@ def trial_run(case_dir: Path, solver: str, steps: int = 3, timeout_s: float = 30
             ("writeInterval", "1"),
         ):
             _set_control_entry(scratch, entry, value_text)
-        return run_solver(scratch, solver, n_procs=1, timeout_s=timeout_s)
+        result = run_solver(scratch, solver, n_procs=1, timeout_s=timeout_s)
     finally:
-        _remove_scratch(tmp)
+        leaked = _remove_scratch(tmp)
+    if leaked is not None:
+        note = f"\n[cfdagent] could not delete the scratch directory {leaked}\n"
+        result = replace(result, tool=replace(result.tool, tail=result.tool.tail + note))
+    return result

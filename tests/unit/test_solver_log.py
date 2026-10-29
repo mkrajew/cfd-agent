@@ -1379,3 +1379,77 @@ def test_trial_run_scratch_is_removed_even_with_a_read_only_directory(tmp_path, 
     assert result.ok
     assert len(scratch_dirs) == 1
     assert not scratch_dirs[0].exists()
+
+
+# --- cleanup stays inside the scratch tree, odd steps are ignored ---------------------------
+
+
+@pytest.mark.skipif(os.name == "nt", reason="needs POSIX permissions")
+def test_scratch_cleanup_never_changes_the_mode_of_the_parent_of_the_scratch_root(
+    tmp_path, monkeypatch
+):
+    shared = tmp_path / "shared"  # stands for a user-owned TMPDIR
+    shared.mkdir()
+    shared.chmod(0o755)
+    scratch = shared / "cfdagent-trial-x"
+    scratch.mkdir()
+
+    def failing_rmtree(path, onexc):
+        onexc(os.rmdir, path, OSError("cannot remove the root"))  # the root itself fails
+
+    monkeypatch.setattr(foam.shutil, "rmtree", failing_rmtree)
+    foam._remove_scratch(str(scratch))
+    assert shared.stat().st_mode & 0o777 == 0o755
+
+
+@pytest.mark.skipif(os.name == "nt", reason="needs POSIX permissions")
+def test_scratch_cleanup_only_unlocks_directories_inside_the_scratch_tree(tmp_path):
+    shared = tmp_path / "shared"  # stands for a user-owned TMPDIR
+    shared.mkdir()
+    shared.chmod(0o755)
+    scratch = shared / "cfdagent-trial-y"
+    (scratch / "a" / "b").mkdir(parents=True)
+    (scratch / "a" / "b" / "f").write_text("x\n", encoding="utf-8")
+    (scratch / "a" / "b").chmod(0o500)
+    try:
+        assert foam._remove_scratch(str(scratch)) is None
+    finally:
+        if scratch.exists():
+            (scratch / "a" / "b").chmod(0o700)
+    assert not scratch.exists()
+    assert shared.stat().st_mode & 0o777 == 0o755
+
+
+def test_a_leaked_scratch_directory_is_named_in_the_result(tmp_path, monkeypatch):
+    case = _make_case(tmp_path)
+    leaked = []
+    real_rmtree = shutil.rmtree
+
+    def keep_it(path, onexc):  # the removal "fails" completely
+        leaked.append(path)
+
+    monkeypatch.setattr(foam.shutil, "rmtree", keep_it)
+    monkeypatch.setattr(
+        foam, "run_tool", FakeRunner(logs={"icoFoam": "Time = 0.015\n\nEnd\n"}, emulate_dict=True)
+    )
+    try:
+        result = trial_run(case, "icoFoam")
+    finally:
+        real_rmtree(leaked[0], ignore_errors=True)
+    assert result.ok  # the verdict is not changed by a leftover directory
+    assert leaked[0] in result.tool.tail
+    assert "could not delete" in result.tool.tail
+
+
+def test_a_non_finite_last_step_in_the_log_is_ignored():
+    # `Time = -1e999` followed by a finite time makes the last step infinite.
+    summary = parse_solver_log("Time = -1e999\nTime = 1\n\nEnd\n")
+    assert summary.end_time == 1.0
+    assert reach_problem(summary, 40.0, 0.5) is not None
+    assert not _solver_run(1.0, 40.0, delta_t=0.5, last_step=float("inf")).ok
+    assert not _solver_run(1.0, 40.0, delta_t=0.5, last_step=float("nan")).ok
+
+
+def test_a_negative_last_step_does_not_shrink_the_tolerance():
+    assert _solver_run(0.02, 0.015, delta_t=0.005, last_step=-3.0).ok
+    assert not _solver_run(0.0201, 0.015, delta_t=0.005, last_step=-3.0).ok
