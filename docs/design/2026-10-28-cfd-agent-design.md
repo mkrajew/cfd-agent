@@ -328,7 +328,7 @@ Other Claude Code files:
 
 | Milestone | Scope | Done when |
 |---|---|---|
-| **M0 Foundations** | Repo, CI, Docker image (OpenFOAM ESI + Gmsh + CadQuery + Python stack), Bicep infra, LLM capability spike (§6.4) **for all three candidate models**, benchmark references and thresholds fixed | Cavity passes CadQuery → Gmsh → OpenFOAM → post-processing **from hand-written scripts, no LLM**, locally and on the VM |
+| **M0 Foundations** | Repo, CI, Docker image (OpenFOAM ESI + Gmsh + CadQuery + Python stack), Bicep infra, LLM capability spike (§6.4) **run for the candidate models (gpt-oss-120b and Llama-3.3-70B-Instruct tested; qwen3-32b not deployable and excluded, see ADR-0002)**, benchmark references and thresholds fixed | Cavity passes CadQuery → Gmsh → OpenFOAM → post-processing **from hand-written scripts, no LLM**, locally and on the VM |
 | **M1 First autonomous run** | Orchestrator, agents 1–6, CLI, Blob upload, run record | Cavity Re = 100 from text to results with no human intervention |
 | **M2 Robustness + full benchmark set** | Fix loops, Critic, Scorer, knowledge base; generality test set prepared (owner's task texts, references, criteria) but **not run** | Pipe and cylinder (Re 20, Re 100) pass |
 | **M3 Experiment campaign** | Frozen release; `cfdagent bench`; first runs of the generality test set; matrix in §14.1 | Statistics ready for the report |

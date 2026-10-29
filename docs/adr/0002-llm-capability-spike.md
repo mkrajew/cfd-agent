@@ -23,7 +23,7 @@ Mean latency and tokens per call (3 repeats):
 
 | Model | plain | tool call | structured | effort low | effort high |
 |---|---|---|---|---|---|
-| `gpt-oss-120b` | 0.9 s | 0.8 s | 1.4 s | 0.8 s, 305 completion tokens | 1.3 s, 589 completion tokens |
+| `gpt-oss-120b` | 0.9 s | 0.8 s | 1.3 s | 0.8 s, 305 completion tokens | 1.3 s, 589 completion tokens |
 | `Llama-3.3-70B-Instruct` | 0.8 s | 0.4 s | 0.8 s | 1.7 s, 268 completion tokens | 2.0 s, 260 completion tokens |
 
 Observations:

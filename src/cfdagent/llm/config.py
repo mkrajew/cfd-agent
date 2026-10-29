@@ -22,6 +22,8 @@ class LLMSettings(BaseModel):
     endpoint: str  # OpenAI v1 base URL, e.g. https://<account>.services.ai.azure.com/openai/v1/
     auth: Literal["entra", "api_key"] = "entra"
     api_key_env: str = "CFDAGENT_LLM_API_KEY"
+    timeout: float = 120.0  # seconds per request
+    max_retries: int = 2  # automatic retries of failed requests (connection errors, 429, 5xx)
 
     @classmethod
     def from_env(cls) -> Self:

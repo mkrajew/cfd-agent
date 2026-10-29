@@ -104,6 +104,7 @@ def check_tools(client: LLMClient, model: ModelConfig, endpoint: str) -> dict[st
     result = call.pop("result")
     well_formed = any(
         tc.name == "calculator"
+        and isinstance(tc.arguments, dict)
         and isinstance(tc.arguments.get("expression"), str)
         and tc.arguments["expression"].strip() != ""
         for tc in result.tool_calls
@@ -174,7 +175,7 @@ def main(
         Path, typer.Option(help="JSON results file, merged by deployment")
     ] = DEFAULT_OUT,
 ) -> None:
-    settings = LLMSettings.from_env()
+    settings = LLMSettings.from_env().model_copy(update={"max_retries": 0})
     client = LLMClient(settings)
     model = ModelConfig(deployment=deployment, max_tokens=max_tokens)
     runs = []

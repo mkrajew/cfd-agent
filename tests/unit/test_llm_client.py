@@ -9,7 +9,14 @@ import pytest
 from azure.core.credentials import AccessToken
 from pydantic import BaseModel
 
-from cfdagent.llm.client import LLMClient, StructuredOutputError, ToolCall, Usage
+from cfdagent.llm.client import (
+    UNPARSED_KEY,
+    LLMClient,
+    StructuredOutputError,
+    ToolCall,
+    Usage,
+    strict_schema,
+)
 from cfdagent.llm.config import LLMSettings, ModelConfig
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "llm"
@@ -76,6 +83,7 @@ def test_bearer_token_from_credential():
     client, requests = make_client("chat_plain.json")
     client.chat(MESSAGES, ModelConfig(deployment="d"))
     assert requests[0].headers["Authorization"] == "Bearer fake-token"
+    assert client.credential.scopes == ("https://cognitiveservices.azure.com/.default",)
 
 
 def test_parses_tool_calls():
@@ -145,3 +153,92 @@ def test_settings_from_env_requires_endpoint(monkeypatch):
     monkeypatch.delenv("CFDAGENT_LLM_ENDPOINT", raising=False)
     with pytest.raises(ValueError, match="CFDAGENT_LLM_ENDPOINT"):
         LLMSettings.from_env()
+
+
+def test_settings_timeout_and_retries_defaults_and_passthrough():
+    settings = LLMSettings(endpoint=ENDPOINT)
+    assert settings.timeout == 120.0
+    assert settings.max_retries == 2
+    client = LLMClient(
+        LLMSettings(endpoint=ENDPOINT, timeout=7.5, max_retries=0), credential=FakeCredential()
+    )
+    assert client.openai_client.timeout == 7.5
+    assert client.openai_client.max_retries == 0
+
+
+def make_tool_client(arguments) -> LLMClient:
+    body = json.loads((FIXTURES / "chat_tool_call.json").read_text(encoding="utf-8"))
+    body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = arguments
+    transport = httpx2.MockTransport(lambda request: httpx2.Response(200, json=body))
+    return LLMClient(
+        LLMSettings(endpoint=ENDPOINT),
+        credential=FakeCredential(),
+        http_client=httpx2.Client(transport=transport),
+    )
+
+
+@pytest.mark.parametrize("arguments", ["{not json", "[1]", '"x"', "null", "3"])
+def test_malformed_or_non_object_tool_arguments_use_sentinel(arguments):
+    result = make_tool_client(arguments).chat(MESSAGES, ModelConfig(deployment="d"))
+    (call,) = result.tool_calls
+    assert call.name == "calculator"
+    assert call.arguments == {UNPARSED_KEY: arguments}
+
+
+# --- strict schema generation ---
+
+
+class Inner(BaseModel):
+    a: int
+    b: str = "x"
+
+
+class Outer(BaseModel):
+    inner: Inner
+    items: list[Inner]
+    maybe: float | None = None
+    properties: int = 0  # a field that is literally named like the schema keyword
+
+
+def object_nodes(node, path="$"):
+    """Yield (path, node) for every object schema found anywhere below `node`."""
+    if isinstance(node, dict):
+        if node.get("type") == "object":
+            yield path, node
+        for key, value in node.items():
+            if key == "properties":
+                for name, sub in value.items():
+                    yield from object_nodes(sub, f"{path}.{name}")
+            elif key in ("$defs", "definitions"):
+                for name, sub in value.items():
+                    yield from object_nodes(sub, f"{path}#{name}")
+            elif key in ("items", "additionalProperties"):
+                yield from object_nodes(value, f"{path}[]")
+            elif key in ("anyOf", "allOf", "oneOf", "prefixItems"):
+                for i, sub in enumerate(value):
+                    yield from object_nodes(sub, f"{path}|{i}")
+
+
+def test_strict_schema_every_object_is_closed_and_fully_required():
+    schema = strict_schema(Outer.model_json_schema())
+    objects = dict(object_nodes(schema))
+    assert len(objects) == 2  # the root object and Inner under $defs
+    for path, node in objects.items():
+        assert node["additionalProperties"] is False, path
+        assert node["required"] == list(node["properties"]), path
+    assert schema["required"] == ["inner", "items", "maybe", "properties"]
+    assert schema["$defs"]["Inner"]["required"] == ["a", "b"]
+
+
+def test_strict_schema_field_named_properties_is_not_treated_as_an_object():
+    schema = strict_schema(Outer.model_json_schema())
+    assert "additionalProperties" not in schema["properties"]
+    assert schema["properties"]["properties"]["type"] == "integer"
+    assert "required" not in schema["properties"]["properties"]
+
+
+def test_strict_schema_does_not_mutate_input():
+    original = Outer.model_json_schema()
+    snapshot = json.dumps(original, sort_keys=True)
+    strict_schema(original)
+    assert json.dumps(original, sort_keys=True) == snapshot

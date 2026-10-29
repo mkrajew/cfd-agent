@@ -16,8 +16,18 @@ from cfdagent.llm.config import LLMSettings, ModelConfig
 TOKEN_SCOPE = "https://cognitiveservices.azure.com/.default"
 
 
+UNPARSED_KEY = "_unparsed"
+
+
 @dataclass(frozen=True)
 class ToolCall:
+    """One tool call requested by the model.
+
+    `arguments` is always a dict. If the model's argument string is not valid JSON, or is valid
+    JSON that is not an object (a list, string, number or null), it is returned as
+    `{UNPARSED_KEY: <raw argument string>}` so that callers can report it back to the model.
+    """
+
     id: str
     name: str
     arguments: dict
@@ -47,16 +57,40 @@ class StructuredOutputError(Exception):
         self.raw_text = raw_text
 
 
-def _strict_schema(node: Any) -> Any:
-    """Add `additionalProperties: false` to every object schema, as strict mode requires."""
-    if isinstance(node, dict):
-        out = {key: _strict_schema(value) for key, value in node.items()}
-        if out.get("type") == "object" or "properties" in out:
-            out["additionalProperties"] = False
-        return out
-    if isinstance(node, list):
-        return [_strict_schema(item) for item in node]
-    return node
+_SCHEMA_MAP_KEYWORDS = ("$defs", "definitions")  # keyword -> {name: schema}
+_SCHEMA_LIST_KEYWORDS = ("anyOf", "allOf", "oneOf", "prefixItems")  # keyword -> [schema, ...]
+
+
+def strict_schema(node: Any) -> Any:
+    """Return a copy of a JSON schema made acceptable to strict structured-output mode.
+
+    Strict mode needs every object to be closed (`additionalProperties: false`) and to list all
+    of its properties in `required`. Pydantic omits defaulted and `Optional` fields from
+    `required`; here they are required too, so a model must always emit them (use a nullable type
+    to let the model say "no value"). Defaults still apply when the reply is validated.
+    Only schema keywords are followed, so a field that happens to be named `properties` or
+    `items` is not mistaken for a keyword.
+    """
+    if not isinstance(node, dict):
+        return node
+    out = dict(node)
+    props = out.get("properties")
+    if isinstance(props, dict):
+        out["properties"] = {name: strict_schema(sub) for name, sub in props.items()}
+        out["required"] = list(props)
+        out["additionalProperties"] = False
+    elif out.get("type") == "object":
+        out["additionalProperties"] = False
+        out.setdefault("required", [])
+    for key in _SCHEMA_MAP_KEYWORDS:
+        if isinstance(out.get(key), dict):
+            out[key] = {name: strict_schema(sub) for name, sub in out[key].items()}
+    for key in _SCHEMA_LIST_KEYWORDS:
+        if isinstance(out.get(key), list):
+            out[key] = [strict_schema(sub) for sub in out[key]]
+    if isinstance(out.get("items"), dict):
+        out["items"] = strict_schema(out["items"])
+    return out
 
 
 class LLMClient:
@@ -68,15 +102,20 @@ class LLMClient:
         http_client: httpx2.Client | None = None,
     ):
         self.settings = settings
+        self.credential: TokenCredential | None = None
         if settings.auth == "entra":
-            credential = credential or DefaultAzureCredential()
-            api_key: Any = get_bearer_token_provider(credential, TOKEN_SCOPE)
+            self.credential = credential or DefaultAzureCredential()
+            api_key: Any = get_bearer_token_provider(self.credential, TOKEN_SCOPE)
         else:
             api_key = os.environ.get(settings.api_key_env)
             if not api_key:
                 raise ValueError(f"{settings.api_key_env} is not set")
-        self._client = openai.OpenAI(
-            base_url=settings.endpoint, api_key=api_key, http_client=http_client
+        self.openai_client = openai.OpenAI(
+            base_url=settings.endpoint,
+            api_key=api_key,
+            http_client=http_client,
+            timeout=settings.timeout,
+            max_retries=settings.max_retries,
         )
 
     def chat(
@@ -105,21 +144,24 @@ class LLMClient:
                 "type": "json_schema",
                 "json_schema": {
                     "name": response_schema.__name__,
-                    "schema": _strict_schema(response_schema.model_json_schema()),
+                    "schema": strict_schema(response_schema.model_json_schema()),
                     "strict": True,
                 },
             }
 
-        response = self._client.chat.completions.create(**params)
+        response = self.openai_client.chat.completions.create(**params)
         message = response.choices[0].message
         content = message.content
 
         tool_calls = []
         for call in message.tool_calls or []:
+            raw_args = call.function.arguments or "{}"
             try:
-                arguments = json.loads(call.function.arguments or "{}")
+                arguments = json.loads(raw_args)
             except json.JSONDecodeError:
-                arguments = {"_unparsed": call.function.arguments}
+                arguments = None
+            if not isinstance(arguments, dict):
+                arguments = {UNPARSED_KEY: raw_args}
             tool_calls.append(ToolCall(id=call.id, name=call.function.name, arguments=arguments))
 
         usage = response.usage
