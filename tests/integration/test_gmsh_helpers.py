@@ -130,3 +130,26 @@ def test_no_volume_raises(load_step):
     load_step(cq.Workplane("XY").rect(1, 1))  # a face only, no solid
     with pytest.raises(ManifestError, match="volume"):
         assign_physical_groups(_manifest())
+
+
+def test_matching_tolerance_is_relative_to_the_model_size(load_step):
+    # A micro-scale domain of 5e-7 m: an absolute tolerance of 1e-6 would let every surface match
+    # every plane, so each surface would be matched by several patches.
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Terminal", 0)
+    gmsh.model.add("micro")
+    gmsh.model.occ.addBox(0, 0, 0, 5e-7, 5e-7, 5e-7)
+    gmsh.model.occ.synchronize()
+    patches = [
+        BoundaryPatch(name="top", type="wall", locators=[_plane("y", 5e-7)]),
+        BoundaryPatch(
+            name="sides",
+            type="wall",
+            locators=[_plane("x", 0.0), _plane("x", 5e-7), _plane("y", 0.0)],
+        ),
+        BoundaryPatch(
+            name="frontAndBack", type="empty", locators=[_plane("z", 0.0), _plane("z", 5e-7)]
+        ),
+    ]
+    groups = match_surfaces(_manifest(patches))
+    assert {k: len(v) for k, v in groups.items()} == {"top": 1, "sides": 3, "frontAndBack": 2}

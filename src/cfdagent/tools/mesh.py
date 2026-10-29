@@ -404,18 +404,24 @@ def check_mesh(
     case_dir: Path,
     manifest: BoundaryManifest,
     expected_bbox: tuple[float, ...],
-    rel_tol: float = 1e-3,
+    rel_tol: float = 1e-2,
 ) -> GateResult:
     """Run ``checkMesh`` in ``case_dir`` and gate the mesh.
 
     The gate fails if any of these holds: checkMesh reports failed checks; the patch names differ
     from the manifest (in particular a ``defaultFaces`` patch exists, i.e. some boundary faces were
     never named); a patch has no faces; the bounding box differs from ``expected_bbox`` by more
-    than ``rel_tol`` times the largest expected dimension in any coordinate, or contains NaN/inf
+    than the tolerance of ``compare_bbox`` (``rel_tol`` times the expected extent of that axis,
+    with a floor for the 6-digit output of checkMesh), or contains NaN/inf
     (a non-finite expected box or a ``rel_tol`` that is not finite and positive is rejected as
     well); a patch type in ``constant/polyMesh/boundary`` differs from the manifest; for a ``2D``
     manifest the mesh does not have exactly 2 solution directions. All violations are reported,
     not just the first.
+
+    ``rel_tol`` defaults to 1e-2, looser than the geometry gate (1e-3): a mesh of a curved boundary
+    is an inscribed polygon, so its bounding box is short of the CAD box by up to
+    ``R * (1 - cos(pi / N))`` for ``N`` nodes around (about 0.03 mm for a 5 mm radius with ~40
+    nodes, more than ``1e-3`` times the 10 mm diameter). That is a mesh effect, not an error.
 
     Returns the gate result; ``data`` is the parsed ``CheckMeshReport`` (``None`` if checkMesh did
     not run to a parseable end). The checkMesh output is kept in ``checkMesh.log`` in ``case_dir``.

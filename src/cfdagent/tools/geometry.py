@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 from cfdagent.gates import GateResult
@@ -43,16 +44,69 @@ def run_geometry_script(script: Path, workdir: Path, timeout_s: float = 300.0) -
     return fail_after_run(result, problem)
 
 
+def _manifest_coverage_error(step_path: Path, manifest: BoundaryManifest) -> str | None:
+    """Import the STEP into a scratch Gmsh model and match its boundary surfaces to the manifest.
+
+    Returns an error message (naming the geometry stage) if the STEP cannot be imported or the
+    manifest does not cover the boundary exactly, otherwise ``None``. Gmsh is imported here so the
+    module loads on hosts without it. A Gmsh session started here is finalised again; a session
+    that was already running is left alone apart from the scratch model, which is removed.
+    """
+    import gmsh
+
+    from cfdagent.tools.gmsh_helpers import match_surfaces
+
+    started_here = not gmsh.isInitialized()
+    previous_model = None
+    if started_here:
+        gmsh.initialize()
+        gmsh.option.setNumber("General.Terminal", 0)
+    else:
+        previous_model = gmsh.model.getCurrent()
+    try:
+        gmsh.model.add("geometry_gate_scratch")
+        try:
+            gmsh.model.occ.importShapes(str(step_path))
+            gmsh.model.occ.synchronize()
+            match_surfaces(manifest)
+        except ManifestError as exc:
+            return f"geometry stage: the boundary manifest does not cover {STEP_FILE_NAME}: {exc}"
+        except Exception as exc:
+            return f"geometry stage: {STEP_FILE_NAME} could not be checked in Gmsh: {exc}"
+        finally:
+            gmsh.model.remove()
+            if previous_model is not None and previous_model in gmsh.model.list():
+                gmsh.model.setCurrent(previous_model)
+    finally:
+        if started_here:
+            gmsh.finalize()
+    return None
+
+
 def check_geometry(
-    workdir: Path, expected_bbox: tuple[float, ...], rel_tol: float = 1e-3
+    workdir: Path,
+    expected_bbox: tuple[float, ...],
+    expected_volume: float | None = None,
+    rel_tol: float = 1e-3,
 ) -> GateResult:
     """Check the geometry stage output in ``workdir``.
 
     Verifies that ``geometry.step`` and ``boundary_manifest.json`` exist, the manifest parses, the
     STEP holds at least one solid and every solid is valid, and the combined bounding box
     (xmin, ymin, zmin, xmax, ymax, zmax) matches ``expected_bbox`` within ``rel_tol`` times the
-    largest expected dimension, per coordinate. NaN or inf in the actual or expected box, and a
-    ``rel_tol`` that is not a finite positive number, are gate errors and never pass.
+    expected extent of each axis (see ``compare_bbox``). Exactly one solid is supported: several
+    solids are rejected (fuse them into one before export). If ``expected_volume`` is given, the
+    volume of the solid must equal it within ``rel_tol`` (relative to the total volume); this
+    catches a wrong size that leaves the bounding box unchanged. Because the check is relative to
+    the TOTAL volume, an error in a small internal feature is detected only if it changes the
+    volume by more than ``rel_tol * V``, i.e. above about ``rel_tol * V / V_feature`` of the
+    feature's own size; for example a hole radius error below about 5 % can pass at the default
+    1e-3. The default 1e-3 is a coarse check; the orchestrator may call the gate with
+    ``rel_tol=1e-4`` for CAD-exact geometry. Finally the manifest must cover the geometry: every
+    boundary surface matched by exactly one patch and no patch without a surface (an empty patch
+    list is rejected); this step is skipped when the manifest is missing or invalid or a solid is
+    invalid. NaN or inf in the actual or expected values, a non-numeric ``expected_volume``, and
+    a ``rel_tol`` that is not a finite positive number, are gate errors and never pass.
     """
     workdir = Path(workdir)
     errors: list[str] = []
@@ -60,15 +114,26 @@ def check_geometry(
     invalid = validate_expected_bbox(expected_bbox, rel_tol)
     if invalid is not None:
         return GateResult(False, [invalid])
+    if expected_volume is not None:
+        try:
+            usable = math.isfinite(expected_volume) and expected_volume > 0
+        except TypeError:
+            usable = False
+        if not usable:
+            return GateResult(
+                False,
+                [f"expected volume must be a finite positive number, got {expected_volume!r}"],
+            )
 
     step_path = workdir / STEP_FILE_NAME
     manifest_path = workdir / MANIFEST_FILE_NAME
 
+    manifest: BoundaryManifest | None = None
     if not manifest_path.is_file():
         errors.append(f"{MANIFEST_FILE_NAME} is missing in {workdir}")
     else:
         try:
-            BoundaryManifest.from_file(manifest_path)
+            manifest = BoundaryManifest.from_file(manifest_path)
         except ManifestError as exc:
             errors.append(f"{MANIFEST_FILE_NAME} is invalid: {exc}")
 
@@ -88,8 +153,17 @@ def check_geometry(
         errors.append(f"{STEP_FILE_NAME} contains no solid")
         return GateResult(False, errors)
 
+    if len(solids) > 1:
+        errors.append(
+            f"{STEP_FILE_NAME} contains {len(solids)} solids: fuse the solids into one before "
+            "export; multiple solids are not supported in M1"
+        )
+        return GateResult(False, errors)
+
+    all_valid = True
     for i, solid in enumerate(solids):
         if not solid.isValid():
+            all_valid = False
             errors.append(f"solid {i} in {STEP_FILE_NAME} is not valid (isValid() is False)")
 
     boxes = [s.BoundingBox() for s in solids]
@@ -104,5 +178,19 @@ def check_geometry(
     mismatch = compare_bbox(actual, tuple(float(v) for v in expected_bbox), rel_tol)
     if mismatch is not None:
         errors.append(mismatch)
+
+    if expected_volume is not None:
+        actual_volume = sum(s.Volume() for s in solids)
+        # Written so that a NaN volume fails: the comparison is false for NaN.
+        if not abs(actual_volume - expected_volume) <= rel_tol * expected_volume:
+            errors.append(
+                f"volume mismatch: expected {expected_volume:.6g}, got {actual_volume:.6g} "
+                f"(tolerance {rel_tol * expected_volume:.3g})"
+            )
+
+    if manifest is not None and all_valid:
+        coverage = _manifest_coverage_error(step_path, manifest)
+        if coverage is not None:
+            errors.append(coverage)
 
     return GateResult(not errors, errors)
