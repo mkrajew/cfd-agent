@@ -15,9 +15,7 @@ from pathlib import Path
 import numpy as np
 
 from cfdagent.bench.registry import Benchmark, Criterion
-
-# Profile: {"x": [...], "value": [...]}; scalar: float.
-Quantities = dict[str, float | dict[str, list[float]]]
+from cfdagent.quantities import REQUIRED_PROFILE_KEYS, Quantities
 
 _RANGE_TOLERANCE = 1e-9  # relative to the sampled range
 
@@ -117,7 +115,7 @@ def _evaluate(criterion: Criterion, benchmark: Benchmark, value) -> float:
     if criterion.kind == "profile":
         if not isinstance(value, dict):
             raise ValueError("expected a profile ({'x': [...], 'value': [...]}), got a scalar")
-        if "x" not in value or "value" not in value:
+        if any(key not in value for key in REQUIRED_PROFILE_KEYS):
             raise ValueError("a profile needs the keys 'x' and 'value'")
         assert criterion.reference_file is not None  # guaranteed by Criterion validation
         ref_x, ref_v = _read_reference(benchmark.root / criterion.reference_file)

@@ -1,11 +1,22 @@
 """Allowlisted tool runner: no shell, one merged log file, timeouts."""
 
+import json
+import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
-from cfdagent.tools.process import ALLOWED_EXECUTABLES, ToolNotAllowed, run_tool
+from cfdagent.tools.process import (
+    ALLOWED_EXECUTABLES,
+    SAFE_ENV_KEYS,
+    SAFE_ENV_PREFIXES,
+    TAIL_MAX_BYTES,
+    ToolNotAllowed,
+    run_tool,
+)
 
 
 def test_rejects_non_allowlisted_executable(tmp_path):
@@ -130,3 +141,248 @@ def test_python_resolves_to_current_interpreter(tmp_path):
     code = "import sys; print(sys.executable)"
     result = run_tool(["python", "-c", code], cwd=tmp_path, log_path=tmp_path / "log.txt")
     assert sys.executable in result.tail
+
+
+def test_missing_cwd_returns_not_ok(tmp_path):
+    result = run_tool(
+        ["python", "-c", "print('never runs')"],
+        cwd=tmp_path / "does_not_exist",
+        log_path=tmp_path / "log.txt",
+    )
+    assert not result.ok
+    assert result.returncode is None
+    assert not result.timed_out
+    assert "cwd" in result.tail
+    assert "cwd" in result.log_path.read_text()
+
+
+def test_cwd_that_is_a_file_returns_not_ok(tmp_path):
+    a_file = tmp_path / "file.txt"
+    a_file.write_text("x")
+    result = run_tool(["python", "-c", "pass"], cwd=a_file, log_path=tmp_path / "log.txt")
+    assert not result.ok
+    assert "cwd" in result.tail
+
+
+def test_log_inside_missing_cwd_does_not_create_the_cwd(tmp_path):
+    missing = tmp_path / "workdir"
+    result = run_tool(
+        ["python", "-c", "print('never runs')"], cwd=missing, log_path=missing / "run.log"
+    )
+    assert not result.ok
+    assert result.returncode is None
+    assert "cwd" in result.tail
+    assert not missing.exists()
+
+
+def test_bad_argv_raises_even_when_cwd_is_missing(tmp_path):
+    with pytest.raises(ToolNotAllowed):
+        run_tool(["bash"], cwd=tmp_path / "nope", log_path=tmp_path / "log.txt")
+
+
+def test_program_that_cannot_be_started_is_not_ok(tmp_path, monkeypatch):
+    def refuse(*args, **kwargs):
+        raise PermissionError("denied for the test")
+
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+    result = run_tool(["python", "-c", "pass"], cwd=tmp_path, log_path=tmp_path / "log.txt")
+    assert not result.ok
+    assert result.returncode is None
+    assert "denied for the test" in result.tail
+    assert "denied for the test" in result.log_path.read_text()
+
+
+def test_unwritable_log_location_is_not_ok(tmp_path):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("a file, not a directory")
+    result = run_tool(["python", "-c", "pass"], cwd=tmp_path, log_path=blocker / "run.log")
+    assert not result.ok
+    assert result.returncode is None
+    assert "log" in result.tail
+
+
+def test_crlf_in_the_log_is_normalised_in_the_tail(tmp_path):
+    code = "import sys; sys.stdout.buffer.write(b'one\\r\\ntwo\\r\\nthree\\r\\n')"
+    result = run_tool(["python", "-c", code], cwd=tmp_path, log_path=tmp_path / "log.txt")
+    assert result.tail == "one\ntwo\nthree\n"
+
+
+def test_tail_lines_split_on_lf_only(tmp_path):
+    # Form feed and vertical tab must not be treated as line ends when counting tail lines.
+    code = "import sys; sys.stdout.buffer.write(b'a\\x0cb\\x0bc\\n' * 60)"
+    result = run_tool(["python", "-c", code], cwd=tmp_path, log_path=tmp_path / "log.txt")
+    assert result.tail.count("\n") == 50
+    assert result.tail.startswith("a\x0cb\x0bc\n")
+
+
+def test_tail_byte_limit_value():
+    assert TAIL_MAX_BYTES == 8000
+
+
+def test_tail_is_capped_by_bytes(tmp_path):
+    code = "print('a' * 3_000_000 + 'THE-END')"
+    result = run_tool(["python", "-c", code], cwd=tmp_path, log_path=tmp_path / "log.txt")
+    assert result.ok
+    assert len(result.tail.encode()) <= TAIL_MAX_BYTES
+    assert result.tail.rstrip("\r\n").endswith("THE-END")
+    # A single huge line is kept (its end), not dropped as a "broken first line".
+    assert len(result.tail) > 1000
+
+
+def test_tail_byte_cap_drops_broken_first_line(tmp_path):
+    code = "for i in range(3000): print(f'row-{i:05d} ' + 'x' * 20)"
+    result = run_tool(["python", "-c", code], cwd=tmp_path, log_path=tmp_path / "log.txt")
+    lines = result.tail.splitlines()
+    assert len(result.tail.encode()) <= TAIL_MAX_BYTES
+    assert lines[-1].startswith("row-02999")
+    assert all(line.startswith("row-") and len(line) == 30 for line in lines)
+
+
+def test_tail_byte_cap_with_multibyte_text(tmp_path):
+    code = "import sys; sys.stdout.buffer.write(('\\u00e9' * 100000 + 'END\\n').encode('utf-8'))"
+    result = run_tool(["python", "-c", code], cwd=tmp_path, log_path=tmp_path / "log.txt")
+    assert len(result.tail.encode()) <= TAIL_MAX_BYTES
+    assert "�" not in result.tail
+    assert result.tail.rstrip().endswith("END")
+
+
+def _pid_alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        handle = ctypes.windll.kernel32.OpenProcess(process_query_limited_information, 0, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            return bool(ok) and code.value == still_active
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    # A killed process whose parent is gone stays a zombie until PID 1 reaps it (a container
+    # without an init process never does); a zombie is dead for our purposes.
+    if not Path("/proc/self").exists():  # no procfs (not Linux): kill(0) was the best we have
+        return True
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:  # the process vanished between the two checks
+        return False
+    # Format: "pid (comm) state ..."; comm may contain spaces and parentheses.
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+# A child that spawns a long-lived grandchild and records the grandchild's pid.
+_SPAWN_GRANDCHILD = """
+import subprocess, sys, time
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+open(sys.argv[1], 'w').write(str(child.pid))
+time.sleep(60)
+"""
+
+
+def _wait_for_pid_file(pid_file: Path) -> int:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if pid_file.exists() and pid_file.read_text().strip():
+            return int(pid_file.read_text())
+        time.sleep(0.05)
+    raise AssertionError("the child did not write its pid")
+
+
+def _assert_dies_within(pid: int, seconds: float) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"process {pid} is still alive")
+
+
+def test_timeout_kills_child_process(tmp_path):
+    pid_file = tmp_path / "grandchild.pid"
+    result = run_tool(
+        ["python", "-c", _SPAWN_GRANDCHILD, str(pid_file)],
+        cwd=tmp_path,
+        log_path=tmp_path / "log.txt",
+        timeout_s=5.0,
+    )
+    assert result.timed_out
+    _assert_dies_within(_wait_for_pid_file(pid_file), 2.0)
+
+
+def test_keyboard_interrupt_kills_child_and_reraises(tmp_path, monkeypatch):
+    pid_file = tmp_path / "grandchild.pid"
+    original_wait = subprocess.Popen.wait
+    started: list[subprocess.Popen] = []
+
+    def fake_wait(self, timeout=None):
+        if not started:
+            started.append(self)
+            # Let the child spawn its own child before the simulated Ctrl-C arrives.
+            _wait_for_pid_file(pid_file)
+            raise KeyboardInterrupt
+        return original_wait(self, timeout)
+
+    monkeypatch.setattr(subprocess.Popen, "wait", fake_wait)
+    with pytest.raises(KeyboardInterrupt):
+        run_tool(
+            ["python", "-c", _SPAWN_GRANDCHILD, str(pid_file)],
+            cwd=tmp_path,
+            log_path=tmp_path / "log.txt",
+            timeout_s=60.0,
+        )
+    assert started[0].poll() is not None
+    _assert_dies_within(int(pid_file.read_text()), 2.0)
+
+
+def test_environment_is_scrubbed(tmp_path, monkeypatch):
+    secrets = {
+        "AZURE_CLIENT_SECRET": "secret-value-1",
+        "CFDAGENT_LLM_API_KEY": "secret-value-2",
+        "IDENTITY_ENDPOINT": "secret-value-3",
+        "MSI_ENDPOINT": "secret-value-4",
+    }
+    for key, value in secrets.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("FOAM_TEST_MARKER", "kept")
+    code = "import os, json; print('ENV=' + json.dumps(dict(os.environ)))"
+    result = run_tool(["python", "-c", code], cwd=tmp_path, log_path=tmp_path / "log.txt")
+    assert result.ok
+    text = result.log_path.read_text()
+    for key, value in secrets.items():
+        assert key not in text
+        assert value not in text
+    child_env = json.loads(text.split("ENV=", 1)[1])
+    assert any(key.upper() == "PATH" for key in child_env)
+    assert child_env["PWD"] == str(tmp_path.resolve())
+    assert child_env["FOAM_TEST_MARKER"] == "kept"
+    # LC_CTYPE: PEP 538 locale coercion makes the Python child add it to its own environment.
+    for key in child_env:
+        assert (
+            key in SAFE_ENV_KEYS or key in ("PWD", "LC_CTYPE") or key.startswith(SAFE_ENV_PREFIXES)
+        )
+
+
+def test_safe_env_constants():
+    assert {"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LD_LIBRARY_PATH"} <= set(
+        SAFE_ENV_KEYS
+    )
+    # Windows needs these to start a Python child at all.
+    assert {"SYSTEMROOT", "PATHEXT", "TEMP", "TMP", "COMSPEC"} <= set(SAFE_ENV_KEYS)
+    assert set(SAFE_ENV_PREFIXES) == {
+        "FOAM_",
+        "WM_",
+        "MPI_",
+        "OMPI_",
+        "OPAL_",
+        "PYTHON",
+        "VTK_",
+        "PYVISTA_",
+        "MPL",
+    }

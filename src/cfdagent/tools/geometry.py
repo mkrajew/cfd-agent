@@ -2,23 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 
+from cfdagent.gates import GateResult
 from cfdagent.manifest import MANIFEST_FILE_NAME, BoundaryManifest
 from cfdagent.tools.bbox import compare_bbox, validate_expected_bbox
 from cfdagent.tools.process import ToolResult, run_tool
 
 STEP_FILE_NAME = "geometry.step"
 GEOMETRY_LOG_NAME = "geometry.log"
-
-
-@dataclass(frozen=True)
-class GateResult:
-    """Outcome of a deterministic stage gate; ``errors`` is empty when ``ok``."""
-
-    ok: bool
-    errors: list[str]
 
 
 def run_geometry_script(script: Path, workdir: Path, timeout_s: float = 300.0) -> ToolResult:
