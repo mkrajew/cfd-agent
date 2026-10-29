@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from cfdagent.quantities import MAX_PROFILE_POINTS, validate_quantities
 from cfdagent.tools.post import (
     PostProcessingError,
     latest_time_dir,
@@ -145,3 +146,128 @@ def test_write_quantities_rejects_non_finite_profile_value(tmp_path):
 def test_write_quantities_rejects_mismatched_profile_lengths(tmp_path):
     with pytest.raises(ValueError):
         write_quantities(tmp_path / "q.json", {"p": {"x": [0.0, 1.0], "value": [1.0]}})
+
+
+def test_write_quantities_rejects_profile_with_wrong_keys(tmp_path):
+    path = tmp_path / "q.json"
+    with pytest.raises(ValueError, match="'p'.*'x'.*'value'"):
+        write_quantities(path, {"p": {"y": [0.0, 1.0], "u": [1.0, 2.0]}})
+    assert not path.exists()
+
+
+def test_write_quantities_rejects_profile_with_extra_key(tmp_path):
+    with pytest.raises(ValueError, match="'p'"):
+        write_quantities(
+            tmp_path / "q.json", {"p": {"x": [0.0, 1.0], "value": [1.0, 2.0], "extra": [1.0, 2.0]}}
+        )
+
+
+GOOD_PROFILE = {"x": [0.0, 1.0], "value": [1.0, 2.0]}
+
+
+def test_validate_quantities_accepts_and_normalises():
+    result = validate_quantities({"a": 1, "p": {"x": [0, 1], "value": [1.5, 2]}})
+    assert result == {"a": 1.0, "p": {"x": [0.0, 1.0], "value": [1.5, 2.0]}}
+    assert isinstance(result["a"], float)
+    assert all(isinstance(v, float) for v in result["p"]["x"])
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"p": {"x": [0.0], "value": [1.0]}},  # fewer than two points
+        {"p": {"x": [], "value": []}},
+        {"p": {"x": [0.0, 1.0], "value": [1.0]}},  # unequal lengths
+        {"p": {"x": [0.0, 1.0]}},  # missing key
+        {"p": {"x": [0.0, 1.0], "value": [1.0, 2.0], "z": [1.0, 2.0]}},  # extra key
+        {"p": {"x": [0.0, 1.0], "value": [1.0, True]}},  # bool in a profile
+        {"p": {"x": [0.0, 1.0], "value": [1.0, "2"]}},  # string
+        {"p": {"x": [0.0, 1.0], "value": [1.0, None]}},
+        {"p": {"x": [0.0, 1.0], "value": [[1.0], [2.0]]}},  # nested lists
+        {"p": {"x": [0.0, 1.0], "value": (1.0, 2.0)}},  # not a list
+        {"p": {"x": [0.0, 1.0], "value": 3.0}},
+        {"p": {"x": [0.0, 1.0], "value": [1.0, math.nan]}},
+        {"p": {"x": [0.0, math.inf], "value": [1.0, 2.0]}},
+        {"p": {"x": [0.0, 1.0], "value": [1.0, 10**400]}},  # huge int: OverflowError in float()
+        {"a": True},
+        {"a": False},
+        {"a": math.nan},
+        {"a": -math.inf},
+        {"a": "1.0"},
+        {"a": None},
+        {"a": [1.0, 2.0]},  # a list is not a scalar and not a profile
+        {"a": 10**400},
+        {1: 1.0},  # key is not a string
+    ],
+)
+def test_validate_quantities_rejects_hostile_input(bad):
+    with pytest.raises(ValueError):
+        validate_quantities(bad)
+
+
+@pytest.mark.parametrize("bad", [None, [], "x", 3.0, [("a", 1.0)]])
+def test_validate_quantities_rejects_non_dict(bad):
+    with pytest.raises(ValueError, match="JSON object"):
+        validate_quantities(bad)
+
+
+def test_validate_quantities_rejects_short_profile_and_bool():
+    with pytest.raises(ValueError, match="'p'.*at least 2"):
+        validate_quantities({"p": {"x": [0.0], "value": [1.0]}})
+    with pytest.raises(ValueError, match="'flag'.*bool"):
+        validate_quantities({"flag": True})
+    with pytest.raises(ValueError, match="'p'.*bool"):
+        validate_quantities({"p": {"x": [0.0, 1.0], "value": [1.0, False]}})
+
+
+def test_validate_quantities_caps_the_profile_length():
+    too_long = [0.0] * (MAX_PROFILE_POINTS + 1)
+    with pytest.raises(ValueError, match=r"'p'.*1000000"):
+        validate_quantities({"p": {"x": too_long, "value": too_long}})
+    at_cap = [0.0] * MAX_PROFILE_POINTS
+    assert len(validate_quantities({"p": {"x": at_cap, "value": at_cap}})["p"]["x"]) == (
+        MAX_PROFILE_POINTS
+    )
+
+
+def test_validate_quantities_does_not_mutate_its_input():
+    data = {"p": {"x": [0, 1], "value": [1, 2]}}
+    validate_quantities(data)
+    assert data == {"p": {"x": [0, 1], "value": [1, 2]}}
+    assert isinstance(data["p"]["x"][0], int)
+
+
+def test_write_quantities_rejects_huge_integer_and_bool(tmp_path):
+    path = tmp_path / "q.json"
+    for bad in ({"a": 10**400}, {"a": True}):
+        with pytest.raises(ValueError):
+            write_quantities(path, bad)
+    assert not path.exists()
+
+
+def test_validate_quantities_cap_is_checked_before_converting_numbers():
+    huge = [10**400] * (MAX_PROFILE_POINTS + 1)
+    with pytest.raises(ValueError, match="at most") as info:
+        validate_quantities({"p": {"x": huge, "value": huge}})
+    assert "too large" not in str(info.value)
+
+
+def test_validate_quantities_messages_stay_small_for_hostile_input():
+    many_keys = {f"k{i}": [1.0, 2.0] for i in range(100_000)}
+    many_keys["x"] = [0.0, 1.0]
+    with pytest.raises(ValueError, match="and 99") as info:
+        validate_quantities({"p": many_keys})
+    assert len(str(info.value)) < 1000
+
+    long_name = "q" * 5_000_000
+    for bad in (
+        {long_name: {"y": [0.0, 1.0]}},
+        {long_name: True},
+        {long_name: [1.0]},
+        {long_name: {"x": [0.0], "value": [1.0]}},
+        {long_name: {"x": [0.0, 1.0], "value": [1.0, math.nan]}},
+        {"p": {long_name: [1.0, 2.0], "x": [0.0, 1.0]}},
+    ):
+        with pytest.raises(ValueError) as info:
+            validate_quantities(bad)
+        assert len(str(info.value)) < 1000

@@ -67,6 +67,11 @@ Full citations are in the `citation` field of each `benchmark.toml`.
   (pipe), and positions as fractions of the cavity side or the pipe radius. `normalise_by` in the
   TOML is the factor in the units of the reported profile (1 for the cavity, 2 for the pipe, the
   centreline velocity in units of the mean velocity).
+- **Kinematic pressure.** The single-phase incompressible solvers (icoFoam, simpleFoam,
+  pimpleFoam) solve for and report the kinematic pressure p/rho, in m^2/s^2. A pressure in Pa,
+  such as the pipe pressure drop, must be multiplied by the density rho before it is reported; a
+  value that is still p/rho is off by the factor rho and fails the criterion. rho is not in the
+  OpenFOAM case; take it from the task statement.
 
 ## Changing a benchmark
 

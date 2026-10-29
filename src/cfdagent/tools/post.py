@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from cfdagent.errors import AgentInputError
-from cfdagent.quantities import Quantities
+from cfdagent.quantities import Quantities, validate_quantities
 
 
 class PostProcessingError(AgentInputError):
@@ -82,30 +82,27 @@ def read_line_sample(path: Path, columns: Sequence[str]) -> dict[str, np.ndarray
     return {name: table[:, i].copy() for i, name in enumerate(names)}
 
 
-def _finite_floats(values, what: str) -> list[float]:
-    out = [float(v) for v in values]
-    if not all(math.isfinite(v) for v in out):
-        raise ValueError(f"{what} contains a non-finite value")
-    return out
+def _plain(value):
+    """numpy arrays and scalars as plain Python lists and numbers; anything else unchanged."""
+    if isinstance(value, np.ndarray | np.generic):
+        return value.tolist()
+    return value
 
 
 def write_quantities(path: Path, quantities: Quantities) -> None:
     """Write ``quantities`` as JSON: LF line endings, sorted keys, floats as numbers.
 
     Scalars are written as floats; a profile (``{"x": [...], "value": [...]}``) as two float lists
-    (numpy arrays are accepted). Raises ValueError, writing nothing, for a non-finite value or a
-    profile whose lists differ in length.
+    (numpy arrays are accepted). The content is checked with ``validate_quantities`` first: raises
+    ValueError, writing nothing, for a non-finite value, a bool, a profile with other keys than
+    ``x`` and ``value``, fewer than two points or lists of different lengths.
     """
-    out: dict[str, float | dict[str, list[float]]] = {}
-    for name, q in quantities.items():
-        if isinstance(q, dict):
-            profile = {key: _finite_floats(vals, f"{name}.{key}") for key, vals in q.items()}
-            if len({len(v) for v in profile.values()}) > 1:
-                raise ValueError(f"profile {name!r} has lists of different lengths")
-            out[name] = profile
-        else:
-            (value,) = _finite_floats([q], name)
-            out[name] = value
+    if isinstance(quantities, dict):
+        quantities = {
+            name: {key: _plain(v) for key, v in q.items()} if isinstance(q, dict) else _plain(q)
+            for name, q in quantities.items()
+        }
+    out = validate_quantities(quantities)
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
