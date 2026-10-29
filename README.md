@@ -1,5 +1,10 @@
 # cfd-agent
 
+[![ci](https://github.com/mkrajew/cfd-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/mkrajew/cfd-agent/actions/workflows/ci.yml)
+
+**Status: M0 complete (v0.0.1).** The deterministic tools, stage gates, benchmark definitions,
+Azure infrastructure and the LLM client are in place; the agents themselves start in M1.
+
 Describe a CFD task in plain English; LLM agents build the geometry, mesh and
 OpenFOAM case, run it and report the results. The pipeline is CadQuery, Gmsh,
 OpenFOAM and PyVista, driven by a deterministic orchestrator and agents backed
@@ -28,7 +33,11 @@ Available from v0.1.0.
 
 ## Validation
 
-To be added.
+The deterministic toolchain (CadQuery, Gmsh, OpenFOAM `icoFoam` and the scorer) was checked end to
+end with a hand-written, LLM-free lid-driven cavity at Re 100 against the tabulated centreline
+velocities of Ghia et al. (1982). The maximum absolute errors are 0.0049 for u and 0.0087 for v
+(acceptance threshold 0.05). The test passes in CI and on the Azure VM. This validates the tools and
+the scoring path for that one case only; it says nothing yet about the agents or other flow types.
 
 ## Roadmap
 
