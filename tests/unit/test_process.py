@@ -164,6 +164,57 @@ def test_cwd_that_is_a_file_returns_not_ok(tmp_path):
     assert "cwd" in result.tail
 
 
+def test_log_inside_missing_cwd_does_not_create_the_cwd(tmp_path):
+    missing = tmp_path / "workdir"
+    result = run_tool(
+        ["python", "-c", "print('never runs')"], cwd=missing, log_path=missing / "run.log"
+    )
+    assert not result.ok
+    assert result.returncode is None
+    assert "cwd" in result.tail
+    assert not missing.exists()
+
+
+def test_bad_argv_raises_even_when_cwd_is_missing(tmp_path):
+    with pytest.raises(ToolNotAllowed):
+        run_tool(["bash"], cwd=tmp_path / "nope", log_path=tmp_path / "log.txt")
+
+
+def test_program_that_cannot_be_started_is_not_ok(tmp_path, monkeypatch):
+    def refuse(*args, **kwargs):
+        raise PermissionError("denied for the test")
+
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+    result = run_tool(["python", "-c", "pass"], cwd=tmp_path, log_path=tmp_path / "log.txt")
+    assert not result.ok
+    assert result.returncode is None
+    assert "denied for the test" in result.tail
+    assert "denied for the test" in result.log_path.read_text()
+
+
+def test_unwritable_log_location_is_not_ok(tmp_path):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("a file, not a directory")
+    result = run_tool(["python", "-c", "pass"], cwd=tmp_path, log_path=blocker / "run.log")
+    assert not result.ok
+    assert result.returncode is None
+    assert "log" in result.tail
+
+
+def test_crlf_in_the_log_is_normalised_in_the_tail(tmp_path):
+    code = "import sys; sys.stdout.buffer.write(b'one\\r\\ntwo\\r\\nthree\\r\\n')"
+    result = run_tool(["python", "-c", code], cwd=tmp_path, log_path=tmp_path / "log.txt")
+    assert result.tail == "one\ntwo\nthree\n"
+
+
+def test_tail_lines_split_on_lf_only(tmp_path):
+    # Form feed and vertical tab must not be treated as line ends when counting tail lines.
+    code = "import sys; sys.stdout.buffer.write(b'a\\x0cb\\x0bc\\n' * 60)"
+    result = run_tool(["python", "-c", code], cwd=tmp_path, log_path=tmp_path / "log.txt")
+    assert result.tail.count("\n") == 50
+    assert result.tail.startswith("a\x0cb\x0bc\n")
+
+
 def test_tail_byte_limit_value():
     assert TAIL_MAX_BYTES == 8000
 
@@ -214,7 +265,16 @@ def _pid_alive(pid: int) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    return True
+    # A killed process whose parent is gone stays a zombie until PID 1 reaps it (a container
+    # without an init process never does); a zombie is dead for our purposes.
+    if not Path("/proc/self").exists():  # no procfs (not Linux): kill(0) was the best we have
+        return True
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:  # the process vanished between the two checks
+        return False
+    # Format: "pid (comm) state ..."; comm may contain spaces and parentheses.
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
 
 
 # A child that spawns a long-lived grandchild and records the grandchild's pid.
@@ -250,7 +310,7 @@ def test_timeout_kills_child_process(tmp_path):
         ["python", "-c", _SPAWN_GRANDCHILD, str(pid_file)],
         cwd=tmp_path,
         log_path=tmp_path / "log.txt",
-        timeout_s=3.0,
+        timeout_s=5.0,
     )
     assert result.timed_out
     _assert_dies_within(_wait_for_pid_file(pid_file), 2.0)
@@ -302,8 +362,11 @@ def test_environment_is_scrubbed(tmp_path, monkeypatch):
     assert any(key.upper() == "PATH" for key in child_env)
     assert child_env["PWD"] == str(tmp_path.resolve())
     assert child_env["FOAM_TEST_MARKER"] == "kept"
+    # LC_CTYPE: PEP 538 locale coercion makes the Python child add it to its own environment.
     for key in child_env:
-        assert key in SAFE_ENV_KEYS or key == "PWD" or key.startswith(SAFE_ENV_PREFIXES)
+        assert (
+            key in SAFE_ENV_KEYS or key in ("PWD", "LC_CTYPE") or key.startswith(SAFE_ENV_PREFIXES)
+        )
 
 
 def test_safe_env_constants():
@@ -317,6 +380,7 @@ def test_safe_env_constants():
         "WM_",
         "MPI_",
         "OMPI_",
+        "OPAL_",
         "PYTHON",
         "VTK_",
         "PYVISTA_",

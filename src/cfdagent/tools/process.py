@@ -62,6 +62,7 @@ SAFE_ENV_PREFIXES: tuple[str, ...] = (
     "WM_",
     "MPI_",
     "OMPI_",
+    "OPAL_",
     "PYTHON",
     "VTK_",
     "PYVISTA_",
@@ -105,8 +106,10 @@ def _read_tail(log_path: Path) -> str:
     truncated = size > len(data)
     if truncated:
         data = _trim_to_char_boundary(data)
-    text = data.decode("utf-8", errors="replace")
-    lines = text.splitlines(keepends=True)
+    # Lines are split on LF only; CRLF is normalised to LF.
+    text = data.decode("utf-8", errors="replace").replace("\r\n", "\n")
+    parts = text.split("\n")
+    lines = [part + "\n" for part in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
     if truncated and len(lines) > 1:
         lines = lines[1:]
     text = "".join(deque(lines, maxlen=TAIL_LINES))
@@ -125,6 +128,17 @@ def _child_env(cwd: Path) -> dict[str, str]:
     # A shell updates PWD on cd; without this OpenFOAM utilities warn about a stale PWD.
     env["PWD"] = str(cwd)
     return env
+
+
+def _not_ok(log_path: Path, message: str, *, write_log: bool = True) -> ToolResult:
+    """Result for an environment problem; the reason goes to the log where that is possible."""
+    if write_log:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(message, encoding="utf-8")
+        except OSError:
+            pass  # the reason is still in ``tail``
+    return ToolResult(False, None, False, log_path, message)
 
 
 def _resolve(name: str) -> str | None:
@@ -159,9 +173,10 @@ def run_tool(
 
     ``argv[0]`` must be a bare allowlisted name (a path is rejected). On timeout the process (and,
     where the platform allows, its children) is killed and the result has ``timed_out=True`` and
-    ``returncode=None``. An allowlisted executable that is not installed, or a ``cwd`` that is not
-    a directory, gives ``ok=False`` with the reason in the log. Environment problems never raise;
-    only a bad ``argv`` raises ``ToolNotAllowed`` (a programmer error). Any exception while waiting,
+    ``returncode=None``. An allowlisted executable that is not installed, a ``cwd`` that is not a
+    directory (it is never created), a program that cannot be started and an unwritable log all
+    give ``ok=False`` with the reason in ``tail`` (and in the log when it can be written). Only a
+    bad ``argv`` raises ``ToolNotAllowed`` (a programmer error). Any exception while waiting,
     ``KeyboardInterrupt`` included, kills the child's process group before it propagates.
     """
     if not argv:
@@ -174,20 +189,19 @@ def run_tool(
 
     cwd = Path(cwd).resolve()
     log_path = Path(log_path)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Checked before anything is created: a log inside a missing cwd must not conjure the cwd up.
     if not cwd.is_dir():
         message = f"cwd {str(cwd)!r} does not exist or is not a directory\n"
-        log_path.write_text(message, encoding="utf-8")
-        return ToolResult(False, None, False, log_path, _read_tail(log_path))
+        inside_cwd = log_path.resolve().is_relative_to(cwd)
+        return _not_ok(log_path, message, write_log=not inside_cwd)
 
     exe = _resolve(name)
     if exe is None:
-        log_path.write_text(
+        return _not_ok(
+            log_path,
             f"executable {name!r} not found on PATH; it is allowlisted but not installed\n",
-            encoding="utf-8",
         )
-        return ToolResult(False, None, False, log_path, _read_tail(log_path))
 
     popen_kwargs: dict = {}
     if sys.platform == "win32":
@@ -195,35 +209,50 @@ def run_tool(
     else:
         popen_kwargs["start_new_session"] = True
 
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log = open(log_path, "wb")
+    except OSError as exc:
+        message = f"cannot write the log file {str(log_path)!r}: {exc}\n"
+        return _not_ok(log_path, message, write_log=False)
+
     timed_out = False
     returncode: int | None = None
-    with open(log_path, "wb") as log:
-        proc = subprocess.Popen(
-            [exe, *argv[1:]],
-            cwd=cwd,
-            env=_child_env(cwd),
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            shell=False,
-            **popen_kwargs,
-        )
-        finished = False
+    spawn_error: str | None = None
+    with log:
         try:
+            proc = subprocess.Popen(
+                [exe, *argv[1:]],
+                cwd=cwd,
+                env=_child_env(cwd),
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                shell=False,
+                **popen_kwargs,
+            )
+        except OSError as exc:
+            spawn_error = f"cannot start {name!r}: {exc}\n"
+        else:
+            finished = False
             try:
-                returncode = proc.wait(timeout=timeout_s)
-                finished = True
-            except subprocess.TimeoutExpired:
-                timed_out = True
-        finally:
-            # Timeout, KeyboardInterrupt or any other exception: never leave the child (or its
-            # children) running behind us.
-            if not finished:
-                _kill_tree(proc)
+                try:
+                    returncode = proc.wait(timeout=timeout_s)
+                    finished = True
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+            finally:
+                # Timeout, KeyboardInterrupt or any other exception: never leave the child (or its
+                # children) running behind us.
+                if not finished:
+                    _kill_tree(proc)
+
+    if spawn_error is not None:
+        return _not_ok(log_path, spawn_error)
 
     if timed_out:
-        with open(log_path, "a", encoding="utf-8") as log:
-            log.write(f"\n[cfdagent] timed out after {timeout_s} s; process killed\n")
+        with open(log_path, "a", encoding="utf-8") as log_file:
+            log_file.write(f"\n[cfdagent] timed out after {timeout_s} s; process killed\n")
 
     return ToolResult(
         ok=(returncode == 0 and not timed_out),
