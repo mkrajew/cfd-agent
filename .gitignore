@@ -17,5 +17,8 @@ runs/
 postProcessing/
 processor*/
 
+# Compiled ARM output of the Bicep files (az bicep build)
+infra/**/*.json
+
 # Local scratch workspace (never commit)
 .superpowers/

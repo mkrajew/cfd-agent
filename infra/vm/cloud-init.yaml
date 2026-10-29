@@ -1,0 +1,67 @@
+#cloud-config
+# Template: infra/modules/vm.bicep substitutes the __PLACEHOLDERS__ before the VM is created.
+package_update: true
+package_upgrade: false
+packages:
+  - docker.io
+  - curl
+  - python3
+  - fail2ban
+
+write_files:
+  # SSH is open to the Internet (owner decision 2026-10-29): keys only, no root, fail2ban below.
+  # 10- sorts before the cloud image's 50-cloud-init.conf, and sshd uses the first value it reads.
+  - path: /etc/ssh/sshd_config.d/10-cfdagent-hardening.conf
+    permissions: "0644"
+    owner: root:root
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin no
+  - path: /etc/fail2ban/jail.d/cfdagent-sshd.local
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [sshd]
+      enabled = true
+      backend = systemd
+      maxretry = 5
+      findtime = 10m
+      bantime = 1h
+  - path: /usr/local/sbin/cfdagent-idle-shutdown
+    permissions: "0755"
+    owner: root:root
+    encoding: b64
+    content: __B64_IDLE_SCRIPT__
+  - path: /etc/systemd/system/cfdagent-idle-shutdown.service
+    permissions: "0644"
+    owner: root:root
+    encoding: b64
+    content: __B64_IDLE_SERVICE__
+  - path: /etc/systemd/system/cfdagent-idle-shutdown.timer
+    permissions: "0644"
+    owner: root:root
+    encoding: b64
+    content: __B64_IDLE_TIMER__
+  - path: /etc/systemd/system/cfdagent-daily-shutdown.service
+    permissions: "0644"
+    owner: root:root
+    encoding: b64
+    content: __B64_DAILY_SERVICE__
+  - path: /etc/systemd/system/cfdagent-daily-shutdown.timer
+    permissions: "0644"
+    owner: root:root
+    encoding: b64
+    content: __B64_DAILY_TIMER__
+
+runcmd:
+  - [mkdir, -p, /var/lib/cfdagent]
+  - [systemctl, enable, --now, docker]
+  - [sh, -c, "mkdir -p /run/sshd && sshd -t && (systemctl reload ssh || true)"]
+  - [systemctl, enable, --now, fail2ban]
+  - [usermod, -aG, docker, "__ADMIN_USER__"]
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, cfdagent-idle-shutdown.timer]
+  - [systemctl, enable, --now, cfdagent-daily-shutdown.timer]
+  # The pull is best effort: it fails until the image is published and public.
+  - [sh, -c, "docker pull __CONTAINER_IMAGE__ || echo 'image pre-pull failed; pull it manually'"]
