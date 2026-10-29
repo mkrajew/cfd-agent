@@ -4,15 +4,21 @@
 and returns a ``SolverRun``. ``parse_solver_log`` and ``parse_solver_log_file`` turn a solver log
 into a ``SolverLogSummary``. A run counts as successful only when the step exited cleanly, the log
 ends with the solver's final ``End`` line, shows no fatal error and no divergence, AND the last
-time it reports is the ``endTime`` of the case's ``controlDict``; an exit code of 0 alone is never
-trusted. ``trial_run`` does a few time steps in a scratch copy of a case, to find setup errors
-cheaply.
+time it reports reaches the ``endTime`` of the case's ``controlDict`` (within one time step and the
+printed precision, see ``SolverRun.ok``; a steady solver that announces convergence may stop
+earlier); an exit code of 0 alone is never trusted. ``trial_run`` does a few time steps in a
+scratch copy of a case, to find setup errors cheaply.
+
+Security note: ``foamDictionary`` expands ``#calc`` and ``#codeStream`` in the dictionaries an agent
+wrote, so reading ``controlDict`` can execute agent-written code. The confinement is the executor
+sandbox (container without network or credentials), not this module.
 """
 
 from __future__ import annotations
 
 import io
 import math
+import os
 import re
 import shutil
 import tempfile
@@ -33,10 +39,13 @@ _UTILITY_TIMEOUT_S = 600.0
 _DICTIONARY_TIMEOUT_S = 60.0
 _DICTIONARY_LOG_NAME = "log.foamDictionary"
 _CONTROL_DICT = "system/controlDict"
+_DEFAULT_TIME_PRECISION = 6  # OpenFOAM's timePrecision when controlDict does not set it
+_DICTIONARY_PRECISION = "15"  # digits foamDictionary prints and writes numbers with
 
 # A residual or Courant number above this value is a blow-up, not a solution: the run counts as
-# diverged even when the log still ends with ``End`` and shows no NaN. Healthy runs stay many
-# orders of magnitude below it (residuals are normalised, Courant numbers are of order 1).
+# diverged even when the log still ends with ``End`` and shows no NaN. It is a safety net: healthy
+# residuals are normalised (at most about 1) and healthy Courant numbers reach tens to hundreds at
+# most, and on real blow-ups the Final-residual check usually fires first.
 DIVERGENCE_LIMIT = 1e6
 
 # Executables a solver run may launch. Every other allowlisted name is in NON_SOLVERS; a test
@@ -63,6 +72,8 @@ _RANK_PREFIX_RE = re.compile(r"^\s*\[\d+\]\s?")
 _FROM_RE = re.compile(r"^\s*From\b")
 _END_RE = re.compile(r"^End\s*$")
 _TIME_RE = re.compile(r"^Time = ([-+0-9.eE]+)s?\s*$")
+# Anchored on the whole line: only the steady-state solvers' own convergence announcement counts.
+_CONVERGED_RE = re.compile(r"^SIMPLE solution converged in (\d+) iterations\s*$")
 _RESIDUAL_RE = re.compile(
     r"Solving for (\S+?), Initial residual = (\S+?), Final residual = (\S+?), No Iterations"
 )
@@ -86,7 +97,10 @@ class SolverLogSummary:
     ``Final residual`` of the last solve of that field in the log, so when a field is solved
     several times per step (PISO/PIMPLE correctors) the last solve of the last step wins; a
     diverged run may contain ``nan`` here. ``max_courant``: the maximum of the finite ``Courant
-    Number ... max`` values, or None if the log has none.
+    Number ... max`` values, or None if the log has none. ``converged_at``: the iteration given by
+    the steady solvers' ``SIMPLE solution converged in N iterations`` line, None if absent.
+    ``first_time`` / ``last_step``: the first ``Time = ...`` value and the difference between the
+    last two (None when the log has fewer than one / two of them).
     """
 
     completed: bool
@@ -95,6 +109,9 @@ class SolverLogSummary:
     end_time: float | None
     final_residuals: dict[str, float]
     max_courant: float | None
+    converged_at: float | None = None
+    first_time: float | None = None
+    last_step: float | None = None
 
     @property
     def failure_reason(self) -> str | None:
@@ -119,31 +136,80 @@ class SolverRun:
     run). ``solver_log``: the solver's own log (``log.<solver>``; it does not exist when the
     solver never started). ``summary``: what that log says (that of an empty log when the solver
     never started). ``case_end_time``: the ``endTime`` of the case's ``controlDict``, None when it
-    could not be read.
+    could not be read. ``delta_t`` and ``time_precision``: ``deltaT`` (None when unreadable) and
+    ``timePrecision`` (default 6) of the same file; they set the tolerance of the end-time check.
     """
 
     tool: ToolResult
     solver_log: Path
     summary: SolverLogSummary
     case_end_time: float | None
+    delta_t: float | None = None
+    time_precision: int = _DEFAULT_TIME_PRECISION
 
     @property
     def ok(self) -> bool:
-        """True only if the step succeeded, the log is clean AND the run reached ``endTime``.
+        """True if the solver ran cleanly to the end of the requested time.
 
-        The end time is compared with the last ``Time = ...`` of the log, relative tolerance 1e-9.
+        The step succeeded, the log is complete and clean, and the last ``Time`` reaches
+        ``endTime`` (see ``reach_problem``). It does NOT mean the solution converged: the
+        steady-state residual check belongs to the Solver Runner gate.
         """
         return (
             self.tool.ok
             and self.summary.completed
-            and _reached(self.summary.end_time, self.case_end_time)
+            and reach_problem(self.summary, self.case_end_time, self.delta_t, self.time_precision)
+            is None
         )
 
 
-def _reached(end_time: float | None, case_end_time: float | None) -> bool:
-    if end_time is None or case_end_time is None:
-        return False
-    return math.isclose(end_time, case_end_time, rel_tol=1e-9, abs_tol=0.0)
+ZERO_STEP_MESSAGE = (
+    "the solver advanced no time step; the start time is at or after endTime. "
+    "startFrom latestTime picks up old time directories. Delete them or set startFrom startTime."
+)
+
+
+def _print_tolerance(a: float, b: float, time_precision: int) -> float:
+    """Largest error from the log printing times with ``time_precision`` significant digits."""
+    return max(1e-9, 10.0 ** -(time_precision - 1)) * max(abs(a), abs(b))
+
+
+def reach_problem(
+    summary: SolverLogSummary,
+    case_end_time: float | None,
+    delta_t: float | None,
+    time_precision: int = _DEFAULT_TIME_PRECISION,
+) -> str | None:
+    """Why the last time in the log does not reach ``endTime``; None if it does.
+
+    Reached means ``|end_time - endTime| <= step + print_tol``. ``step`` is the larger of
+    ``deltaT`` and the last step in the log (a time-stepping run ends within one step of the
+    target, also with an adjustable step), ``print_tol`` is the error of printing times with
+    ``time_precision`` digits. A steady solver that announced convergence (``converged_at`` equal
+    to the last ``Time``) may stop earlier than ``endTime``.
+    """
+    if case_end_time is None:
+        return f"cannot read 'endTime' from {_CONTROL_DICT}"
+    end = summary.end_time
+    if end is None:
+        return ZERO_STEP_MESSAGE
+    tol = _print_tolerance(end, case_end_time, time_precision)
+    step = max(delta_t if delta_t is not None and math.isfinite(delta_t) else 0.0, 0.0)
+    step = max(step, summary.last_step or 0.0)
+    if (
+        summary.converged_at is not None
+        and summary.completed
+        and abs(summary.converged_at - end) <= tol
+        and end <= case_end_time + step + tol
+    ):
+        return None
+    if abs(end - case_end_time) <= step + tol:
+        return None
+    return (
+        f"the solver stopped at Time = {end:.12g} but {_CONTROL_DICT} has endTime "
+        f"{case_end_time:.12g}: the run did not reach the requested end time. "
+        "stopAt must be endTime; endTime should be a multiple of deltaT"
+    )
 
 
 def _parse_float(token: str) -> float | None:
@@ -165,6 +231,9 @@ class _LogScanner:
         self.diverged = False
         self.has_end = False
         self.end_time: float | None = None
+        self.first_time: float | None = None
+        self.last_step: float | None = None
+        self.converged_at: float | None = None
         self.final_residuals: dict[str, float] = {}
         self.max_courant: float | None = None
         self._fatal: list[str] | None = None  # message lines of the first fatal error
@@ -181,7 +250,15 @@ class _LogScanner:
         if m:
             t = _parse_float(m.group(1))
             if t is not None:
+                if self.end_time is None:
+                    self.first_time = t
+                else:
+                    self.last_step = t - self.end_time
                 self.end_time = t
+            return
+        m = _CONVERGED_RE.match(line)
+        if m:
+            self.converged_at = float(m.group(1))
             return
         m = _RESIDUAL_RE.search(line)
         if m:
@@ -237,6 +314,9 @@ class _LogScanner:
             end_time=self.end_time,
             final_residuals=dict(self.final_residuals),
             max_courant=self.max_courant,
+            converged_at=self.converged_at,
+            first_time=self.first_time,
+            last_step=self.last_step,
         )
 
 
@@ -303,15 +383,32 @@ def _prepare_decomposition(case_dir: Path, n_procs: int) -> None:
         f.write(content)
 
 
-def _read_control_number(case_dir: Path, entry: str) -> tuple[float | None, str | None]:
+def _available_threads() -> int:
+    """Hardware threads this process may use (one MPI slot each with --use-hwthread-cpus)."""
+    affinity = getattr(os, "sched_getaffinity", None)
+    return len(affinity(0)) if affinity else (os.cpu_count() or 1)
+
+
+def _read_control_number(
+    case_dir: Path, entry: str, default: float | None = None
+) -> tuple[float | None, str | None]:
     """Read a number from ``system/controlDict`` with ``foamDictionary``: ``(value, reason)``.
 
+    The value is printed with 15 digits. An absent entry gives ``default`` when there is one.
     ``reason`` says why there is no value (missing or unparsable file, missing entry, not a plain
     number); that is a problem with what the agent wrote, not an error of ours. A foamDictionary
     that cannot be started or times out raises ``ToolFailure``.
     """
     result = run_tool(
-        ["foamDictionary", _CONTROL_DICT, "-entry", entry, "-value"],
+        [
+            "foamDictionary",
+            _CONTROL_DICT,
+            "-entry",
+            entry,
+            "-value",
+            "-precision",
+            _DICTIONARY_PRECISION,
+        ],
         cwd=case_dir,
         log_path=case_dir / _DICTIONARY_LOG_NAME,
         timeout_s=_DICTIONARY_TIMEOUT_S,
@@ -322,6 +419,8 @@ def _read_control_number(case_dir: Path, entry: str) -> tuple[float | None, str 
         )
     lines = [line.strip() for line in result.tail.splitlines() if line.strip()]
     if not result.ok:
+        if default is not None and "Cannot find entry" in result.tail:
+            return default, None
         detail = lines[-1] if lines else f"foamDictionary exited with code {result.returncode}"
         return None, f"cannot read '{entry}' from {_CONTROL_DICT} ({detail})"
     value = _parse_float(lines[-1]) if lines else None
@@ -333,11 +432,25 @@ def _read_control_number(case_dir: Path, entry: str) -> tuple[float | None, str 
     return value, None
 
 
+def _read_run_settings(case_dir: Path) -> tuple[float | None, str | None, float | None, int]:
+    """``(endTime, why endTime is unreadable, deltaT or None, timePrecision)`` of the case."""
+    case_end_time, problem = _read_control_number(case_dir, "endTime")
+    if case_end_time is None:
+        return None, problem, None, _DEFAULT_TIME_PRECISION
+    delta_t, _ = _read_control_number(case_dir, "deltaT")
+    precision, _ = _read_control_number(case_dir, "timePrecision", default=_DEFAULT_TIME_PRECISION)
+    if precision is None or not 1 <= precision <= 17:
+        precision = _DEFAULT_TIME_PRECISION
+    return case_end_time, None, delta_t, int(precision)
+
+
 def _solver_problem(
     step: ToolResult,
     summary: SolverLogSummary,
     case_end_time: float | None,
     end_time_problem: str | None,
+    delta_t: float | None,
+    time_precision: int,
 ) -> str | None:
     """Why a solver step is not a success; None if it is one (or if the log already says why).
 
@@ -350,12 +463,7 @@ def _solver_problem(
         return summary.failure_reason
     if case_end_time is None:
         return end_time_problem or f"cannot read 'endTime' from {_CONTROL_DICT}"
-    if not _reached(summary.end_time, case_end_time):
-        return (
-            f"the solver stopped at Time = {summary.end_time:g} but {_CONTROL_DICT} has "
-            f"endTime {case_end_time:g}: the run did not reach the requested end time"
-        )
-    return None
+    return reach_problem(summary, case_end_time, delta_t, time_precision)
 
 
 def run_solver(
@@ -364,20 +472,23 @@ def run_solver(
     """Run ``solver`` in ``case_dir``; logs are written to ``case_dir``.
 
     ``n_procs`` must be 1..4 (ValueError otherwise, before anything runs) and ``solver`` must be in
-    ``SOLVERS`` (ToolNotAllowed otherwise).
+    ``SOLVERS`` (ToolNotAllowed otherwise). More ranks than hardware threads raise
+    ``AgentInputError`` (the choice of ``n_procs`` is the caller's; there is no clamping).
 
     Serial (``n_procs == 1``): ``<solver>`` with log ``log.<solver>``.
     Parallel: ``decomposePar -force`` (``log.decomposePar``; ``system/decomposeParDict`` is created
     with ``numberOfSubdomains n_procs`` and method ``scotch`` if absent, a mismatching existing one
     is a ValueError), ``mpirun --use-hwthread-cpus -np N <solver> -parallel`` (``log.<solver>``),
-    then ``reconstructPar -latestTime`` (``log.reconstructPar``).
+    then ``reconstructPar -latestTime`` (``log.reconstructPar``). A failing ``decomposePar`` is
+    returned as it is (``summary`` of an empty log, ``case_end_time`` None).
 
     ``SolverRun.tool`` is the first failing step, otherwise the last step. A solver step with exit
-    code 0 whose log is not ``completed`` (fatal error, divergence, missing ``End``), or whose
-    last ``Time`` differs from the ``endTime`` of ``system/controlDict`` (read with
-    ``foamDictionary``; unreadable counts as a failure), is turned into a failed step: the reason
-    is appended to the solver log and so is visible in ``tool.tail``. A run that fails this way is
-    not reconstructed. A ``foamDictionary`` that cannot run or times out raises ``ToolFailure``.
+    code 0 whose log is not ``completed`` (fatal error, divergence, missing ``End``), that advanced
+    no time step, or whose last ``Time`` does not reach the ``endTime`` of ``system/controlDict``
+    (read with ``foamDictionary``, see ``reach_problem``; unreadable counts as a failure), is
+    turned into a failed step: the reason is appended to the solver log and so is visible in
+    ``tool.tail``. A run that fails this way is not reconstructed. A ``foamDictionary`` that cannot
+    run or times out raises ``ToolFailure``.
     """
     _check_n_procs(n_procs)
     _check_solver(solver)
@@ -387,6 +498,12 @@ def run_solver(
     if n_procs == 1:
         step = run_tool([solver], cwd=case_dir, log_path=solver_log, timeout_s=timeout_s)
     else:
+        available = _available_threads()
+        if n_procs > available:
+            raise AgentInputError(
+                f"n_procs={n_procs} but only {available} hardware threads are available; "
+                f"use n_procs <= {available}"
+            )
         _prepare_decomposition(case_dir, n_procs)
         decomposed = run_tool(
             ["decomposePar", "-force"],
@@ -395,8 +512,7 @@ def run_solver(
             timeout_s=min(timeout_s, _UTILITY_TIMEOUT_S),
         )
         if not decomposed.ok:
-            case_end_time, _ = _read_control_number(case_dir, "endTime")
-            return SolverRun(decomposed, solver_log, parse_solver_log(""), case_end_time)
+            return SolverRun(decomposed, solver_log, parse_solver_log(""), None)
         step = run_tool(
             ["mpirun", "--use-hwthread-cpus", "-np", str(n_procs), solver, "-parallel"],
             cwd=case_dir,
@@ -408,12 +524,14 @@ def run_solver(
         summary = parse_solver_log_file(solver_log)
     except FileNotFoundError:  # the process could not be started and wrote no log
         summary = parse_solver_log("")
-    case_end_time, end_time_problem = _read_control_number(case_dir, "endTime")
-    problem = _solver_problem(step, summary, case_end_time, end_time_problem)
+    case_end_time, end_time_problem, delta_t, time_precision = _read_run_settings(case_dir)
+    problem = _solver_problem(
+        step, summary, case_end_time, end_time_problem, delta_t, time_precision
+    )
     if problem is not None:
         step = fail_after_run(step, problem)
     if not step.ok or n_procs == 1:
-        return SolverRun(step, solver_log, summary, case_end_time)
+        return SolverRun(step, solver_log, summary, case_end_time, delta_t, time_precision)
 
     reconstructed = run_tool(
         ["reconstructPar", "-latestTime"],
@@ -421,29 +539,49 @@ def run_solver(
         log_path=case_dir / "log.reconstructPar",
         timeout_s=min(timeout_s, _UTILITY_TIMEOUT_S),
     )
-    return SolverRun(reconstructed, solver_log, summary, case_end_time)
+    return SolverRun(reconstructed, solver_log, summary, case_end_time, delta_t, time_precision)
 
 
-def _is_time_directory(path: Path) -> bool:
+def _time_directory_value(path: Path) -> float | None:
+    """The time a directory name stands for, None if it is not a time directory."""
     if not path.is_dir():
-        return False
+        return None
     try:
-        float(path.name)
+        value = float(path.name)
     except ValueError:
-        return False
-    return True
+        return None
+    return value if math.isfinite(value) else None
 
 
-def _trial_ignore(directory: str, names: list[str]) -> list[str]:
-    """Top level of a case: skip results, logs, decomposed data and every time directory."""
-    top = Path(directory)
-    return [
-        name
-        for name in names
-        if name == "postProcessing"
-        or name.startswith(("processor", "log."))
-        or _is_time_directory(top / name)
-    ]
+def _raise_symlink(path: Path, case_dir: Path) -> None:
+    shown = path.relative_to(case_dir).as_posix()
+    raise AgentInputError(
+        f"{shown} is a symbolic link; a case must not contain symbolic links; write real files"
+    )
+
+
+def _reject_symlinks(path: Path, case_dir: Path) -> None:
+    """Raise ``AgentInputError`` for a symbolic link at or below ``path`` (never followed)."""
+    if path.is_symlink():
+        _raise_symlink(path, case_dir)
+    if not path.is_dir():
+        return
+    for root, dirnames, filenames in os.walk(path, followlinks=False):
+        for name in (*dirnames, *filenames):
+            candidate = Path(root) / name
+            if candidate.is_symlink():
+                _raise_symlink(candidate, case_dir)
+
+
+def _copy_into(source: Path, target: Path) -> None:
+    """Copy a directory by value; a full disk or similar is a tool failure, not the agent's."""
+    try:
+        shutil.copytree(source, target, symlinks=False)
+    except OSError as exc:  # shutil.Error is an OSError
+        raise ToolFailure(
+            f"could not copy {source.name} into the scratch directory: {exc}; "
+            "check the free disk space"
+        ) from exc
 
 
 def _trial_control_number(scratch: Path, entry: str) -> float:
@@ -457,7 +595,16 @@ def _trial_control_number(scratch: Path, entry: str) -> float:
 
 def _set_control_entry(scratch: Path, entry: str, value: str) -> None:
     result = run_tool(
-        ["foamDictionary", _CONTROL_DICT, "-entry", entry, "-set", value],
+        [
+            "foamDictionary",
+            _CONTROL_DICT,
+            "-entry",
+            entry,
+            "-set",
+            value,
+            "-precision",
+            _DICTIONARY_PRECISION,
+        ],
         cwd=scratch,
         log_path=scratch / _DICTIONARY_LOG_NAME,
         timeout_s=_DICTIONARY_TIMEOUT_S,
@@ -467,18 +614,28 @@ def _set_control_entry(scratch: Path, entry: str, value: str) -> None:
 
 
 def trial_run(case_dir: Path, solver: str, steps: int = 3, timeout_s: float = 300.0) -> SolverRun:
-    """Run ``steps`` time steps of the case, serially, in a scratch copy; find setup errors early.
+    """Run about ``steps`` time steps of the case, serially, in a scratch copy; find setup errors.
 
-    The copy leaves out ``postProcessing``, logs, ``processor*`` and every time directory except
-    the one of ``startTime``. In the copy ``startFrom`` is ``startTime`` and ``endTime`` is
-    ``startTime + steps * deltaT``, so a successful result means the setup runs and reaches that
-    time. ``case_dir`` is never written to, and the scratch directory is deleted afterwards, also
-    on an exception; this means the paths in the returned ``SolverRun`` no longer exist, and only
-    its ``tool.tail``, ``summary`` and ``case_end_time`` are usable.
+    Only ``constant``, ``system`` and the start-time directory (and ``0``, if that is another one)
+    are copied, by value; results, logs, decomposed data and other time directories are not. In
+    the copy ``startFrom`` is ``startTime``, ``stopAt`` is ``endTime``, ``endTime`` is
+    ``startTime + steps * deltaT`` and a write is forced at the end (``writeControl timeStep``,
+    ``writeInterval steps``), so that errors that only show when fields or function objects are
+    written surface too. The result is judged like a normal run (see ``SolverRun.ok``): clean log,
+    at least one time step, last time within one step of the target.
 
-    A case without ``system/controlDict``, or without a readable ``startTime`` or positive
-    ``deltaT``, raises ``AgentInputError`` (the agent wrote the case). A ``case_dir`` that is not a
-    directory raises ``ToolFailure``. ``steps`` must be an integer of at least 1 (ValueError).
+    Limits: with an adjustable time step the solver does not make exactly ``steps`` steps, it
+    stops at about the target time. The maximum Courant number after a few steps is not evidence
+    of stability.
+
+    ``case_dir`` is never written to, and the scratch directory is deleted afterwards, also on an
+    exception; this means the paths in the returned ``SolverRun`` no longer exist, and only its
+    ``tool.tail``, ``summary`` and ``case_end_time`` are usable.
+
+    A case without ``system/controlDict``, without a readable ``startTime`` or positive
+    ``deltaT``, or containing a symbolic link in the copied parts, raises ``AgentInputError`` (the
+    agent wrote the case). A ``case_dir`` that is not a directory, or a failed copy (full disk),
+    raises ``ToolFailure``. ``steps`` must be an integer of at least 1 (ValueError).
     """
     if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
         raise ValueError(f"steps must be an integer of at least 1, got {steps!r}")
@@ -491,17 +648,40 @@ def trial_run(case_dir: Path, solver: str, steps: int = 3, timeout_s: float = 30
             f"{case_dir} has no {_CONTROL_DICT}; write it (application, startFrom, startTime, "
             "endTime, deltaT, write settings) before running the solver"
         )
+    for name in ("constant", "system"):
+        _reject_symlinks(case_dir / name, case_dir)
 
-    with tempfile.TemporaryDirectory(prefix="cfdagent-trial-") as tmp:
+    try:
+        tmp = tempfile.mkdtemp(prefix="cfdagent-trial-")
+    except OSError as exc:
+        raise ToolFailure(f"could not create a scratch directory: {exc}") from exc
+    try:
         scratch = Path(tmp) / "case"
-        shutil.copytree(case_dir, scratch, symlinks=True, ignore=_trial_ignore)
+        scratch.mkdir()
+        for name in ("constant", "system"):
+            if (case_dir / name).is_dir():
+                _copy_into(case_dir / name, scratch / name)
         start_time = _trial_control_number(scratch, "startTime")
         delta_t = _trial_control_number(scratch, "deltaT")
         if delta_t <= 0:
             raise AgentInputError(f"deltaT in {_CONTROL_DICT} must be positive, got {delta_t:g}")
-        for candidate in case_dir.iterdir():
-            if _is_time_directory(candidate) and _reached(float(candidate.name), start_time):
-                shutil.copytree(candidate, scratch / candidate.name, symlinks=True)
-        _set_control_entry(scratch, "startFrom", "startTime")
-        _set_control_entry(scratch, "endTime", f"{start_time + steps * delta_t:.12g}")
+        for candidate in sorted(case_dir.iterdir()):
+            value = _time_directory_value(candidate)
+            if value is None:
+                continue
+            if candidate.name == "0" or math.isclose(
+                value, start_time, rel_tol=1e-9, abs_tol=1e-12
+            ):
+                _reject_symlinks(candidate, case_dir)
+                _copy_into(candidate, scratch / candidate.name)
+        for entry, value_text in (
+            ("startFrom", "startTime"),
+            ("stopAt", "endTime"),
+            ("endTime", f"{start_time + steps * delta_t:.15g}"),
+            ("writeControl", "timeStep"),
+            ("writeInterval", str(steps)),
+        ):
+            _set_control_entry(scratch, entry, value_text)
         return run_solver(scratch, solver, n_procs=1, timeout_s=timeout_s)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)

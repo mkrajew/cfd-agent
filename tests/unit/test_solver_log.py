@@ -2,7 +2,10 @@
 
 import hashlib
 import math
+import os
 import re
+import shutil
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -11,10 +14,12 @@ from cfdagent.errors import AgentInputError, ToolFailure
 from cfdagent.tools import foam
 from cfdagent.tools.foam import (
     DIVERGENCE_LIMIT,
+    ZERO_STEP_MESSAGE,
     SolverLogSummary,
     SolverRun,
     parse_solver_log,
     parse_solver_log_file,
+    reach_problem,
     run_solver,
     trial_run,
 )
@@ -252,7 +257,7 @@ def test_parse_log_file_equals_parse_solver_log_on_every_fixture(name):
     assert repr(parse_solver_log_file(LOGS / name)) == repr(parse_solver_log(_read(name)))
 
 
-def test_parse_log_file_streams(tmp_path, monkeypatch):
+def test_parse_log_file_streams(tmp_path):
     # About 12 MB of log lines, with a fatal error and an End line at the very end.
     block = _read("icoFoam_ok.log").split("Starting time loop")[1].rsplit("End", 1)[0]
     path = tmp_path / "big.log"
@@ -261,18 +266,21 @@ def test_parse_log_file_streams(tmp_path, monkeypatch):
         while f.tell() < 12_000_000:
             f.write(block)
         f.write("--> FOAM FATAL ERROR:\nlate failure\n\n    From x\n\nEnd\n")
+    assert path.stat().st_size > 12_000_000
 
     expected = parse_solver_log(path.read_text(encoding="utf-8"))
 
-    def _no_whole_file_read(*args, **kwargs):
-        raise AssertionError("parse_solver_log_file must stream, not read the whole file")
-
-    monkeypatch.setattr(Path, "read_text", _no_whole_file_read)
-    monkeypatch.setattr(Path, "read_bytes", _no_whole_file_read)
-    summary = parse_solver_log_file(path)
+    tracemalloc.start()
+    try:
+        summary = parse_solver_log_file(path)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
     assert summary == expected
     assert summary.fatal_error == "late failure"
     assert not summary.completed
+    # Reading the whole file would allocate at least its size (12 MB).
+    assert peak < 5_000_000, f"peak Python allocation while parsing: {peak} bytes"
 
 
 def test_parse_log_file_handles_crlf_lone_cr_and_invalid_utf8(tmp_path):
@@ -342,11 +350,15 @@ class FakeRunner:
         emulate_dict=False,
         on_run=None,
         timeouts=(),
+        delta_t="0.5",
+        time_precision=None,
     ):
         self.calls = []
         self.logs = logs or {}
         self.returncodes = returncodes or {}
         self.end_time = end_time
+        self.delta_t = delta_t
+        self.time_precision = time_precision
         self.emulate_dict = emulate_dict
         self.on_run = on_run
         self.timeouts = set(timeouts)
@@ -371,7 +383,15 @@ class FakeRunner:
         if not self.emulate_dict:
             if self.end_time is None:
                 return 1, DICT_MISSING_LOG
-            return 0, f"{self.end_time}\n"
+            entry = argv[argv.index("-entry") + 1]
+            value = {
+                "endTime": self.end_time,
+                "deltaT": self.delta_t,
+                "timePrecision": self.time_precision,
+            }[entry]
+            if value is None:
+                return 1, f"Cannot find entry {entry}\n"
+            return 0, f"{value}\n"
         path = cwd / argv[1]
         if not path.is_file():
             return 1, DICT_MISSING_LOG
@@ -387,6 +407,12 @@ class FakeRunner:
         if found is None:
             return 1, f"Cannot find entry {entry}\n"
         return 0, found.group(1).strip() + "\n"
+
+
+@pytest.fixture(autouse=True)
+def _eight_hardware_threads(monkeypatch):
+    # The parallel tests must not depend on the machine they run on.
+    monkeypatch.setattr(foam, "_available_threads", lambda: 8)
 
 
 @pytest.fixture
@@ -411,10 +437,23 @@ def test_run_solver_serial(tmp_path, fake):
 
 def test_run_solver_reads_the_end_time_with_foam_dictionary(tmp_path, fake):
     result = run_solver(tmp_path, "icoFoam")
-    argv, cwd, _, _ = fake.calls[-1]
-    assert argv == ["foamDictionary", "system/controlDict", "-entry", "endTime", "-value"]
+    reads = {c[0][3]: c for c in fake.calls if c[0][0] == "foamDictionary"}
+    assert set(reads) == {"endTime", "deltaT", "timePrecision"}
+    argv, cwd, _, _ = reads["endTime"]
+    # 15 digits, so that times such as 0.1234567891 are read exactly.
+    assert argv == [
+        "foamDictionary",
+        "system/controlDict",
+        "-entry",
+        "endTime",
+        "-value",
+        "-precision",
+        "15",
+    ]
     assert cwd == tmp_path
     assert result.case_end_time == 1.0
+    assert result.delta_t == 0.5
+    assert result.time_precision == 6  # absent entry: OpenFOAM's default
 
 
 def test_run_solver_parallel_sequence(tmp_path, fake):
@@ -422,6 +461,8 @@ def test_run_solver_parallel_sequence(tmp_path, fake):
     assert [c[0][0] for c in fake.calls] == [
         "decomposePar",
         "mpirun",
+        "foamDictionary",
+        "foamDictionary",
         "foamDictionary",
         "reconstructPar",
     ]
@@ -434,7 +475,7 @@ def test_run_solver_parallel_sequence(tmp_path, fake):
         "simpleFoam",
         "-parallel",
     ]
-    assert fake.calls[3][0] == ["reconstructPar", "-latestTime"]
+    assert fake.calls[5][0] == ["reconstructPar", "-latestTime"]
     assert [c[2].name for c in fake.calls if c[0][0] != "foamDictionary"] == [
         "log.decomposePar",
         "log.simpleFoam",
@@ -488,7 +529,9 @@ def test_run_solver_failed_decomposition_stops_before_the_solver(tmp_path, monke
     result = run_solver(tmp_path, "icoFoam", n_procs=2)
     assert not result.ok
     assert result.tool.log_path == tmp_path / "log.decomposePar"
-    assert [c[0][0] for c in runner.calls if c[0][0] != "foamDictionary"] == ["decomposePar"]
+    # The real failure is returned as it is: nothing else runs, not even a foamDictionary.
+    assert [c[0][0] for c in runner.calls] == ["decomposePar"]
+    assert result.case_end_time is None
     # The solver never started: there is no solver log, so the summary is that of an empty log.
     assert not result.summary.completed
     assert result.summary.end_time is None
@@ -556,10 +599,34 @@ def test_end_time_mismatch_is_not_ok(tmp_path, monkeypatch):
     assert "[cfdagent]" in (tmp_path / "log.icoFoam").read_text(encoding="utf-8")
 
 
-def _solver_run(end_time, case_end_time, completed=True, tool_ok=True, tmp_path=Path("x")):
-    summary = SolverLogSummary(completed, not completed, None, end_time, {}, None)
+def _summary(end_time, completed=True, last_step=None, converged_at=None):
+    return SolverLogSummary(
+        completed,
+        not completed,
+        None,
+        end_time,
+        {},
+        None,
+        converged_at=converged_at,
+        first_time=None,
+        last_step=last_step,
+    )
+
+
+def _solver_run(
+    end_time,
+    case_end_time,
+    completed=True,
+    tool_ok=True,
+    delta_t=None,
+    time_precision=6,
+    last_step=None,
+    converged_at=None,
+    tmp_path=Path("x"),
+):
+    summary = _summary(end_time, completed, last_step, converged_at)
     tool = ToolResult(tool_ok, 0 if tool_ok else 1, False, tmp_path / "log", "")
-    return SolverRun(tool, tmp_path / "log", summary, case_end_time)
+    return SolverRun(tool, tmp_path / "log", summary, case_end_time, delta_t, time_precision)
 
 
 def test_solver_run_ok_needs_every_condition():
@@ -571,13 +638,192 @@ def test_solver_run_ok_needs_every_condition():
     assert not _solver_run(None, None).ok
     assert not _solver_run(39.9, 40.0).ok
     assert not _solver_run(40.0, float("nan")).ok
+    assert not _solver_run(float("nan"), 40.0).ok
 
 
-def test_solver_run_end_time_tolerance_is_relative_1e_9():
-    assert _solver_run(40.0 * (1 + 1e-10), 40.0).ok
-    assert not _solver_run(40.0 * (1 + 1e-8), 40.0).ok
-    assert _solver_run(1e-6 * (1 + 1e-10), 1e-6).ok  # relative, not absolute
-    assert not _solver_run(1e-6 * (1 + 1e-8), 1e-6).ok
+def test_solver_run_ok_means_ran_to_the_end_not_converged():
+    assert "NOT mean the solution converged" in (SolverRun.ok.__doc__ or "")
+
+
+def test_reach_rule_allows_one_step_and_the_printing_error():
+    # |end_time - endTime| <= step + print_tol, step = max(deltaT, last step in the log).
+    assert _solver_run(0.015, 0.015, delta_t=0.005).ok
+    assert _solver_run(0.02, 0.015, delta_t=0.005).ok  # one step beyond the target
+    assert _solver_run(0.01, 0.015, delta_t=0.005).ok  # one step short of the target
+    assert not _solver_run(0.0201, 0.015, delta_t=0.005).ok
+    assert not _solver_run(0.0049, 0.015, delta_t=0.005).ok
+    # the last step of the log counts too (adjustable time step, deltaT in controlDict is initial)
+    assert _solver_run(0.019, 0.015, delta_t=0.001, last_step=0.004).ok
+    assert not _solver_run(0.019, 0.015, delta_t=0.001, last_step=0.002).ok
+    # without a step only the printing error is allowed: relative 1e-5 for 6 digits
+    assert _solver_run(40.0 * (1 + 5e-6), 40.0).ok
+    assert not _solver_run(40.0 * (1 + 5e-5), 40.0).ok
+    assert not _solver_run(40.0 * (1 + 5e-6), 40.0, time_precision=12).ok
+    assert _solver_run(40.0 * (1 + 1e-10), 40.0, time_precision=12).ok  # floor 1e-9 relative
+
+
+def test_reach_problem_messages():
+    assert reach_problem(_summary(1.0), 1.0, 0.5) is None
+    assert reach_problem(_summary(None), 1.0, 0.5) == ZERO_STEP_MESSAGE
+    assert "cannot read 'endTime'" in reach_problem(_summary(1.0), None, 0.5)
+    message = reach_problem(_summary(0.123456789012), 40.0, 0.005)
+    assert "0.123456789012" in message and "40" in message  # both times, 12 digits
+    assert "stopAt must be endTime; endTime should be a multiple of deltaT" in message
+
+
+def test_zero_step_message_names_the_cause_and_the_fix():
+    assert "advanced no time step" in ZERO_STEP_MESSAGE
+    assert "startFrom latestTime" in ZERO_STEP_MESSAGE
+    assert "set startFrom startTime" in ZERO_STEP_MESSAGE
+
+
+def test_log_with_end_but_no_time_line_is_not_ok_and_does_not_raise(tmp_path, monkeypatch):
+    # A zero-step run: startFrom latestTime found a time directory at or after endTime.
+    log = "Create time\n\nStarting time loop\n\nEnd\n"
+    monkeypatch.setattr(foam, "run_tool", FakeRunner(logs={"icoFoam": log}))
+    result = run_solver(tmp_path, "icoFoam")
+    assert result.summary.completed
+    assert result.summary.end_time is None
+    assert not result.ok
+    assert not result.tool.ok
+    assert "advanced no time step" in result.tool.tail
+    assert "[cfdagent]" in (tmp_path / "log.icoFoam").read_text(encoding="utf-8")
+
+
+def test_time_precision_widens_the_printing_tolerance():
+    # The log prints times with timePrecision significant digits; 0.123457 stands for 0.1234567.
+    summary = _summary(0.123457)
+    assert reach_problem(summary, 0.1234567, None, 6) is None
+    assert reach_problem(summary, 0.1234567, None, 15) is not None
+    assert reach_problem(_summary(0.123), 0.1234567, None, 3) is None
+
+
+def test_time_precision_is_read_from_the_control_dict(tmp_path, monkeypatch):
+    # endTime 40.002 printed as 40: default tolerance 1e-5 * 40 = 4e-4 < 2e-3, 4 digits: 4e-2
+    runner = FakeRunner(logs={"icoFoam": "Time = 40\n\nEnd\n"}, end_time="40.002", delta_t="1e-9")
+    monkeypatch.setattr(foam, "run_tool", runner)
+    assert run_solver(tmp_path, "icoFoam").ok is False  # default 6 digits
+    runner = FakeRunner(
+        logs={"icoFoam": "Time = 40\n\nEnd\n"},
+        end_time="40.002",
+        delta_t="1e-9",
+        time_precision="4",
+    )
+    monkeypatch.setattr(foam, "run_tool", runner)
+    assert run_solver(tmp_path, "icoFoam").ok
+
+
+# --- steady solvers that announce convergence ----------------------------------------------------
+
+CONVERGED = "SIMPLE solution converged in 133 iterations\n"
+
+
+def _steady_log(last_time=133, converged=CONVERGED):
+    return f"Time = {last_time - 1}\n\nTime = {last_time}\n\n{converged}\nEnd\n"
+
+
+def test_converged_line_is_parsed_only_when_it_is_the_whole_line():
+    assert parse_solver_log(_steady_log()).converged_at == 133.0
+    assert parse_solver_log(_steady_log(converged="")).converged_at is None
+    for line in (
+        "  SIMPLE solution converged in 133 iterations\n",
+        "PIMPLE solution converged in 133 iterations\n",
+        "SIMPLE solution converged in 133 iterations and more\n",
+        "# SIMPLE solution converged in 133 iterations\n",
+        "SIMPLE solution converged in 13x iterations\n",
+    ):
+        assert parse_solver_log(_steady_log(converged=line)).converged_at is None, line
+
+
+def test_first_time_and_last_step_are_reported():
+    summary = parse_solver_log("Time = 0.005\nTime = 0.01\nTime = 0.0175\nEnd\n")
+    assert summary.first_time == 0.005
+    assert summary.last_step == pytest.approx(0.0075)
+    assert parse_solver_log("Time = 1\nEnd\n").last_step is None
+    assert parse_solver_log("End\n").first_time is None
+
+
+def test_early_convergence_is_ok_only_when_announced():
+    ok = _solver_run(133.0, 1000.0, delta_t=1.0, last_step=1.0, converged_at=133.0)
+    assert ok.ok
+    # same early stop without the announcement
+    assert not _solver_run(133.0, 1000.0, delta_t=1.0, last_step=1.0).ok
+    # announcement for another iteration than the last Time
+    assert not _solver_run(133.0, 1000.0, delta_t=1.0, converged_at=120.0).ok
+    # a diverged or incomplete log never counts as converged
+    assert not _solver_run(133.0, 1000.0, delta_t=1.0, converged_at=133.0, completed=False).ok
+    assert not _solver_run(133.0, 1000.0, delta_t=1.0, converged_at=133.0, tool_ok=False).ok
+
+
+def test_run_solver_accepts_a_steady_run_that_converged_early(tmp_path, monkeypatch):
+    runner = FakeRunner(logs={"simpleFoam": _steady_log()}, end_time="1000", delta_t="1")
+    monkeypatch.setattr(foam, "run_tool", runner)
+    result = run_solver(tmp_path, "simpleFoam")
+    assert result.ok
+    assert result.summary.converged_at == 133.0
+
+
+def test_run_solver_rejects_an_early_stop_without_convergence(tmp_path, monkeypatch):
+    runner = FakeRunner(
+        logs={"simpleFoam": _steady_log(converged="")}, end_time="1000", delta_t="1"
+    )
+    monkeypatch.setattr(foam, "run_tool", runner)
+    result = run_solver(tmp_path, "simpleFoam")
+    assert not result.ok
+    assert "endTime 1000" in result.tool.tail
+    assert "stopAt must be endTime" in result.tool.tail
+
+
+def test_run_solver_rejects_convergence_announced_after_a_blow_up(tmp_path, monkeypatch):
+    log = _steady_log().replace(
+        "Time = 133",
+        "Time = 133\nsmoothSolver:  Solving for Ux, Initial residual = 1, "
+        "Final residual = 5e9, No Iterations 2",
+    )
+    runner = FakeRunner(logs={"simpleFoam": log}, end_time="1000", delta_t="1")
+    monkeypatch.setattr(foam, "run_tool", runner)
+    assert not run_solver(tmp_path, "simpleFoam").ok
+
+
+def test_real_simple_foam_log_with_early_convergence_parses():
+    summary = parse_solver_log(_read("simpleFoam_converged.log"))
+    assert summary.completed
+    assert summary.converged_at is not None
+    assert summary.end_time == summary.converged_at
+
+
+# --- rank count against the hardware --------------------------------------------------------------
+
+
+def test_more_ranks_than_hardware_threads_is_refused_with_advice(tmp_path, monkeypatch):
+    runner = FakeRunner()
+    monkeypatch.setattr(foam, "run_tool", runner)
+    monkeypatch.setattr(foam, "_available_threads", lambda: 2)
+    with pytest.raises(
+        AgentInputError, match=r"n_procs=4 but only 2 hardware threads.*n_procs <= 2"
+    ):
+        run_solver(tmp_path, "icoFoam", n_procs=4)
+    assert runner.calls == []
+    assert list(tmp_path.iterdir()) == []  # not even a decomposeParDict was written
+
+
+def test_as_many_ranks_as_hardware_threads_is_fine(tmp_path, monkeypatch):
+    monkeypatch.setattr(foam, "run_tool", FakeRunner())
+    monkeypatch.setattr(foam, "_available_threads", lambda: 2)
+    assert run_solver(tmp_path, "icoFoam", n_procs=2).ok
+
+
+def test_serial_run_needs_no_check_of_the_threads(tmp_path, monkeypatch):
+    monkeypatch.setattr(foam, "run_tool", FakeRunner())
+    monkeypatch.setattr(foam, "_available_threads", lambda: 1)
+    assert run_solver(tmp_path, "icoFoam").ok
+
+
+def test_available_threads_uses_the_affinity_mask_when_there_is_one(monkeypatch):
+    monkeypatch.undo()
+    if hasattr(os, "sched_getaffinity"):
+        assert foam._available_threads() == len(os.sched_getaffinity(0))
+    assert foam._available_threads() >= 1
 
 
 def test_solver_run_is_frozen():
@@ -729,7 +975,8 @@ def test_trial_run_end_time_is_start_time_plus_steps_times_delta_t(tmp_path, mon
     assert result.case_end_time == pytest.approx(2.8)
     assert re.search(r"^endTime\s+2\.8;", seen["control"], re.MULTILINE)
     assert "2.5" in seen["times"]
-    assert "0" not in seen["times"]  # only the start time directory is kept
+    assert "0" in seen["times"]  # the 0 directory is copied as well, even if it is not the start
+    assert "0.5" not in seen["times"] and "10" not in seen["times"]  # stale times are not
     assert result.ok
 
 
@@ -850,3 +1097,176 @@ def test_crashed_solver_step_without_a_diagnosis_gets_no_extra_text(tmp_path, mo
     result = run_solver(tmp_path, "icoFoam")
     assert not result.ok
     assert "[cfdagent]" not in (tmp_path / "log.icoFoam").read_text(encoding="utf-8")
+
+
+# --- trial_run: judging, forced write, copying ---------------------------------------------------
+
+
+def test_trial_run_accepts_a_run_that_ends_a_step_beyond_the_target(tmp_path, monkeypatch):
+    # Adjustable time steps do not give exactly `steps` steps: 4 steps for a 3-step target is fine.
+    case = _make_case(tmp_path)
+    log = "Time = 0.005\n\nTime = 0.01\n\nTime = 0.015\n\nTime = 0.02\n\nEnd\n"
+    monkeypatch.setattr(foam, "run_tool", FakeRunner(logs={"icoFoam": log}, emulate_dict=True))
+    result = trial_run(case, "icoFoam", steps=3)
+    assert result.ok, result.tool.tail
+    assert result.summary.end_time == pytest.approx(0.02)
+    assert result.case_end_time == pytest.approx(0.015)
+
+
+def test_trial_run_rejects_a_run_that_stops_two_steps_short_or_beyond(tmp_path, monkeypatch):
+    case = _make_case(tmp_path)
+    for log in ("Time = 0.005\n\nEnd\n", "Time = 0.005\nTime = 0.025\nTime = 0.045\n\nEnd\n"):
+        monkeypatch.setattr(foam, "run_tool", FakeRunner(logs={"icoFoam": log}, emulate_dict=True))
+        assert not trial_run(case, "icoFoam", steps=3).ok
+
+
+def test_trial_run_with_no_time_step_is_not_ok(tmp_path, monkeypatch):
+    case = _make_case(tmp_path)
+    runner = FakeRunner(logs={"icoFoam": "Starting time loop\n\nEnd\n"}, emulate_dict=True)
+    monkeypatch.setattr(foam, "run_tool", runner)
+    result = trial_run(case, "icoFoam", steps=3)
+    assert not result.ok
+    assert "advanced no time step" in result.tool.tail
+
+
+def test_trial_run_sets_the_run_and_forces_a_write_at_the_end(tmp_path, monkeypatch):
+    case = _make_case(tmp_path)
+    seen = {}
+
+    def on_run(argv, cwd):
+        if argv[0] == "icoFoam":
+            seen["control"] = (cwd / "system" / "controlDict").read_text(encoding="utf-8")
+
+    runner = FakeRunner(logs={"icoFoam": "Time = 0.015\n\nEnd\n"}, emulate_dict=True, on_run=on_run)
+    monkeypatch.setattr(foam, "run_tool", runner)
+    trial_run(case, "icoFoam", steps=3)
+    control = seen["control"]
+    for pattern in (
+        r"^startFrom\s+startTime;",
+        r"^stopAt\s+endTime;",
+        r"^endTime\s+0\.015;",
+        r"^writeControl\s+timeStep;",
+        r"^writeInterval\s+3;",
+    ):
+        assert re.search(pattern, control, re.MULTILINE), pattern
+    sets = [c[0] for c in runner.calls if "-set" in c[0]]
+    assert sets and all(argv[-2:] == ["-precision", "15"] for argv in sets)
+    reads = [c[0] for c in runner.calls if "-value" in c[0]]
+    assert reads and all(argv[-2:] == ["-precision", "15"] for argv in reads)
+
+
+def test_trial_run_copies_only_constant_system_and_the_start_time(tmp_path, monkeypatch):
+    case = _make_case(tmp_path)
+    (case / "Allrun").write_text("#!/bin/sh\n", encoding="utf-8")
+    (case / "notes").mkdir()
+    (case / "notes" / "x.txt").write_text("x\n", encoding="utf-8")
+    seen = {}
+
+    def on_run(argv, cwd):
+        if argv[0] == "icoFoam":
+            seen["top"] = sorted(p.name for p in cwd.iterdir() if not p.name.startswith("log."))
+
+    runner = FakeRunner(logs={"icoFoam": "Time = 0.015\n\nEnd\n"}, emulate_dict=True, on_run=on_run)
+    monkeypatch.setattr(foam, "run_tool", runner)
+    trial_run(case, "icoFoam")
+    assert seen["top"] == ["0", "constant", "system"]
+
+
+def test_trial_run_ignores_nothing_at_depth(tmp_path, monkeypatch):
+    # Names that would be dropped at the case root (log.*, processor*, postProcessing, numbers)
+    # are ordinary files inside constant and system and must be copied.
+    case = _make_case(tmp_path)
+    for rel in (
+        "constant/log.keep",
+        "constant/postProcessing/table",
+        "system/processorTemplate/data",
+        "system/10/entry",
+        "constant/triSurface/5/surface",
+    ):
+        path = case / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("kept\n", encoding="utf-8")
+    seen = {}
+
+    def on_run(argv, cwd):
+        if argv[0] == "icoFoam":
+            seen["files"] = _files(cwd)
+
+    runner = FakeRunner(logs={"icoFoam": "Time = 0.015\n\nEnd\n"}, emulate_dict=True, on_run=on_run)
+    monkeypatch.setattr(foam, "run_tool", runner)
+    trial_run(case, "icoFoam")
+    for rel in (
+        "constant/log.keep",
+        "constant/postProcessing/table",
+        "system/processorTemplate/data",
+        "system/10/entry",
+        "constant/triSurface/5/surface",
+    ):
+        assert rel in seen["files"], rel
+
+
+def _symlink_or_skip(link: Path, target: Path) -> None:
+    try:
+        os.symlink(target, link, target_is_directory=target.is_dir())
+    except (OSError, NotImplementedError, AttributeError):
+        pytest.skip("symbolic links are not permitted here")
+
+
+@pytest.mark.parametrize(
+    ("where", "make_target_dir"),
+    [
+        ("constant/linked", True),
+        ("system/linked.txt", False),
+        ("0/linked", True),
+        ("constant", True),
+    ],
+)
+def test_trial_run_rejects_symbolic_links(tmp_path, monkeypatch, where, make_target_dir):
+    case = _make_case(tmp_path)
+    outside = tmp_path / "outside"
+    if make_target_dir:
+        outside.mkdir()
+    else:
+        outside.write_text("secret\n", encoding="utf-8")
+    link = case / where
+    if where == "constant":
+        shutil.rmtree(link)
+    _symlink_or_skip(link, outside)
+    runner = FakeRunner(logs={"icoFoam": "Time = 0.015\n\nEnd\n"}, emulate_dict=True)
+    monkeypatch.setattr(foam, "run_tool", runner)
+    with pytest.raises(AgentInputError, match=r"symbolic link.*write real files"):
+        trial_run(case, "icoFoam")
+    assert not any(c[0][0] == "icoFoam" for c in runner.calls)
+
+
+def test_trial_run_failed_copy_is_a_tool_failure_and_leaves_no_scratch(tmp_path, monkeypatch):
+    case = _make_case(tmp_path)
+    scratch_dirs = []
+    real_mkdtemp = foam.tempfile.mkdtemp
+
+    def recording_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        scratch_dirs.append(Path(path))
+        return path
+
+    def full_disk(*args, **kwargs):
+        raise shutil.Error([("a", "b", "No space left on device")])
+
+    monkeypatch.setattr(foam.tempfile, "mkdtemp", recording_mkdtemp)
+    monkeypatch.setattr(foam.shutil, "copytree", full_disk)
+    monkeypatch.setattr(foam, "run_tool", FakeRunner(emulate_dict=True))
+    with pytest.raises(ToolFailure, match="scratch"):
+        trial_run(case, "icoFoam")
+    assert len(scratch_dirs) == 1
+    assert not scratch_dirs[0].exists()
+
+
+def test_trial_run_cannot_create_the_scratch_directory(tmp_path, monkeypatch):
+    case = _make_case(tmp_path)
+
+    def no_space(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(foam.tempfile, "mkdtemp", no_space)
+    with pytest.raises(ToolFailure, match="scratch"):
+        trial_run(case, "icoFoam")

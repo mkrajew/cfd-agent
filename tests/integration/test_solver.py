@@ -234,3 +234,231 @@ def test_trial_run_without_control_dict_is_the_agents_fault(tmp_path):
     (case / "system" / "controlDict").unlink()
     with pytest.raises(AgentInputError, match="controlDict"):
         trial_run(case, "icoFoam")
+
+
+# --- steady solver, early convergence ------------------------------------------------------------
+
+STEADY_CONTROL_DICT = """FoamFile
+{
+    version 2.0;
+    format ascii;
+    class dictionary;
+    object controlDict;
+}
+
+application simpleFoam;
+startFrom startTime;
+startTime 0;
+stopAt endTime;
+endTime 2000;
+deltaT 1;
+writeControl timeStep;
+writeInterval 500;
+writeFormat ascii;
+timeFormat general;
+timePrecision 6;
+runTimeModifiable false;
+"""
+
+STEADY_FV_SCHEMES = """FoamFile
+{
+    version 2.0;
+    format ascii;
+    class dictionary;
+    object fvSchemes;
+}
+
+ddtSchemes { default steadyState; }
+gradSchemes { default Gauss linear; }
+divSchemes
+{
+    default none;
+    div(phi,U) bounded Gauss linearUpwind grad(U);
+    div((nuEff*dev2(T(grad(U))))) Gauss linear;
+}
+laplacianSchemes { default Gauss linear corrected; }
+interpolationSchemes { default linear; }
+snGradSchemes { default corrected; }
+"""
+
+STEADY_FV_SOLUTION = """FoamFile
+{
+    version 2.0;
+    format ascii;
+    class dictionary;
+    object fvSolution;
+}
+
+solvers
+{
+    p { solver PCG; preconditioner DIC; tolerance 1e-8; relTol 0.01; }
+    U { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-9; relTol 0.1; }
+}
+
+SIMPLE
+{
+    nNonOrthogonalCorrectors 0;
+    consistent yes;
+    pRefCell 0;
+    pRefValue 0;
+    residualControl { p 1e-3; U 1e-4; }
+}
+
+relaxationFactors
+{
+    equations { U 0.9; }
+}
+"""
+
+TRANSPORT = """FoamFile
+{
+    version 2.0;
+    format ascii;
+    class dictionary;
+    object transportProperties;
+}
+
+transportModel Newtonian;
+nu 0.01;
+"""
+
+TURBULENCE_PROPERTIES = """FoamFile
+{
+    version 2.0;
+    format ascii;
+    class dictionary;
+    object turbulenceProperties;
+}
+
+simulationType laminar;
+"""
+
+
+def _build_steady_case(root: Path) -> Path:
+    """A tiny steady laminar case (simpleFoam) that stops early on ``residualControl``."""
+    case = _build_case(root)
+    (case / "system" / "controlDict").write_text(STEADY_CONTROL_DICT, encoding="utf-8")
+    (case / "system" / "fvSchemes").write_text(STEADY_FV_SCHEMES, encoding="utf-8")
+    (case / "system" / "fvSolution").write_text(STEADY_FV_SOLUTION, encoding="utf-8")
+    (case / "constant" / "turbulenceProperties").write_text(TURBULENCE_PROPERTIES, encoding="utf-8")
+    (case / "constant" / "transportProperties").write_text(TRANSPORT, encoding="utf-8")
+    return case
+
+
+def test_steady_run_that_converges_early_is_ok(tmp_path):
+    case = _build_steady_case(tmp_path)
+    result = run_solver(case, "simpleFoam", timeout_s=300)
+    assert result.ok, result.tool.tail
+    assert result.case_end_time == 2000
+    assert result.summary.converged_at is not None
+    assert result.summary.end_time == result.summary.converged_at
+    assert result.summary.end_time < 2000  # it stopped on residualControl, long before endTime
+
+
+def test_steady_run_that_reaches_its_end_time_without_converging_is_ok(tmp_path):
+    case = _build_steady_case(tmp_path)
+    control = case / "system" / "controlDict"
+    control.write_text(
+        control.read_text(encoding="utf-8").replace("endTime 2000;", "endTime 3;"), encoding="utf-8"
+    )
+    result = run_solver(case, "simpleFoam", timeout_s=300)
+    assert result.ok, result.tool.tail  # reaches its end time after 3 iterations
+    assert result.summary.end_time == 3
+
+
+# --- start time at or after endTime ---------------------------------------------------------------
+
+
+def test_start_from_latest_time_with_an_old_result_advances_no_step(tmp_path):
+    case = _build_case(tmp_path, end_time=0.25)
+    first = run_solver(case, "icoFoam", timeout_s=300)
+    assert first.ok, first.tool.tail
+    control = case / "system" / "controlDict"
+    control.write_text(
+        control.read_text(encoding="utf-8").replace(
+            "startFrom startTime;", "startFrom latestTime;"
+        ),
+        encoding="utf-8",
+    )
+    again = run_solver(case, "icoFoam", timeout_s=300)
+    assert not again.ok
+    assert again.summary.completed  # the solver ended cleanly, having done nothing
+    assert again.summary.end_time is None
+    assert "advanced no time step" in again.tool.tail
+    assert "startFrom latestTime" in again.tool.tail
+
+
+# --- trial run: forced write, adjustable time step ----------------------------------------
+
+BAD_FUNCTION_OBJECT = """
+functions
+{
+    profile
+    {
+        type sets;
+        libs (sampling);
+        writeControl writeTime;
+        interpolationScheme noSuchScheme;
+        setFormat raw;
+        fields (U);
+        sets ( line { type uniform; axis y; start (0.5 0 0.05); end (0.5 1 0.05); nPoints 5; } );
+    }
+}
+"""
+
+
+def test_trial_run_surfaces_an_error_that_only_shows_when_writing(tmp_path):
+    case = _build_case(tmp_path, end_time=40)
+    control = case / "system" / "controlDict"
+    control.write_text(control.read_text(encoding="utf-8") + BAD_FUNCTION_OBJECT, encoding="utf-8")
+    # writeInterval is 50 steps, so a plain three-step run never writes and never meets the error.
+    result = trial_run(case, "icoFoam", steps=3, timeout_s=120)
+    assert not result.ok
+    assert result.summary.fatal_error is not None
+    assert "noSuchScheme" in result.tool.tail
+
+
+PIMPLE_FV_SOLUTION = """FoamFile
+{
+    version 2.0;
+    format ascii;
+    class dictionary;
+    object fvSolution;
+}
+
+solvers
+{
+    p { solver PCG; preconditioner DIC; tolerance 1e-8; relTol 0.05; }
+    pFinal { $p; relTol 0; }
+    "U.*" { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-8; relTol 0; }
+}
+
+PIMPLE
+{
+    nOuterCorrectors 1;
+    nCorrectors 2;
+    nNonOrthogonalCorrectors 0;
+    pRefCell 0;
+    pRefValue 0;
+}
+"""
+
+
+def test_trial_run_with_an_adjustable_time_step_is_ok(tmp_path):
+    case = _build_case(tmp_path, end_time=40)
+    control = case / "system" / "controlDict"
+    text = control.read_text(encoding="utf-8").replace(
+        "application icoFoam;", "application pimpleFoam;"
+    )
+    control.write_text(
+        text + "adjustTimeStep yes;\nmaxCo 0.4;\nmaxDeltaT 0.01;\n", encoding="utf-8"
+    )
+    (case / "system" / "fvSolution").write_text(PIMPLE_FV_SOLUTION, encoding="utf-8")
+    schemes = STEADY_FV_SCHEMES.replace("steadyState", "Euler")
+    schemes = schemes.replace("bounded Gauss linearUpwind grad(U)", "Gauss linear")
+    (case / "system" / "fvSchemes").write_text(schemes, encoding="utf-8")
+    (case / "constant" / "turbulenceProperties").write_text(TURBULENCE_PROPERTIES, encoding="utf-8")
+    (case / "constant" / "transportProperties").write_text(TRANSPORT, encoding="utf-8")
+    result = trial_run(case, "pimpleFoam", steps=3, timeout_s=120)
+    assert result.ok, result.tool.tail
+    assert result.summary.end_time == pytest.approx(result.case_end_time, abs=0.01)
