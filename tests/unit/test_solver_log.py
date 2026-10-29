@@ -1,5 +1,6 @@
 """Solver log parsing and run_solver orchestration; logs captured from icoFoam in the image."""
 
+import errno
 import hashlib
 import math
 import os
@@ -1146,7 +1147,7 @@ def test_trial_run_sets_the_run_and_forces_a_write_at_the_end(tmp_path, monkeypa
         r"^stopAt\s+endTime;",
         r"^endTime\s+0\.015;",
         r"^writeControl\s+timeStep;",
-        r"^writeInterval\s+3;",
+        r"^writeInterval\s+1;",  # not `steps`: an adjustable-step run may take fewer steps
     ):
         assert re.search(pattern, control, re.MULTILINE), pattern
     sets = [c[0] for c in runner.calls if "-set" in c[0]]
@@ -1270,3 +1271,111 @@ def test_trial_run_cannot_create_the_scratch_directory(tmp_path, monkeypatch):
     monkeypatch.setattr(foam.tempfile, "mkdtemp", no_space)
     with pytest.raises(ToolFailure, match="scratch"):
         trial_run(case, "icoFoam")
+
+
+# --- non-finite times, convergence counts, cleanup -------------------------------------------
+
+
+def test_converged_iteration_count_may_be_a_time_value():
+    # OpenFOAM prints timeName(): with deltaT 0.5 the count can be 23.5.
+    log = _steady_log(last_time=23.5, converged="SIMPLE solution converged in 23.5 iterations\n")
+    summary = parse_solver_log(log)
+    assert summary.converged_at == 23.5
+    assert summary.end_time == 23.5
+    assert _solver_run(23.5, 1000.0, delta_t=0.5, converged_at=23.5).ok
+
+
+@pytest.mark.parametrize("count", ["1e999", "nan", "-inf", "1e", "x"])
+def test_unusable_converged_count_never_counts_as_convergence(count):
+    summary = parse_solver_log(
+        _steady_log(converged=f"SIMPLE solution converged in {count} iterations\n")
+    )
+    assert not _solver_run(133.0, 1000.0, delta_t=1.0, converged_at=summary.converged_at).ok
+
+
+@pytest.mark.parametrize("end", [float("inf"), float("-inf"), float("nan")])
+def test_non_finite_times_fail_closed(end):
+    assert reach_problem(_summary(end), 1.0, 0.5) is not None
+    assert reach_problem(_summary(end), float("inf"), 0.5) is not None
+    assert reach_problem(_summary(1.0), float("inf"), 0.5) is not None
+    assert reach_problem(_summary(1.0), float("nan"), 0.5) is not None
+    assert not _solver_run(end, 1.0, delta_t=0.5).ok
+    assert not _solver_run(end, end, delta_t=0.5).ok  # inf == inf must not count as reached
+    assert not _solver_run(end, 1000.0, delta_t=1.0, converged_at=end).ok
+
+
+def test_time_equal_to_infinity_in_the_log_is_not_ok(tmp_path, monkeypatch):
+    monkeypatch.setattr(foam, "run_tool", FakeRunner(logs={"icoFoam": "Time = 1e999\n\nEnd\n"}))
+    assert not run_solver(tmp_path, "icoFoam").ok
+
+
+@pytest.mark.parametrize("delta_t", ["0", "-0.005"])
+def test_trial_run_with_a_non_positive_delta_t_is_the_agents_fault(tmp_path, monkeypatch, delta_t):
+    case = _make_case(tmp_path)
+    control = case / "system" / "controlDict"
+    text = control.read_text(encoding="utf-8").replace("deltaT      0.005;", f"deltaT {delta_t};")
+    control.write_text(text, encoding="utf-8")
+    runner = FakeRunner(emulate_dict=True)
+    monkeypatch.setattr(foam, "run_tool", runner)
+    with pytest.raises(AgentInputError, match="deltaT.*positive"):
+        trial_run(case, "icoFoam")
+    assert not any(c[0][0] == "icoFoam" for c in runner.calls)
+
+
+def test_trial_run_other_copy_errors_show_the_cause_and_do_not_blame_the_disk(
+    tmp_path, monkeypatch
+):
+    case = _make_case(tmp_path)
+
+    def denied(*args, **kwargs):
+        raise PermissionError(13, "Permission denied: 'system/fvSchemes'")
+
+    monkeypatch.setattr(foam.shutil, "copytree", denied)
+    monkeypatch.setattr(foam, "run_tool", FakeRunner(emulate_dict=True))
+    with pytest.raises(ToolFailure) as caught:
+        trial_run(case, "icoFoam")
+    assert "Permission denied" in str(caught.value)
+    assert "disk space" not in str(caught.value)
+
+
+def test_trial_run_full_disk_suggests_checking_the_disk_space(tmp_path, monkeypatch):
+    case = _make_case(tmp_path)
+
+    def full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(foam.shutil, "copytree", full)
+    monkeypatch.setattr(foam, "run_tool", FakeRunner(emulate_dict=True))
+    with pytest.raises(ToolFailure, match="disk space"):
+        trial_run(case, "icoFoam")
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason="needs POSIX permissions and a user that is not root",
+)
+def test_trial_run_scratch_is_removed_even_with_a_read_only_directory(tmp_path, monkeypatch):
+    case = _make_case(tmp_path)
+    locked = case / "constant" / "locked"
+    locked.mkdir()
+    (locked / "data").write_text("x\n", encoding="utf-8")
+    locked.chmod(0o500)  # the copy keeps these permissions: its files cannot be unlinked as is
+    scratch_dirs = []
+    real_mkdtemp = foam.tempfile.mkdtemp
+
+    def recording_mkdtemp(*args, **kwargs):
+        path = real_mkdtemp(*args, **kwargs)
+        scratch_dirs.append(Path(path))
+        return path
+
+    monkeypatch.setattr(foam.tempfile, "mkdtemp", recording_mkdtemp)
+    monkeypatch.setattr(
+        foam, "run_tool", FakeRunner(logs={"icoFoam": "Time = 0.015\n\nEnd\n"}, emulate_dict=True)
+    )
+    try:
+        result = trial_run(case, "icoFoam")
+    finally:
+        locked.chmod(0o700)
+    assert result.ok
+    assert len(scratch_dirs) == 1
+    assert not scratch_dirs[0].exists()

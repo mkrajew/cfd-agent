@@ -16,11 +16,13 @@ sandbox (container without network or credentials), not this module.
 
 from __future__ import annotations
 
+import errno
 import io
 import math
 import os
 import re
 import shutil
+import stat
 import tempfile
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -73,7 +75,8 @@ _FROM_RE = re.compile(r"^\s*From\b")
 _END_RE = re.compile(r"^End\s*$")
 _TIME_RE = re.compile(r"^Time = ([-+0-9.eE]+)s?\s*$")
 # Anchored on the whole line: only the steady-state solvers' own convergence announcement counts.
-_CONVERGED_RE = re.compile(r"^SIMPLE solution converged in (\d+) iterations\s*$")
+# The count is printed with timeName(), so it can be a time value such as 23.5.
+_CONVERGED_RE = re.compile(r"^SIMPLE solution converged in ([-+0-9.eE]+) iterations\s*$")
 _RESIDUAL_RE = re.compile(
     r"Solving for (\S+?), Initial residual = (\S+?), Final residual = (\S+?), No Iterations"
 )
@@ -193,11 +196,17 @@ def reach_problem(
     end = summary.end_time
     if end is None:
         return ZERO_STEP_MESSAGE
+    if not (math.isfinite(end) and math.isfinite(case_end_time)):
+        return (
+            f"the log reports Time = {end:g} and {_CONTROL_DICT} has endTime {case_end_time:g}; "
+            "a time that is not a finite number can never count as reached"
+        )
     tol = _print_tolerance(end, case_end_time, time_precision)
     step = max(delta_t if delta_t is not None and math.isfinite(delta_t) else 0.0, 0.0)
     step = max(step, summary.last_step or 0.0)
     if (
         summary.converged_at is not None
+        and math.isfinite(summary.converged_at)
         and summary.completed
         and abs(summary.converged_at - end) <= tol
         and end <= case_end_time + step + tol
@@ -258,7 +267,7 @@ class _LogScanner:
             return
         m = _CONVERGED_RE.match(line)
         if m:
-            self.converged_at = float(m.group(1))
+            self.converged_at = _parse_float(m.group(1))
             return
         m = _RESIDUAL_RE.search(line)
         if m:
@@ -574,14 +583,39 @@ def _reject_symlinks(path: Path, case_dir: Path) -> None:
 
 
 def _copy_into(source: Path, target: Path) -> None:
-    """Copy a directory by value; a full disk or similar is a tool failure, not the agent's."""
+    """Copy a directory by value; a failed copy is a tool failure, not the agent's."""
     try:
         shutil.copytree(source, target, symlinks=False)
     except OSError as exc:  # shutil.Error is an OSError
+        hint = "; check the free disk space" if _is_out_of_space(exc) else ""
         raise ToolFailure(
-            f"could not copy {source.name} into the scratch directory: {exc}; "
-            "check the free disk space"
+            f"could not copy {source.name} into the scratch directory: {exc}{hint}"
         ) from exc
+
+
+def _is_out_of_space(exc: OSError) -> bool:
+    # shutil.Error carries a list of (source, target, message) and no errno.
+    return exc.errno == errno.ENOSPC or "No space left" in str(exc)
+
+
+def _remove_scratch(path: str) -> None:
+    """Delete the scratch directory; a read-only directory in the copy must not leak it.
+
+    A failing removal is retried after making the entry and its parent writable; if it still
+    fails the leftover is ignored (it must not hide the result or the error of the trial).
+    """
+
+    def make_writable_and_retry(function, failed_path, _exc) -> None:
+        try:
+            parent = os.path.dirname(failed_path)
+            os.chmod(parent, stat.S_IRWXU)
+            if os.path.isdir(failed_path) and not os.path.islink(failed_path):
+                os.chmod(failed_path, stat.S_IRWXU)
+            function(failed_path)
+        except OSError:
+            pass
+
+    shutil.rmtree(path, onexc=make_writable_and_retry)
 
 
 def _trial_control_number(scratch: Path, entry: str) -> float:
@@ -619,14 +653,16 @@ def trial_run(case_dir: Path, solver: str, steps: int = 3, timeout_s: float = 30
     Only ``constant``, ``system`` and the start-time directory (and ``0``, if that is another one)
     are copied, by value; results, logs, decomposed data and other time directories are not. In
     the copy ``startFrom`` is ``startTime``, ``stopAt`` is ``endTime``, ``endTime`` is
-    ``startTime + steps * deltaT`` and a write is forced at the end (``writeControl timeStep``,
-    ``writeInterval steps``), so that errors that only show when fields or function objects are
-    written surface too. The result is judged like a normal run (see ``SolverRun.ok``): clean log,
-    at least one time step, last time within one step of the target.
+    ``startTime + steps * deltaT`` and every step is written (``writeControl timeStep``,
+    ``writeInterval 1``; with an adjustable step the run may take fewer than ``steps`` steps, so a
+    later write could be missed), so that errors that only show when fields or function objects
+    are written surface too. The result is judged like a normal run (see ``SolverRun.ok``): clean
+    log, at least one time step, last time within one step of the target.
 
-    Limits: with an adjustable time step the solver does not make exactly ``steps`` steps, it
-    stops at about the target time. The maximum Courant number after a few steps is not evidence
-    of stability.
+    Limits: ``startFrom``, ``stopAt``, ``writeControl`` and ``writeInterval`` of the case are
+    overwritten in the copy, so errors in those keys are NOT validated by the trial. With an
+    adjustable time step the solver does not make exactly ``steps`` steps, it stops at about the
+    target time. The maximum Courant number after a few steps is not evidence of stability.
 
     ``case_dir`` is never written to, and the scratch directory is deleted afterwards, also on an
     exception; this means the paths in the returned ``SolverRun`` no longer exist, and only its
@@ -634,8 +670,9 @@ def trial_run(case_dir: Path, solver: str, steps: int = 3, timeout_s: float = 30
 
     A case without ``system/controlDict``, without a readable ``startTime`` or positive
     ``deltaT``, or containing a symbolic link in the copied parts, raises ``AgentInputError`` (the
-    agent wrote the case). A ``case_dir`` that is not a directory, or a failed copy (full disk),
-    raises ``ToolFailure``. ``steps`` must be an integer of at least 1 (ValueError).
+    agent wrote the case). A ``case_dir`` that is not a directory, or a failed copy (the message
+    names the cause, and suggests checking the disk space only for a full disk), raises
+    ``ToolFailure``. ``steps`` must be an integer of at least 1 (ValueError).
     """
     if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
         raise ValueError(f"steps must be an integer of at least 1, got {steps!r}")
@@ -679,9 +716,9 @@ def trial_run(case_dir: Path, solver: str, steps: int = 3, timeout_s: float = 30
             ("stopAt", "endTime"),
             ("endTime", f"{start_time + steps * delta_t:.15g}"),
             ("writeControl", "timeStep"),
-            ("writeInterval", str(steps)),
+            ("writeInterval", "1"),
         ):
             _set_control_entry(scratch, entry, value_text)
         return run_solver(scratch, solver, n_procs=1, timeout_s=timeout_s)
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        _remove_scratch(tmp)

@@ -444,21 +444,38 @@ PIMPLE
 """
 
 
-def test_trial_run_with_an_adjustable_time_step_is_ok(tmp_path):
-    case = _build_case(tmp_path, end_time=40)
+def _build_adjustable_case(root: Path, max_co: float, max_delta_t: float) -> Path:
+    """A transient pimpleFoam case with an adjustable time step."""
+    case = _build_case(root, end_time=40)
     control = case / "system" / "controlDict"
     text = control.read_text(encoding="utf-8").replace(
         "application icoFoam;", "application pimpleFoam;"
     )
-    control.write_text(
-        text + "adjustTimeStep yes;\nmaxCo 0.4;\nmaxDeltaT 0.01;\n", encoding="utf-8"
-    )
+    text += f"adjustTimeStep yes;\nmaxCo {max_co};\nmaxDeltaT {max_delta_t};\n"
+    control.write_text(text, encoding="utf-8")
     (case / "system" / "fvSolution").write_text(PIMPLE_FV_SOLUTION, encoding="utf-8")
     schemes = STEADY_FV_SCHEMES.replace("steadyState", "Euler")
     schemes = schemes.replace("bounded Gauss linearUpwind grad(U)", "Gauss linear")
     (case / "system" / "fvSchemes").write_text(schemes, encoding="utf-8")
     (case / "constant" / "turbulenceProperties").write_text(TURBULENCE_PROPERTIES, encoding="utf-8")
     (case / "constant" / "transportProperties").write_text(TRANSPORT, encoding="utf-8")
+    return case
+
+
+def test_trial_run_with_an_adjustable_time_step_is_ok(tmp_path):
+    case = _build_adjustable_case(tmp_path, max_co=0.4, max_delta_t=0.01)
     result = trial_run(case, "pimpleFoam", steps=3, timeout_s=120)
     assert result.ok, result.tool.tail
     assert result.summary.end_time == pytest.approx(result.case_end_time, abs=0.01)
+
+
+def test_trial_run_catches_a_write_time_error_when_the_run_takes_fewer_steps(tmp_path):
+    # With a loose maxCo the step grows by 20 % per step, so reaching the time of 6 initial steps
+    # takes fewer than 6 steps; a write every `steps` steps would never happen.
+    case = _build_adjustable_case(tmp_path, max_co=10, max_delta_t=1)
+    control = case / "system" / "controlDict"
+    control.write_text(control.read_text(encoding="utf-8") + BAD_FUNCTION_OBJECT, encoding="utf-8")
+    result = trial_run(case, "pimpleFoam", steps=6, timeout_s=120)
+    assert not result.ok
+    assert result.summary.fatal_error is not None
+    assert "noSuchScheme" in result.tool.tail
