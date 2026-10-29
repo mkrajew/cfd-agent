@@ -9,9 +9,9 @@ by Azure AI Foundry models. This is a research project; see
 ## Architecture
 
 ```
- Owner's laptop                               Azure (italynorth)
- ──────────────                               ─────────────────────────────────────────
- az vm start / VS Code Remote-SSH ──SSH──►    VM Standard_F4s_v2 (Ubuntu 24.04, Docker)
+ Owner's laptop                               Azure (VM, storage: belgiumcentral; AI: italynorth)
+ ──────────────                               ─────────────────────────────────────────────────────
+ az vm start / VS Code Remote-SSH ──SSH──►    VM Standard_D4as_v4 (Ubuntu 24.04, Docker)
                                                └─ cfdagent CLI → Docker image
                                                     ├─ Orchestrator (deterministic)
                                                     ├─ LLM agents ─────────► Azure AI Foundry

@@ -42,6 +42,25 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # GITLEAKS_LICENSE is only needed for organisation accounts; this is a personal repo.
 
+  infra-lint:
+    name: infra-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Bicep
+        run: az bicep install
+      - name: Bicep build
+        # Every Bicep file must compile without errors or warnings (nothing is deployed here).
+        run: |
+          set -euo pipefail
+          for file in infra/main.bicep infra/modules/*.bicep; do
+            out="$(az bicep build --file "${file}" --outfile "${RUNNER_TEMP}/$(basename "${file}" .bicep).json" 2>&1)" || { echo "${out}"; exit 1; }
+            if grep -qi 'warning' <<<"${out}"; then echo "${out}"; exit 1; fi
+          done
+      - name: Shellcheck
+        run: shellcheck infra/vm/*.sh
+
   unit:
     name: unit
     runs-on: ubuntu-latest

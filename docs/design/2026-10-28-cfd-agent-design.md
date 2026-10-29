@@ -54,8 +54,9 @@ Open-weight models are used **because of budget**, not as part of the hypothesis
 | Allowed regions (policy) | `italynorth`, `spaincentral`, `belgiumcentral`, `denmarkeast`, `austriaeast` |
 | Compute quota | **6 vCPU total per region**, **max 4 vCPU per VM family**; spot/low-priority 3 vCPU |
 | GPU | Quota 0 for every current GPU family. Increase requests for NCASv3_T4 in Italy North and Spain Central were **rejected**. **No GPU.** |
-| LLM hosting | Azure AI Foundry serverless (pay per token). Verified working: **`gpt-oss-120b`** (deployment succeeded, test call ~2 s). Quotas: gpt-oss-120b 5000, Llama-3.3-70B-Instruct 20, Llama-4-Scout 20, Phi-4 20, mistral-small 20, Codestral 20, qwen3-32b likely via shared MaaS pool 600. `gpt-oss-20b` is **not deployable** (fine-tune only). DeepSeek/Kimi/Grok quota 0. |
-| Prices (Azure retail API, italynorth) | gpt-oss-120b: $0.15 / 1M input tokens, $0.60 / 1M output tokens. VM Standard_F4s_v2 (Linux): ~$0.194/h. |
+| LLM hosting | Azure AI Foundry serverless (pay per token). Verified working: **`gpt-oss-120b`** (deployment succeeded, test call ~2 s). Quotas: gpt-oss-120b 5000, Llama-3.3-70B-Instruct 20, Llama-4-Scout 20, Phi-4 20, mistral-small 20, Codestral 20, qwen3-32b likely via shared MaaS pool 600, but ARM preflight rejects it as an account deployment in italynorth (checked 2026-10-28). `gpt-oss-20b` is **not deployable** (fine-tune only). DeepSeek/Kimi/Grok quota 0. |
+| Prices (Azure retail API) | gpt-oss-120b (italynorth): $0.15 / 1M input tokens, $0.60 / 1M output tokens. VM Standard_D4as_v4 (Linux, belgiumcentral): ~$0.208/h. |
+| VM SKU availability | **Owner decision 2026-10-28:** italynorth has no usable 4-vCPU size for this subscription (`Standard_F4s_v2` is `NotAvailableForSubscription`; the available v7 sizes have quota 0). `Standard_F4s_v2` is unrestricted only in denmarkeast ($0.27/h; Azure retail prices API, queried 2026-10-28). Chosen: **belgiumcentral, `Standard_D4as_v4`** (4 vCPU, 16 GB, $0.208/h). `Microsoft.DevTestLab/schedules` is not offered in any allowed region. |
 | Existing probe resources | RG `rg-cfdagent-probe` with AI Services `cfdagent-probe-wgcbe` and deployment `gpt-oss-120b`. Delete once the IaC-managed environment exists. |
 | Owner's machine | Windows 11, RTX A3000 12 GB, i7-12800H, 32 GB RAM, Docker Desktop, WSL2 Ubuntu, git, `gh` logged in as `mkrajew`, Azure CLI installed (not on PATH: `C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd`). |
 | Owner's role | Approves design decisions, PR descriptions + CI status, CFD results, every cost. Does not review code line by line. |
@@ -90,9 +91,9 @@ Open-weight models are used **because of budget**, not as part of the hypothesis
 ## 5. System overview
 
 ```
- Owner's laptop                               Azure (italynorth)
- ──────────────                               ─────────────────────────────────────────
- az vm start / VS Code Remote-SSH ──SSH──►    VM Standard_F4s_v2 (Ubuntu 24.04, Docker)
+ Owner's laptop                               Azure (VM, storage: belgiumcentral; AI: italynorth)
+ ──────────────                               ─────────────────────────────────────────────────────
+ az vm start / VS Code Remote-SSH ──SSH──►    VM Standard_D4as_v4 (Ubuntu 24.04, Docker)
                                                └─ cfdagent CLI → Docker image
                                                     ├─ Orchestrator (deterministic)
                                                     ├─ LLM agents ─────────► Azure AI Foundry
@@ -215,11 +216,11 @@ Resource group `rg-cfdagent` in `italynorth`, deployed/destroyed with one comman
 
 | Resource | Details |
 |---|---|
-| VM | `Standard_F4s_v2`, Ubuntu 24.04, Docker, OS disk sized by builder (cost-aware), system-assigned managed identity |
-| Network | VNet, public IP, NSG: SSH (22) only from the owner's IP (parameter); SSH key auth only |
-| Auto-shutdown | Daily schedule (time parameter, Europe/Warsaw) |
+| VM | `Standard_D4as_v4` (4 vCPU, 16 GB) in `belgiumcentral`, Ubuntu 24.04, Docker, OS disk sized by builder (cost-aware), system-assigned managed identity. **Owner decision 2026-10-28** (see §3): VM, network and storage in belgiumcentral; the resource group and AI Services stay in italynorth |
+| Network | VNet, public IP, NSG: SSH 22 open to the Internet, key-only + fail2ban — owner decision 2026-10-29 (the owner switches networks and uses a VPN); no other inbound port |
+| Auto-shutdown | Daily shutdown at a time parameter (Europe/Warsaw) by a systemd timer on the VM, because DevTestLab schedules are not offered in any allowed region (**owner decision 2026-10-28**) |
 | Idle shutdown | On-VM timer: no SSH sessions and no running `cfdagent` for 30 min → VM deallocates itself (identity scoped to deallocate only that VM) |
-| AI Foundry | AI Services account + deployments: `gpt-oss-120b` (primary), `Llama-3.3-70B-Instruct`, (comparison; `qwen3-32b` excluded, see §14.1) |
+| AI Foundry | AI Services account + deployments: `gpt-oss-120b` (primary), `Llama-3.3-70B-Instruct` (comparison). `qwen3-32b` is **not deployable** on an AIServices account in italynorth (ARM preflight rejects `GlobalStandard` and `DeveloperTier`), so it is not in the Bicep; the fallback rule was applied and the owner declined a replacement (2026-10-29, ADR-0002, §14.1) |
 | Storage | StorageV2, LRS, Hot; container `runs`; lifecycle rule; VM identity has Blob Data Contributor; owner has a data-reader role for Portal browsing |
 | Key Vault | Only if a key fallback is needed (§6.4) |
 | Budget | Subscription budget $100 with alerts at 25/50/75/90 %, owner's email as parameter |
@@ -346,7 +347,7 @@ Other Claude Code files:
 
 ## 14. Budget sketch
 - LLM: estimated $0.10–0.20 per run (≈50 calls × ≈15k tokens); 100 runs ≈ $10–20.
-- VM: ≈ $0.19/h while running; ≈100 h ≈ $20; disk a few dollars per month.
+- VM: ≈ $0.21/h while running; ≈100 h ≈ $20; disk a few dollars per month.
 - Storage: cents.
 - Remaining credit is headroom. Budget alerts guard it.
 - Runtime estimate per run (Claude's estimate, to be measured in M1): cavity minutes; pipe 10–30 min; cylinder Re = 100 (unsteady, ~20 shedding periods) ≈ 20–40 min; plus LLM time.
