@@ -1350,6 +1350,21 @@ def test_trial_run_full_disk_suggests_checking_the_disk_space(tmp_path, monkeypa
         trial_run(case, "icoFoam")
 
 
+def test_trial_run_full_disk_names_the_scratch_location(tmp_path, monkeypatch):
+    # In the sandbox the scratch directory is a small tmpfs, not the disk of the machine.
+    case = _make_case(tmp_path)
+
+    def full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(foam.shutil, "copytree", full)
+    monkeypatch.setattr(foam, "run_tool", FakeRunner(emulate_dict=True))
+    with pytest.raises(ToolFailure) as caught:
+        trial_run(case, "icoFoam")
+    assert foam.tempfile.gettempdir() in str(caught.value)
+    assert "small" in str(caught.value)
+
+
 @pytest.mark.skipif(
     os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
     reason="needs POSIX permissions and a user that is not root",

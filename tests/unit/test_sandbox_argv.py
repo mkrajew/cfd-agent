@@ -69,11 +69,26 @@ def test_config_uid_gid_default_to_the_host_user(monkeypatch):
         {"uid": 0},
         {"gid": 0},
         {"mode": "ssh"},
+        {"mode": "local"},  # not confined: needs allow_local=True
+        {"allow_local": True},  # allow_local only makes sense for mode="local"
     ],
 )
 def test_config_rejects_unsafe_values(overrides):
     with pytest.raises(ValidationError):
         _config(**overrides)
+
+
+def test_local_mode_needs_an_explicit_opt_in():
+    config = _config(mode="local", allow_local=True)
+    assert config.mode == "local" and config.allow_local is True
+    assert _config().allow_local is False
+
+
+def test_run_dir_with_a_colon_is_refused():
+    with pytest.raises(ValueError, match="':'"):
+        _argv(run_dir=Path("/data/runs/a:b"))
+    with pytest.raises(ValueError, match="':'"):
+        _argv(run_dir=Path("/data/runs/x:/etc"))
 
 
 def test_config_forbids_unknown_fields():
@@ -89,10 +104,14 @@ def test_build_argv_has_every_hardening_flag():
     assert _value_after(argv, "--cap-drop") == "ALL"
     assert _value_after(argv, "--security-opt") == "no-new-privileges"
     assert argv.count("--read-only") == 1
-    assert _value_after(argv, "--tmpfs") == "/tmp:rw,size=512m"
+    assert _value_after(argv, "--tmpfs") == "/tmp:rw,noexec,nosuid,nodev,size=512m"
     assert _value_after(argv, "--shm-size") == "512m"
     assert _value_after(argv, "--pids-limit") == "512"
     assert _value_after(argv, "--memory") == "8g"
+    assert _value_after(argv, "--memory-swap") == "8g"  # no swap beyond the memory limit
+    assert _value_after(argv, "--pull") == "never"
+    assert _value_after(argv, "--ulimit") == "core=0"
+    assert argv.count("--init") == 1
     assert _value_after(argv, "--cpus") == "4"
     assert _value_after(argv, "--user") == "1234:4321"
     assert _value_after(argv, "-w") == CONTAINER_JOB_DIR == "/job"
@@ -104,6 +123,7 @@ def test_build_argv_image_is_last_before_the_command():
     image_at = argv.index("cfdagent:test")
     assert argv[image_at + 1 :] == [
         "python",
+        "-P",  # never put the working directory (the hostile run directory) on sys.path
         "-m",
         "cfdagent.executor",
         "check_mesh",
@@ -118,7 +138,8 @@ def test_build_argv_uses_the_configured_limits():
     assert _value_after(argv, "--memory") == "2g"
     assert _value_after(argv, "--cpus") == "1.5"
     assert _value_after(argv, "--pids-limit") == "64"
-    assert _value_after(argv, "--tmpfs") == "/tmp:rw,size=64m"
+    assert _value_after(argv, "--tmpfs") == "/tmp:rw,noexec,nosuid,nodev,size=64m"
+    assert _value_after(argv, "--memory-swap") == "2g"
     assert _value_after(argv, "--shm-size") == "128m"
 
 
@@ -130,7 +151,7 @@ def test_argv_mounts_nothing_but_run_dir():
     assert host_side.replace("\\", "/").endswith("runs/20260101-000000-demo")
     joined = " ".join(argv)
     assert "docker.sock" not in joined and "benchmarks" not in joined
-    options = {a.split("=", 1)[0] for a in argv if a.startswith("-")}
+    options = {a.split("=", 1)[0] for a in argv[: argv.index("cfdagent:test")] if a.startswith("-")}
     for forbidden in (
         "--volume",
         "--mount",

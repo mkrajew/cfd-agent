@@ -7,7 +7,7 @@ runs inside the container. Confinement itself is covered by ``tests/sandbox``.
 import shutil
 
 import pytest
-from test_solver import _build_case, needs_4_threads
+from foam_cases import build_case, needs_4_threads
 
 from cfdagent.rundir import RunDir
 from cfdagent.sandbox.client import SandboxClient
@@ -21,9 +21,9 @@ def job(tmp_path):
     root = tmp_path / "job"
     root.mkdir()
     run_dir = RunDir(root)
-    config = SandboxConfig(mode="local", image="local-unused")
+    config = SandboxConfig(mode="local", allow_local=True, image="local-unused")
     client = SandboxClient(config, run_dir, "20260101-000000-ops")
-    _build_case(root, end_time=0.25)
+    build_case(root, end_time=0.25)
     return client, run_dir
 
 

@@ -152,8 +152,10 @@ def response_rel_for(request: str) -> str | None:
 # Argument models of the ops
 # --------------------------------------------------------------------------------------------
 
-BBox = Annotated[list[float], Field(min_length=6, max_length=6)]
-_Timeout = Annotated[float, Field(gt=0, le=86_400)]
+_Finite = Annotated[float, Field(allow_inf_nan=False)]
+_PositiveFinite = Annotated[float, Field(gt=0, allow_inf_nan=False)]
+BBox = Annotated[list[_Finite], Field(min_length=6, max_length=6)]
+_Timeout = Annotated[float, Field(gt=0, le=86_400, allow_inf_nan=False)]
 
 
 @op_args("run_script")
@@ -170,8 +172,8 @@ class RunScriptArgs(ArgsModel):
 class CheckGeometryArgs(ArgsModel):
     workdir: RelPath
     expected_bbox: BBox
-    expected_volume: float | None = None
-    rel_tol: float = 1e-3
+    expected_volume: _PositiveFinite | None = None
+    rel_tol: _PositiveFinite = 1e-3
 
 
 @op_args("convert_mesh")
@@ -185,7 +187,7 @@ class ConvertMeshArgs(ArgsModel):
 class CheckMeshArgs(ArgsModel):
     case_dir: RelPath
     expected_bbox: BBox
-    rel_tol: float = 1e-2
+    rel_tol: _PositiveFinite = 1e-2
     manifest: RelPath | None = None  # default: boundary_manifest.json beside case_dir
 
 

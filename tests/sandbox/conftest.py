@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from cfdagent.rundir import RunDir
-from cfdagent.sandbox.client import SandboxClient
+from cfdagent.sandbox.client import SandboxClient, outer_timeout
 from cfdagent.sandbox.config import SandboxConfig
 
 IMAGE = os.environ.get("CFDAGENT_SANDBOX_IMAGE", "cfdagent:dev")
@@ -64,7 +64,9 @@ class Sandbox:
 
     def run_script(self, name: str, timeout_s: float = 120.0, **extra):
         """Write nothing; run script ``name`` (already in the run directory) in a container."""
-        return self.client.call("run_script", {"script": name, **extra}, timeout_s=timeout_s + 60)
+        return self.client.call(
+            "run_script", {"script": name, **extra}, timeout_s=outer_timeout(timeout_s)
+        )
 
     def containers(self) -> str:
         """Ids of any container (running or not) whose name belongs to this run."""

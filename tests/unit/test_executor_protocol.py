@@ -7,11 +7,15 @@ Ops that need OpenFOAM or CAD are covered by the integration and sandbox suites.
 import json
 import math
 import os
+import subprocess
+import sys
 import textwrap
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+import cfdagent
 from cfdagent.errors import AgentInputError, ToolFailure
 from cfdagent.executor import ops, protocol
 from cfdagent.executor.__main__ import main
@@ -383,3 +387,92 @@ def test_response_is_written_atomically_and_size_bounded(run, monkeypatch):
     assert answer.ok is False and answer.internal is True
     assert "too large" in answer.error
     assert [p.name for p in (run.root / ".sandbox").iterdir() if ".tmp" in p.name] == []
+
+
+# --------------------------------------------------------------------------------------------
+# Fix round 1
+# --------------------------------------------------------------------------------------------
+
+
+def test_numpy_scalars_in_a_result_become_plain_numbers(run, monkeypatch):
+    np = pytest.importorskip("numpy")
+    monkeypatch.setitem(protocol.ARG_MODELS, "numbers", protocol.ArgsModel)
+
+    @ops.operation("numbers")
+    def numbers(args, jail):
+        return {
+            "f": np.float64(1.5),
+            "i": np.int64(3),
+            "b": np.bool_(True),
+            "nan": np.float64("nan"),
+        }
+
+    try:
+        code, answer = _call(run, "numbers", {})
+    finally:
+        ops.OPS.pop("numbers", None)
+    assert code == 0 and answer.ok, answer
+    assert answer.data == {"f": 1.5, "i": 3, "b": True, "nan": None}
+
+
+def test_result_that_is_not_json_safe_still_gets_a_response(run, monkeypatch):
+    monkeypatch.setitem(protocol.ARG_MODELS, "odd", protocol.ArgsModel)
+
+    @ops.operation("odd")
+    def odd(args, jail):
+        return {"thing": object()}
+
+    try:
+        code, answer = _call(run, "odd", {})
+    finally:
+        ops.OPS.pop("odd", None)
+    assert code == 0  # a response was written
+    assert answer.ok is False and answer.internal is True
+    assert "serial" in answer.error.lower()
+
+
+@pytest.mark.parametrize(
+    ("op", "args"),
+    [
+        ("check_geometry", {"workdir": ".", "expected_bbox": [0, 0, 0, 1, 1, math.nan]}),
+        ("check_geometry", {"workdir": ".", "expected_bbox": [0, 0, 0, math.inf, 1, 1]}),
+        ("check_geometry", {"workdir": ".", "expected_bbox": [0] * 6, "rel_tol": 0}),
+        ("check_geometry", {"workdir": ".", "expected_bbox": [0] * 6, "rel_tol": -1e-3}),
+        ("check_geometry", {"workdir": ".", "expected_bbox": [0] * 6, "rel_tol": math.nan}),
+        ("check_geometry", {"workdir": ".", "expected_bbox": [0] * 6, "expected_volume": math.nan}),
+        ("check_geometry", {"workdir": ".", "expected_bbox": [0] * 6, "expected_volume": -1}),
+        ("check_mesh", {"case_dir": "c", "expected_bbox": [0] * 6, "rel_tol": 0}),
+        ("check_mesh", {"case_dir": "c", "expected_bbox": [0] * 6, "rel_tol": math.inf}),
+        ("run_solver", {"case_dir": "c", "solver": "icoFoam", "timeout_s": math.nan}),
+        ("run_script", {"script": "a.py", "timeout_s": math.inf}),
+    ],
+)
+def test_non_finite_and_non_positive_numbers_are_rejected_in_the_arguments(op, args):
+    with pytest.raises(protocol.InvalidArgs):
+        protocol.validate_args(op, args)
+
+
+def test_response_ok_must_be_a_real_boolean():
+    for bad in ("yes", 1, 0, None, "true"):
+        with pytest.raises(ValidationError):
+            protocol.OpResponse.model_validate({"ok": bad})
+    assert protocol.OpResponse.model_validate({"ok": True}).ok is True
+
+
+def test_stdout_is_redirected_to_stderr_while_ops_run():
+    code = (
+        "import os, sys\n"
+        "from cfdagent.executor.__main__ import _stdout_to_stderr\n"
+        "_stdout_to_stderr()\n"
+        "print('python-level')\n"
+        "os.write(1, b'fd-level')\n"
+        "sys.stderr.flush()\n"
+    )
+    source_root = str(Path(cfdagent.__file__).resolve().parents[1])
+    env = {**os.environ, "PYTHONPATH": source_root}
+    done = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120, env=env
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == ""
+    assert "python-level" in done.stderr and "fd-level" in done.stderr

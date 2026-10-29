@@ -53,7 +53,13 @@ def main(argv: list[str], root: Path | None = None) -> int:
         return 2
     jail = RunDir(root if root is not None else Path.cwd())
     response = _respond(op, request_rel, jail)
-    text = response.model_dump_json()
+    try:
+        text = response.model_dump_json()
+    except Exception as exc:  # a result that is not JSON-safe must not leave the host waiting
+        text = protocol.failure(
+            f"the result of {op} could not be serialised to JSON ({type(exc).__name__})",
+            internal=True,
+        ).model_dump_json()
     if len(text.encode("utf-8")) > protocol.RESPONSE_MAX_BYTES:
         text = protocol.failure(
             f"the response of {op} is too large (over {protocol.RESPONSE_MAX_BYTES} bytes)",

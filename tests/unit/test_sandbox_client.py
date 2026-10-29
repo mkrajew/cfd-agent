@@ -4,15 +4,18 @@ Local-mode tests start the real executor as a plain subprocess; they need nothin
 """
 
 import json
+import math
 import os
 import subprocess
+import sys
 import time
 
 import pytest
 
 from cfdagent.executor.protocol import OpResponse, RunSolverArgs
 from cfdagent.rundir import RunDir
-from cfdagent.sandbox.client import SandboxClient
+from cfdagent.sandbox import client as client_module
+from cfdagent.sandbox.client import OUTER_TIMEOUT_MARGIN_S, SandboxClient, outer_timeout
 from cfdagent.sandbox.config import SandboxConfig
 
 RUN_ID = "20260101-000000-demo"
@@ -22,6 +25,8 @@ SOLVE_ARGS = {"case_dir": "case", "solver": "icoFoam"}
 def _config(**overrides):
     values = {"image": "cfdagent:test", "uid": 1234, "gid": 4321}
     values.update(overrides)
+    if values.get("mode") == "local":
+        values["allow_local"] = True
     return SandboxConfig(**values)
 
 
@@ -121,7 +126,7 @@ def test_client_runs_docker_with_a_unique_named_container_per_call(tmp_path):
     argv = runner.popen_calls[0]
     assert argv[:3] == ["docker", "run", "--rm"]
     command = argv[argv.index("cfdagent:test") + 1 :]
-    assert command[:4] == ["python", "-m", "cfdagent.executor", "run_solver"]
+    assert command[:5] == ["python", "-P", "-m", "cfdagent.executor", "run_solver"]
     request_rel = argv[-1]
     assert request_rel.startswith(".sandbox/") and request_rel.endswith(".request.json")
     request = run_dir.read_json(request_rel)
@@ -315,3 +320,114 @@ def test_local_env_allowlist_matches_the_tool_layer():
 
     assert tuple(client_module.SAFE_ENV_KEYS) == process.SAFE_ENV_KEYS
     assert tuple(client_module.SAFE_ENV_PREFIXES) == process.SAFE_ENV_PREFIXES
+
+
+# --------------------------------------------------------------------------------------------
+# Fix round 1
+# --------------------------------------------------------------------------------------------
+
+
+def test_local_mode_command_does_not_put_the_run_directory_on_sys_path(tmp_path):
+    runner = FakeRunner(response=OpResponse(ok=True))
+    client, _ = _client(tmp_path, runner, mode="local")
+    client.call("run_solver", SOLVE_ARGS, timeout_s=30)
+    argv = runner.popen_calls[0]
+    assert argv[:4] == [sys.executable, "-P", "-m", "cfdagent.executor"]
+
+
+@pytest.mark.parametrize("module", ["json", "pydantic", "os", "cfdagent"])
+def test_planted_module_in_the_run_directory_is_never_imported(tmp_path, module):
+    root = tmp_path / "run"
+    root.mkdir()
+    marker = tmp_path / "IMPORTED"
+    package = root / module
+    if module == "cfdagent":
+        package.mkdir()
+        (package / "__init__.py").write_text(f"open({str(marker)!r}, 'w')\n", encoding="utf-8")
+    else:
+        (root / f"{module}.py").write_text(
+            f"open({str(marker)!r}, 'w')\nraise SystemExit(7)\n", encoding="utf-8"
+        )
+    (root / "hello.py").write_text("print('fine')\n", encoding="utf-8")
+    client = SandboxClient(_config(mode="local"), RunDir(root), RUN_ID)
+    response = client.call("run_script", {"script": "hello.py"}, timeout_s=120)
+    assert response.ok, response.error
+    assert "fine" in response.data["tail"]
+    assert not marker.exists()
+
+
+def test_nonzero_exit_with_a_planted_response_is_a_failure(tmp_path):
+    runner = FakeRunner(exit_code=1, response=OpResponse(ok=True, data={"forged": 1}))
+    client, _ = _client(tmp_path, runner)
+    response = client.call("run_solver", SOLVE_ARGS, timeout_s=30)
+    assert response.ok is False and response.internal is True
+    assert "exit code 1" in response.error
+
+
+def test_a_response_present_before_the_start_is_deleted(tmp_path, monkeypatch):
+    class FixedUuid:
+        hex = "deadbeef" * 4
+
+    class FixedModule:
+        @staticmethod
+        def uuid4():
+            return FixedUuid()
+
+    monkeypatch.setattr(client_module, "uuid", FixedModule)
+    runner = FakeRunner()  # the "container" writes no response
+    client, run_dir = _client(tmp_path, runner)
+    planted = ".sandbox/00001-deadbeef.response.json"
+    run_dir.write_text(planted, OpResponse(ok=True, data={"stale": 1}).model_dump_json())
+    response = client.call("run_solver", SOLVE_ARGS, timeout_s=30)
+    assert response.ok is False  # the stale file was not taken for an answer
+    assert not (run_dir.root / planted).exists()
+
+
+@pytest.mark.parametrize("timeout_s", [0, -1, math.nan, math.inf, -math.inf, "5", None, True])
+def test_call_rejects_unusable_timeouts(tmp_path, timeout_s):
+    runner = FakeRunner(response=OpResponse(ok=True))
+    client, _ = _client(tmp_path, runner)
+    with pytest.raises(ValueError, match="timeout"):
+        client.call("run_solver", SOLVE_ARGS, timeout_s=timeout_s)
+    assert runner.popen_calls == []
+
+
+def test_outer_timeout_adds_the_documented_margin():
+    assert OUTER_TIMEOUT_MARGIN_S == 1500.0
+    assert outer_timeout(300) == 1800.0
+    assert outer_timeout(0.5) == 1500.5
+    for bad in (0, -1, math.nan, math.inf):
+        with pytest.raises(ValueError):
+            outer_timeout(bad)
+
+
+def test_responses_do_not_leak_host_paths(tmp_path):
+    host = str(tmp_path)
+    stderr = f"docker: invalid mount {host}/run:/job\nopen {host.replace(chr(92), '/')}/x: denied"
+    runner = FakeRunner(exit_code=125, stderr=stderr.encode())
+    client, run_dir = _client(tmp_path, runner)
+    missing = client.call("run_solver", SOLVE_ARGS, timeout_s=30)
+    assert missing.ok is False
+    assert host not in missing.error and host.replace(chr(92), "/") not in missing.error
+    assert str(run_dir.root) not in missing.error
+
+    def no_docker(argv, **kwargs):
+        raise FileNotFoundError(2, "No such file", f"{host}/docker")
+
+    client = SandboxClient(_config(), run_dir, RUN_ID, popen=no_docker, run=runner.run)
+    refused = client.call("run_solver", SOLVE_ARGS, timeout_s=30)
+    assert refused.ok is False and refused.internal is True
+    assert host not in refused.error and "FileNotFoundError" in refused.error
+
+
+def test_unwritable_request_reports_the_class_not_the_path(tmp_path, monkeypatch):
+    runner = FakeRunner(response=OpResponse(ok=True))
+    client, run_dir = _client(tmp_path, runner)
+
+    def deny(*_args, **_kwargs):
+        raise PermissionError(13, "denied", str(run_dir.root / ".sandbox"))
+
+    monkeypatch.setattr(run_dir, "write_text", deny)
+    response = client.call("run_solver", SOLVE_ARGS, timeout_s=30)
+    assert response.ok is False and response.internal is True
+    assert str(tmp_path) not in response.error and "PermissionError" in response.error

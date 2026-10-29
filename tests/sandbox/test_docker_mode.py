@@ -14,6 +14,8 @@ from pathlib import Path
 
 import pytest
 
+from cfdagent.sandbox.client import outer_timeout
+
 pytestmark = pytest.mark.sandbox
 
 ROOT = Path(__file__).parents[2]
@@ -138,6 +140,9 @@ def test_root_filesystem_is_read_only_and_cannot_gain_privileges(sandbox):
         assert result[refused].startswith("refused"), result
     assert result["write /tmp"] == "ALLOWED" and result["write /job"] == "ALLOWED", result
     assert "ro" in result["mount /"], result
+    # /tmp is scratch space only: nothing in it can be executed, and no setuid or device nodes.
+    for flag in ("rw", "noexec", "nosuid", "nodev"):
+        assert flag in result["mount /tmp"], result
     assert result["no_new_privs"] == "1", result
     assert int(result["caps"]["CapEff"], 16) == 0, result
     assert int(result["caps"]["CapBnd"], 16) == 0, result
@@ -250,6 +255,39 @@ def test_mpi_environment_is_ready_for_cap_drop_all(sandbox):
     assert result["shm"], result
 
 
+def test_runtime_limits_beyond_memory_and_pids(sandbox):
+    result = probe(
+        sandbox,
+        """
+        import json, resource
+        limits = {
+            name: open("/sys/fs/cgroup/" + name).read().strip()
+            for name in ("memory.max", "memory.swap.max", "pids.max")
+        }
+        limits["core"] = list(resource.getrlimit(resource.RLIMIT_CORE))
+        print("RESULT=" + json.dumps(limits))
+        """,
+    )
+    assert result["memory.swap.max"] == "0", result  # --memory-swap equals --memory: no swap
+    assert result["core"] == [0, 0], result  # --ulimit core=0
+    assert result["pids.max"] == str(sandbox.config.pids), result
+
+
+@pytest.mark.parametrize("module", ["json", "pydantic", "cfdagent"])
+def test_planted_module_in_the_run_directory_is_never_imported(sandbox, module):
+    """The executor starts in the hostile run directory; python -P keeps it off sys.path."""
+    marker = "IMPORTED_MARKER"
+    plant = f"open('/job/{marker}', 'w').close()\nraise SystemExit(7)\n"
+    if module == "cfdagent":
+        sandbox.run_dir.write_text("cfdagent/__init__.py", plant)
+    else:
+        sandbox.run_dir.write_text(f"{module}.py", plant)
+    sandbox.run_dir.write_text("fine.py", "print('fine')\n")
+    response = sandbox.run_script("fine.py")
+    assert response.ok, response
+    assert not (sandbox.run_dir.root / marker).exists()
+
+
 def test_a_symlink_left_by_a_script_is_refused_on_the_next_call(sandbox):
     sandbox.script(
         "evil.py",
@@ -301,6 +339,8 @@ def test_codestream_dictionary_is_refused(sandbox):
     response = sandbox.client.call("check_dictionaries", {"case_dir": "case"}, timeout_s=300)
     assert response.ok is False, response
     assert not (sandbox.run_dir.root / "EXECUTED_MARKER").exists()
+    # The refusal is OpenFOAM's own, and says why.
+    assert "allowSystemOperations" in response.error or "#codeStream" in response.error
     # Refused up front: today OpenFOAM still compiles the block (wmake) and only the noexec
     # /tmp keeps the library from loading; with allowSystemOperations off nothing is compiled.
     assert "wmake" not in response.error, response.error
@@ -315,7 +355,7 @@ def test_full_pipeline_with_four_mpi_ranks_in_the_sandbox(sandbox):
     call = sandbox.client.call
 
     def step(op, args, timeout_s=600):
-        response = call(op, args, timeout_s=timeout_s)
+        response = call(op, args, timeout_s=outer_timeout(timeout_s))
         assert response.ok, f"{op}: {response.error}"
         return response
 

@@ -28,6 +28,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from cfdagent.errors import AgentInputError
 from cfdagent.executor import protocol
 from cfdagent.executor.protocol import OpRequest, OpResponse
@@ -109,6 +111,8 @@ def _plain(value: Any) -> Any:
         return {str(key): _plain(item) for key, item in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
         return [_plain(item) for item in value]
+    if isinstance(value, np.generic):
+        value = value.item()  # numpy scalars are not JSON-serialisable as they are
     if isinstance(value, float) and not math.isfinite(value):
         return None
     if isinstance(value, Path):

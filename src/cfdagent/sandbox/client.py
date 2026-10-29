@@ -22,6 +22,7 @@ This module is host-side: it imports no tool, CAD or mesh code.
 from __future__ import annotations
 
 import itertools
+import math
 import os
 import re
 import subprocess
@@ -42,8 +43,10 @@ from cfdagent.rundir import RunDir, RunDirError
 from cfdagent.sandbox.config import SandboxConfig
 from cfdagent.sandbox.docker import build_argv
 
-# Environment a local-mode executor gets; the same lists as ``tools.process`` (a test compares
-# them). Everything else, in particular cloud credentials and API keys, is dropped.
+# Environment a local-mode executor gets. These two lists are a copy of ``SAFE_ENV_KEYS`` and
+# ``SAFE_ENV_PREFIXES`` in ``tools.process`` (this host-side module must not import the tool
+# layer); change both together, a unit test compares them. Everything else, in particular
+# cloud credentials and API keys, is dropped.
 SAFE_ENV_KEYS: tuple[str, ...] = (
     "PATH",
     "HOME",
@@ -72,8 +75,41 @@ SAFE_ENV_PREFIXES: tuple[str, ...] = (
 
 STDERR_TAIL_BYTES = 6000  # with the message prefix this stays under protocol.MAX_ERROR_CHARS
 KILL_GRACE_S = 30.0
+# Added to an op's own time limit to get the limit of the whole call: container start-up and,
+# for a parallel solve, the decomposePar and reconstructPar steps and the foamDictionary
+# reads around the solver, which the op's timeout_s does not cover.
+OUTER_TIMEOUT_MARGIN_S = 1500.0
 _COMMAND_TIMEOUT_S = 60.0
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}")
+
+
+def _check_timeout(timeout_s: object) -> float:
+    if (
+        isinstance(timeout_s, bool)
+        or not isinstance(timeout_s, (int, float))
+        or not math.isfinite(timeout_s)
+        or timeout_s <= 0
+    ):
+        raise ValueError(f"timeout_s must be a finite number greater than 0, got {timeout_s!r}")
+    return float(timeout_s)
+
+
+def outer_timeout(inner_timeout_s: float) -> float:
+    """The ``timeout_s`` of ``SandboxClient.call`` for an op whose own limit is ``inner_timeout_s``.
+
+    Callers use this instead of passing the op's limit on: the call must outlive the op by the
+    margin ``OUTER_TIMEOUT_MARGIN_S`` (1500 s), or a slow but healthy decompose/reconstruct step
+    would be cut off by the container kill and reported as a timeout of the solver.
+    """
+    return _check_timeout(inner_timeout_s) + OUTER_TIMEOUT_MARGIN_S
+
+
+def _why(exc: BaseException) -> str:
+    """A reason fit for a response: run-relative messages of RunDir errors, else the class only.
+
+    Operating system errors carry absolute host paths in their text; those never leave the host.
+    """
+    return str(exc)[:300] if isinstance(exc, RunDirError) else type(exc).__name__
 
 
 def _tail(handle, limit: int = STDERR_TAIL_BYTES) -> str:
@@ -84,7 +120,7 @@ def _tail(handle, limit: int = STDERR_TAIL_BYTES) -> str:
         data = handle.read()
     except (OSError, ValueError):
         return ""
-    return data.decode("utf-8", errors="replace").lstrip("�")
+    return data.decode("utf-8", errors="replace").lstrip("\ufffd")
 
 
 def _kill_process(proc: Any) -> None:
@@ -154,7 +190,17 @@ class SandboxClient:
             kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             kwargs["start_new_session"] = True
-        return [sys.executable, "-m", "cfdagent.executor", op, request_rel], kwargs
+        return [sys.executable, "-P", "-m", "cfdagent.executor", op, request_rel], kwargs
+
+    def _scrub(self, text: str) -> str:
+        """Replace the host paths of the run directory and its parent in text from the outside."""
+        root = self.run_dir.root
+        for path in (root, root.parent):
+            if len(str(path)) <= 3:  # a file system root: nothing sensible to hide
+                continue
+            for variant in {str(path), path.as_posix(), str(path).replace("\\", "\\\\")}:
+                text = text.replace(variant, "<run>" if path == root else "<runs>")
+        return text
 
     def _command_quietly(self, argv: list[str]) -> None:
         try:
@@ -194,6 +240,7 @@ class SandboxClient:
         does not start, no or bad response, timeout); those are failed responses. A
         ``KeyboardInterrupt`` kills the container and propagates.
         """
+        timeout_s = _check_timeout(timeout_s)
         raw_args = args.model_dump(mode="json") if isinstance(args, BaseModel) else args
         try:
             model = protocol.validate_args(op, raw_args)
@@ -209,12 +256,14 @@ class SandboxClient:
 
         request = OpRequest(op=op, args=model.model_dump(mode="json"))
         try:
+            # An answer that exists before the executor starts cannot be its answer.
+            self.run_dir.path(response_rel).unlink(missing_ok=True)
             self.run_dir.write_text(
                 request_rel, request.model_dump_json(), max_bytes=protocol.REQUEST_MAX_BYTES
             )
         except (RunDirError, OSError) as exc:
             return protocol.failure(
-                f"cannot write the request into the run directory ({exc}); "
+                f"cannot prepare the call in the run directory ({_why(exc)}); "
                 "the run directory may have been tampered with",
                 internal=True,
             )
@@ -232,7 +281,8 @@ class SandboxClient:
                 )
             except OSError as exc:
                 return protocol.failure(
-                    f"cannot start the executor ({argv[0]}): {exc}", internal=True
+                    f"cannot start the executor ({Path(argv[0]).name}): {_why(exc)}",
+                    internal=True,
                 )
 
             timed_out = False
@@ -245,7 +295,7 @@ class SandboxClient:
             except BaseException:  # KeyboardInterrupt included: never leave the container behind
                 self._stop(proc, name)
                 raise
-            tail = _tail(output)
+            tail = self._scrub(_tail(output))
 
         if timed_out:
             where = (
@@ -257,15 +307,19 @@ class SandboxClient:
                 f"{op} timed out after {timeout_s:g} s; {where}\n{tail}".rstrip(),
                 data={"timed_out": True},
             )
+        if code != 0:  # the executor exits 0 whenever it wrote a response: ignore any file
+            return protocol.failure(
+                f"the executor for {op} failed (exit code {code}); a response file, if any, "
+                f"is ignored\n{tail}".rstrip(),
+                internal=True,
+            )
         try:
             return OpResponse.model_validate(
                 self.run_dir.read_json(response_rel, protocol.RESPONSE_MAX_BYTES)
             )
         except (RunDirError, OSError, ValidationError) as exc:
-            reason = exc.__class__.__name__ if isinstance(exc, ValidationError) else str(exc)
-            reason = reason[:300]
             return protocol.failure(
-                f"the executor for {op} (exit code {code}) left no valid response: {reason}\n"
-                f"{tail}".rstrip(),
+                f"the executor for {op} (exit code {code}) left no valid response: "
+                f"{_why(exc)}\n{tail}".rstrip(),
                 internal=True,
             )

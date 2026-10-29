@@ -6,7 +6,7 @@ import os
 import re
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _host_id(getter: str) -> int:
@@ -25,7 +25,8 @@ class SandboxConfig(BaseModel):
     ``mode="docker"``: every call is a fresh hardened container (see ``sandbox.docker``).
     ``mode="local"``: the executor runs as a plain subprocess of the caller. That is NOT
     confined: it exists for tests that already run inside the image and must never be used for
-    agent-written code on a machine that holds credentials.
+    agent-written code on a machine that holds credentials. It is refused unless
+    ``allow_local=True`` is set explicitly (and ``allow_local`` is refused in docker mode).
 
     ``uid`` / ``gid`` default to the host user's, so files that the container creates in the run
     directory belong to the host user (1000 where the platform has no uid). The container never
@@ -35,6 +36,7 @@ class SandboxConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     mode: Literal["docker", "local"] = "docker"
+    allow_local: bool = False
     image: str
     uid: int = Field(default_factory=lambda: _host_id("getuid"), ge=1, le=2**31 - 1)
     gid: int = Field(default_factory=lambda: _host_id("getgid"), ge=1, le=2**31 - 1)
@@ -43,6 +45,17 @@ class SandboxConfig(BaseModel):
     pids: int = Field(default=512, ge=1, le=1_000_000)
     tmpfs_size: str = "512m"
     shm_size: str = "512m"
+
+    @model_validator(mode="after")
+    def _local_mode_is_an_explicit_choice(self) -> SandboxConfig:
+        if self.mode == "local" and not self.allow_local:
+            raise ValueError(
+                "mode='local' runs agent-written code without a container; "
+                "pass allow_local=True to confirm it is only used inside a disposable test image"
+            )
+        if self.mode == "docker" and self.allow_local:
+            raise ValueError("allow_local only makes sense with mode='local'")
+        return self
 
     @field_validator("image")
     @classmethod

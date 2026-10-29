@@ -12,7 +12,7 @@ import sys
 import pytest
 
 from cfdagent.errors import AgentInputError
-from cfdagent.rundir import FileTooLarge, RunDir, RunDirError, UnsafePath
+from cfdagent.rundir import MAX_DEPTH, FileTooLarge, RunDir, RunDirError, UnsafePath
 
 windows_only = pytest.mark.skipif(sys.platform != "win32", reason="NTFS junctions")
 needs_fifo = pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
@@ -301,3 +301,88 @@ def test_promote_refuses_unsafe_arguments(run, tmp_path):
     with pytest.raises(UnsafePath):
         run.promote(attempt, ".")  # would replace the whole run directory
     assert attempt.is_dir()
+
+
+# --------------------------------------------------------------------------------------------
+# Fix round 1: depth cap, no recursion, no host paths in messages
+# --------------------------------------------------------------------------------------------
+
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="deep relative trees need POSIX")
+
+
+def _deep_tree(top, depth):
+    """Create top/d/d/d/... (depth levels) with relative mkdir, so path length never matters."""
+    here = os.getcwd()
+    os.chdir(top)
+    try:
+        for _ in range(depth):
+            os.mkdir("d")
+            os.chdir("d")
+            with open("f.txt", "w", encoding="utf-8") as handle:
+                handle.write("x")
+    finally:
+        os.chdir(here)
+
+
+@posix_only
+def test_iter_files_caps_the_depth_and_does_not_recurse(run):
+    (run.root / "top.txt").write_text("t", encoding="utf-8")
+    _deep_tree(run.root, 400)  # several times the cap
+    found = list(run.iter_files())
+    assert run.root / "top.txt" in found
+    assert len(found) == 1 + MAX_DEPTH  # files down to the cap, nothing deeper
+    assert run.skipped >= 1 and run.skipped_paths
+
+
+@posix_only
+def test_promote_caps_the_depth_and_does_not_recurse(run):
+    attempt = run.attempt_dir("mesh", 1)
+    (attempt / "top.txt").write_text("t", encoding="utf-8")
+    _deep_tree(attempt, 400)
+    run.promote(attempt, "mesh")
+    copied = [p for p in (run.root / "mesh").rglob("f.txt")]
+    assert 0 < len(copied) <= MAX_DEPTH
+    assert (run.root / "mesh" / "top.txt").is_file()
+    assert run.skipped >= 1
+
+
+@posix_only
+def test_attempt_dir_removes_a_very_deep_tree(run):
+    first = run.attempt_dir("geometry", 1)
+    _deep_tree(first, 500)
+    second = run.attempt_dir("geometry", 1)
+    assert list(second.iterdir()) == []
+
+
+def test_residual_recursion_error_becomes_a_run_dir_error(run, monkeypatch):
+    def boom(*_args, **_kwargs):
+        raise RecursionError
+
+    monkeypatch.setattr(os, "scandir", boom)
+    with pytest.raises(RunDirError, match="too deep"):
+        list(run.iter_files())
+
+
+def test_symlinked_attempt_directory_is_refused_and_not_deleted(run, tmp_path):
+    precious = tmp_path / "precious"
+    precious.mkdir()
+    (precious / "keep.txt").write_text("keep", encoding="utf-8")
+    (run.root / "attempts").mkdir()
+    _symlink(run.root / "attempts" / "geometry-1", precious, directory=True)
+    with pytest.raises(UnsafePath):
+        run.attempt_dir("geometry", 1)
+    assert (precious / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_messages_do_not_carry_host_paths(run, tmp_path):
+    host = str(run.root)
+    with pytest.raises(FileNotFoundError) as missing:
+        run.read_text("nope.txt")
+    assert host not in str(missing.value) and "nope.txt" in str(missing.value)
+    with pytest.raises(UnsafePath) as outside:
+        run.relative(tmp_path / "elsewhere")
+    assert str(tmp_path) not in str(outside.value)
+    (run.root / "d").mkdir()
+    with pytest.raises(RunDirError) as directory:
+        run.read_text("d")
+    assert host not in str(directory.value)
