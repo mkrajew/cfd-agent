@@ -1,0 +1,17 @@
+{
+  "id": "chatcmpl-fixture-3",
+  "object": "chat.completion",
+  "created": 1790000002,
+  "model": "fixture-deployment",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "{\"solver\": \"icoFoam\", \"steady\": false, \"reynolds\": 100.0}"
+      }
+    }
+  ],
+  "usage": {"prompt_tokens": 30, "completion_tokens": 18, "total_tokens": 48}
+}

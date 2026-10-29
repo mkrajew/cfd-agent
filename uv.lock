@@ -228,6 +228,7 @@ source = { editable = "." }
 dependencies = [
     { name = "azure-identity" },
     { name = "azure-storage-blob" },
+    { name = "httpx2" },
     { name = "numpy" },
     { name = "openai" },
     { name = "pydantic" },
@@ -255,6 +256,7 @@ requires-dist = [
     { name = "azure-storage-blob" },
     { name = "cadquery", marker = "extra == 'toolchain'" },
     { name = "gmsh", marker = "extra == 'toolchain'" },
+    { name = "httpx2" },
     { name = "matplotlib", marker = "extra == 'toolchain'" },
     { name = "numpy" },
     { name = "openai" },

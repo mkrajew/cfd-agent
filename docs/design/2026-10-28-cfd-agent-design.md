@@ -220,7 +220,7 @@ Resource group `rg-cfdagent` in `italynorth`, deployed/destroyed with one comman
 | Network | VNet, public IP, NSG: SSH 22 open to the Internet, key-only + fail2ban — owner decision 2026-10-29 (the owner switches networks and uses a VPN); no other inbound port |
 | Auto-shutdown | Daily shutdown at a time parameter (Europe/Warsaw) by a systemd timer on the VM, because DevTestLab schedules are not offered in any allowed region (**owner decision 2026-10-28**) |
 | Idle shutdown | On-VM timer: no SSH sessions and no running `cfdagent` for 30 min → VM deallocates itself (identity scoped to deallocate only that VM) |
-| AI Foundry | AI Services account + deployments: `gpt-oss-120b` (primary), `Llama-3.3-70B-Instruct` (comparison). `qwen3-32b` is **not deployable** on an AIServices account in italynorth (ARM preflight rejects `GlobalStandard` and `DeveloperTier`), so it is not in the Bicep; the Task 11 fallback rule applies |
+| AI Foundry | AI Services account + deployments: `gpt-oss-120b` (primary), `Llama-3.3-70B-Instruct` (comparison). `qwen3-32b` is **not deployable** on an AIServices account in italynorth (ARM preflight rejects `GlobalStandard` and `DeveloperTier`), so it is not in the Bicep; the fallback rule was applied and the owner declined a replacement (2026-10-29, ADR-0002, §14.1) |
 | Storage | StorageV2, LRS, Hot; container `runs`; lifecycle rule; VM identity has Blob Data Contributor; owner has a data-reader role for Portal browsing |
 | Key Vault | Only if a key fallback is needed (§6.4) |
 | Budget | Subscription budget $100 with alerts at 25/50/75/90 %, owner's email as parameter |
@@ -329,7 +329,7 @@ Other Claude Code files:
 
 | Milestone | Scope | Done when |
 |---|---|---|
-| **M0 Foundations** | Repo, CI, Docker image (OpenFOAM ESI + Gmsh + CadQuery + Python stack), Bicep infra, LLM capability spike (§6.4) **for all three candidate models**, benchmark references and thresholds fixed | Cavity passes CadQuery → Gmsh → OpenFOAM → post-processing **from hand-written scripts, no LLM**, locally and on the VM |
+| **M0 Foundations** | Repo, CI, Docker image (OpenFOAM ESI + Gmsh + CadQuery + Python stack), Bicep infra, LLM capability spike (§6.4) **run for the candidate models (gpt-oss-120b and Llama-3.3-70B-Instruct tested; qwen3-32b not deployable and excluded, see ADR-0002)**, benchmark references and thresholds fixed | Cavity passes CadQuery → Gmsh → OpenFOAM → post-processing **from hand-written scripts, no LLM**, locally and on the VM |
 | **M1 First autonomous run** | Orchestrator, agents 1–6, CLI, Blob upload, run record | Cavity Re = 100 from text to results with no human intervention |
 | **M2 Robustness + full benchmark set** | Fix loops, Critic, Scorer, knowledge base; generality test set prepared (owner's task texts, references, criteria) but **not run** | Pipe and cylinder (Re 20, Re 100) pass |
 | **M3 Experiment campaign** | Frozen release; `cfdagent bench`; first runs of the generality test set; matrix in §14.1 | Statistics ready for the report |
@@ -355,12 +355,12 @@ Other Claude Code files:
 ### 14.1 M3 experiment matrix **[Claude's call, accepted by the owner 2026-10-28]**
 Priority order — lower rows are dropped first if money or time runs short:
 1. **gpt-oss-120b, reasoning medium:** all 5 development variants + the generality test set (3–4 tasks), 5 repeats each.
-2. **Model comparison:** Llama-3.3-70B and qwen3-32b on a subset (cavity Re 100, cylinder Re 20, one generality task), 3 repeats each.
+2. **Model comparison:** Llama-3.3-70B only on a subset (cavity Re 100, cylinder Re 20, one generality task), 3 repeats. `qwen3-32b` is excluded (owner decision 2026-10-29, see ADR-0002).
 3. **Reasoning effort:** gpt-oss-120b low and high on the same subset, 3 repeats each.
 
-The optional heated-cavity task is the first thing dropped inside row 1. Estimated ≈ 75–85 runs, ≈ 35–45 VM-hours, ≈ $8 VM + ≈ $12 LLM.
+The optional heated-cavity task is the first thing dropped inside row 1. Estimated ≈ 65–75 runs, ≈ 30–40 VM-hours, ≈ $7 VM + ≈ $11 LLM (recomputed 2026-10-29 after dropping `qwen3-32b`, i.e. 9 runs fewer).
 
-**Comparison-model fallback [Claude's call]:** if the M0 spike shows a candidate cannot do tool calling reliably, or its quota (20) makes runs impractically slow, it is replaced by another model with quota (Llama-4-Scout, mistral-small, Phi-4) or excluded. An exclusion and its reason are recorded as a finding. Weaker models never silently run through a different interface than gpt-oss-120b; any interface difference is stated in the results.
+**Comparison-model fallback [Claude's call]:** if the M0 spike shows a candidate cannot do tool calling reliably, or its quota (20) makes runs impractically slow, it is replaced by another model with quota (Llama-4-Scout, mistral-small, Phi-4) or excluded. An exclusion and its reason are recorded as a finding. Weaker models never silently run through a different interface than gpt-oss-120b; any interface difference is stated in the results. The rule was applied in the M0 spike: `qwen3-32b` could not be deployed (ARM rejected both SKUs), and the owner declined a replacement on 2026-10-29, so the comparison has one model.
 
 ### 14.2 Spending envelopes (owner's decision, 2026-10-28)
 | Phase | Envelope |
