@@ -219,7 +219,7 @@ Resource group `rg-cfdagent` in `italynorth`, deployed/destroyed with one comman
 | Network | VNet, public IP, NSG: SSH (22) only from the owner's IP (parameter); SSH key auth only |
 | Auto-shutdown | Daily schedule (time parameter, Europe/Warsaw) |
 | Idle shutdown | On-VM timer: no SSH sessions and no running `cfdagent` for 30 min → VM deallocates itself (identity scoped to deallocate only that VM) |
-| AI Foundry | AI Services account + deployments: `gpt-oss-120b` (primary), `Llama-3.3-70B-Instruct`, `qwen3-32b` (comparison; deploy when M3 needs them) |
+| AI Foundry | AI Services account + deployments: `gpt-oss-120b` (primary), `Llama-3.3-70B-Instruct`, (comparison; `qwen3-32b` excluded, see §14.1) |
 | Storage | StorageV2, LRS, Hot; container `runs`; lifecycle rule; VM identity has Blob Data Contributor; owner has a data-reader role for Portal browsing |
 | Key Vault | Only if a key fallback is needed (§6.4) |
 | Budget | Subscription budget $100 with alerts at 25/50/75/90 %, owner's email as parameter |
@@ -354,12 +354,12 @@ Other Claude Code files:
 ### 14.1 M3 experiment matrix **[Claude's call, accepted by the owner 2026-10-28]**
 Priority order — lower rows are dropped first if money or time runs short:
 1. **gpt-oss-120b, reasoning medium:** all 5 development variants + the generality test set (3–4 tasks), 5 repeats each.
-2. **Model comparison:** Llama-3.3-70B and qwen3-32b on a subset (cavity Re 100, cylinder Re 20, one generality task), 3 repeats each.
+2. **Model comparison:** Llama-3.3-70B only on a subset (cavity Re 100, cylinder Re 20, one generality task), 3 repeats. `qwen3-32b` is excluded (owner decision 2026-10-29, see ADR-0002).
 3. **Reasoning effort:** gpt-oss-120b low and high on the same subset, 3 repeats each.
 
-The optional heated-cavity task is the first thing dropped inside row 1. Estimated ≈ 75–85 runs, ≈ 35–45 VM-hours, ≈ $8 VM + ≈ $12 LLM.
+The optional heated-cavity task is the first thing dropped inside row 1. Estimated ≈ 65–75 runs, ≈ 30–40 VM-hours, ≈ $7 VM + ≈ $11 LLM (recomputed 2026-10-29 after dropping `qwen3-32b`, i.e. 9 runs fewer).
 
-**Comparison-model fallback [Claude's call]:** if the M0 spike shows a candidate cannot do tool calling reliably, or its quota (20) makes runs impractically slow, it is replaced by another model with quota (Llama-4-Scout, mistral-small, Phi-4) or excluded. An exclusion and its reason are recorded as a finding. Weaker models never silently run through a different interface than gpt-oss-120b; any interface difference is stated in the results.
+**Comparison-model fallback [Claude's call]:** if the M0 spike shows a candidate cannot do tool calling reliably, or its quota (20) makes runs impractically slow, it is replaced by another model with quota (Llama-4-Scout, mistral-small, Phi-4) or excluded. An exclusion and its reason are recorded as a finding. Weaker models never silently run through a different interface than gpt-oss-120b; any interface difference is stated in the results. The rule was applied in the M0 spike: `qwen3-32b` could not be deployed (ARM rejected both SKUs), and the owner declined a replacement on 2026-10-29, so the comparison has one model.
 
 ### 14.2 Spending envelopes (owner's decision, 2026-10-28)
 | Phase | Envelope |

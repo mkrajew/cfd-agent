@@ -1,6 +1,6 @@
 # ADR-0002: LLM capability spike and client behaviour
 
-- **Status:** Proposed, 2026-10-29 (the replacement for `qwen3-32b` needs the owner's approval, see Decision 4)
+- **Status:** Accepted, 2026-10-29
 - **Deciders:** the owner
 
 ## Context
@@ -44,11 +44,11 @@ Observations:
    - Structured output uses strict `json_schema`; the reply is validated with pydantic and `StructuredOutputError` carries the raw text. If a model later rejects `json_schema` or fails it, the fallback is: ask for a single JSON object in the system prompt, validate with pydantic, and retry with the validation error appended (the spike script contains the prompt-only variant). Not needed so far.
    - If a model were to reject reasoning effort, reasoning depth is steered through the system prompt instead ("think step by step" versus "answer briefly").
    - If a model were to reject Entra ID, the fallback is an API key kept in Key Vault and passed through the environment variable named by `LLMSettings.api_key_env` (`auth="api_key"`). Not needed so far.
-3. **`qwen3-32b` is excluded at deployment.** ARM rejected both SKUs tried, so the spike could not run for it. This is recorded as a finding of the M0 spike (the design lists quota and availability as the reasons for the fallback rule).
-4. **Replacement pending.** Under the comparison-model fallback rule (design section 14.1) `qwen3-32b` is replaced, in this order, by `Llama-4-Scout`, `mistral-small`, `Phi-4`. Deploying a replacement creates an Azure resource and needs the owner's explicit approval. Until then this ADR stays Proposed. After approval the same spike is run for the first model that deploys, and its row is added to the tables above and to the JSON file. A replacement that fails tool calling in 2 or more of 3 repeats is skipped for the next one.
-5. **M3 model list (current state).**
-   - Main: `gpt-oss-120b` with reasoning effort low, medium (default) and high. Medium was not exercised in the spike; only low and high were.
-   - Comparison: `Llama-3.3-70B-Instruct` (effort not varied) and the replacement for `qwen3-32b` once it is deployed and has passed the spike.
+3. **`qwen3-32b` is excluded.** It is not deployable on the AI Services account: ARM rejects both `GlobalStandard` and `DeveloperTier`, so the spike could not run for it. Under the comparison-model fallback rule (design section 14.1) a replacement (`Llama-4-Scout`, `mistral-small`, `Phi-4`, in that order) would have been spike-tested next. The owner declined deploying a replacement on 2026-10-29 because two models are enough. Both facts are findings of the M0 spike.
+4. **Final M3 model list.**
+   - Primary: `gpt-oss-120b`, with reasoning effort low, medium (default) and high. Medium was not exercised in the spike; only low and high were.
+   - Comparison: `Llama-3.3-70B-Instruct`, effort not varied.
+   - `reasoning_effort` is an experimental factor for `gpt-oss-120b` only; Llama ignores it.
    - Any interface difference between models must still be stated in the results, as the design requires. At present there is none.
 
 ## Consequences
@@ -57,4 +57,4 @@ Observations:
 - The reasoning-effort comparison in M3 (design section 14.1, row 3) applies to `gpt-oss-120b` only.
 - Reasoning token counts per run cannot be reported separately; reports use completion tokens and say so.
 - The client depends on `httpx2`, the HTTP library of the installed `openai` package (version 3.x); it is declared in `pyproject.toml`.
-- Rate limits and quota ceilings were not stress-tested. The design's quota concern (20 for the comparison models) is still open until the first campaign runs.
+- Rate limits and quota ceilings were not stress-tested. The design's quota concern (20 for Llama-3.3-70B-Instruct) is still open until the first campaign runs.
