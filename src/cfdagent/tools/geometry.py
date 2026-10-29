@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cfdagent.manifest import MANIFEST_FILE_NAME, BoundaryManifest
+from cfdagent.tools.bbox import compare_bbox, validate_expected_bbox
 from cfdagent.tools.process import ToolResult, run_tool
 
 STEP_FILE_NAME = "geometry.step"
@@ -36,10 +37,6 @@ def run_geometry_script(script: Path, workdir: Path, timeout_s: float = 300.0) -
     )
 
 
-def _fmt_bbox(bbox: tuple[float, ...]) -> str:
-    return "(" + ", ".join(f"{v:.6g}" for v in bbox) + ")"
-
-
 def check_geometry(
     workdir: Path, expected_bbox: tuple[float, ...], rel_tol: float = 1e-3
 ) -> GateResult:
@@ -48,15 +45,15 @@ def check_geometry(
     Verifies that ``geometry.step`` and ``boundary_manifest.json`` exist, the manifest parses, the
     STEP holds at least one solid and every solid is valid, and the combined bounding box
     (xmin, ymin, zmin, xmax, ymax, zmax) matches ``expected_bbox`` within ``rel_tol`` times the
-    largest expected dimension, per coordinate.
+    largest expected dimension, per coordinate. NaN or inf in the actual or expected box, and a
+    ``rel_tol`` that is not a finite positive number, are gate errors and never pass.
     """
     workdir = Path(workdir)
     errors: list[str] = []
 
-    if len(expected_bbox) != 6:
-        return GateResult(
-            False, [f"expected bounding box must have 6 values, got {len(expected_bbox)}"]
-        )
+    invalid = validate_expected_bbox(expected_bbox, rel_tol)
+    if invalid is not None:
+        return GateResult(False, [invalid])
 
     step_path = workdir / STEP_FILE_NAME
     manifest_path = workdir / MANIFEST_FILE_NAME
@@ -98,13 +95,8 @@ def check_geometry(
         max(b.ymax for b in boxes),
         max(b.zmax for b in boxes),
     )
-    expected = tuple(float(v) for v in expected_bbox)
-    largest = max(expected[3] - expected[0], expected[4] - expected[1], expected[5] - expected[2])
-    tol = rel_tol * largest
-    if any(abs(a - e) > tol for a, e in zip(actual, expected, strict=True)):
-        errors.append(
-            f"bounding box mismatch: expected {_fmt_bbox(expected)}, got {_fmt_bbox(actual)} "
-            f"(tolerance {tol:.3g})"
-        )
+    mismatch = compare_bbox(actual, tuple(float(v) for v in expected_bbox), rel_tol)
+    if mismatch is not None:
+        errors.append(mismatch)
 
     return GateResult(not errors, errors)

@@ -18,14 +18,9 @@ from __future__ import annotations
 import gmsh
 
 from cfdagent.manifest import BoundaryManifest, Locator, ManifestError
+from cfdagent.tools.bbox import BBox, format_bbox
 
 _AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
-
-BBox = tuple[float, float, float, float, float, float]
-
-
-def _fmt_bbox(bbox: BBox) -> str:
-    return "(" + ", ".join(f"{v:.6g}" for v in bbox) + ")"
 
 
 def _boundary_surfaces() -> list[int]:
@@ -70,7 +65,7 @@ def match_surfaces(manifest: BoundaryManifest, tol: float = 1e-6) -> dict[str, l
 
     problems = []
     for tag in surfaces:
-        where = f"surface tag {tag}, bounding box {_fmt_bbox(bboxes[tag])}"
+        where = f"surface tag {tag}, bounding box {format_bbox(bboxes[tag])}"
         if not owners[tag]:
             problems.append(f"{where} is not matched by any patch")
         elif len(owners[tag]) > 1:
