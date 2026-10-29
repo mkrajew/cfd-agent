@@ -511,3 +511,40 @@ def test_benchmark_root_is_absolute_after_chdir(tmp_path, monkeypatch):
     monkeypatch.chdir(elsewhere)
     result = score(registry["alpha"], {"prof": {"x": [0.0, 1.0], "value": [0.0, 1.0]}, "cd": 1.5})
     assert result.passed
+
+
+def test_score_never_reports_a_non_finite_error(tmp_path):
+    write_csv(tmp_path / "reference/prof.csv", [0.0, 0.5, 1.0], [0.0, 0.5, 1.0])
+    big = 1.7e308
+    criteria = [
+        profile_criterion(),
+        profile_criterion(quantity="prof_rms", metric="rms_error"),
+        scalar_criterion(quantity="s_abs", metric="max_abs_error", reference_value=-big),
+        scalar_criterion(quantity="s_rel", reference_value=1.0, normalise_by=1e-300),
+        Criterion(
+            quantity="s_range", kind="scalar", metric="in_range", reference_range=(-big, -big)
+        ),
+    ]
+    benchmark = make_benchmark(tmp_path, criteria)
+    quantities = {
+        "prof": {"x": [0.0, 1.0], "value": [-1e308, 1e308]},
+        "prof_rms": {"x": [0.0, 0.5, 1.0], "value": [big, -big, big]},
+        "s_abs": big,
+        "s_rel": big,
+        "s_range": big,
+    }
+
+    result = score(benchmark, quantities)
+
+    assert not result.passed
+    for criterion_result in result.criteria:
+        assert not criterion_result.passed
+        assert criterion_result.error is None
+        assert "not a finite number" in criterion_result.reason
+
+
+def test_score_documents_a_dict_precondition(tmp_path):
+    benchmark = make_benchmark(tmp_path, [scalar_criterion()])
+    assert "validate_quantities" in (score.__doc__ or "")
+    with pytest.raises(TypeError):
+        score(benchmark, None)  # type: ignore[arg-type]

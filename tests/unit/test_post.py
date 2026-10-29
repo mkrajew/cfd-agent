@@ -243,3 +243,31 @@ def test_write_quantities_rejects_huge_integer_and_bool(tmp_path):
         with pytest.raises(ValueError):
             write_quantities(path, bad)
     assert not path.exists()
+
+
+def test_validate_quantities_cap_is_checked_before_converting_numbers():
+    huge = [10**400] * (MAX_PROFILE_POINTS + 1)
+    with pytest.raises(ValueError, match="at most") as info:
+        validate_quantities({"p": {"x": huge, "value": huge}})
+    assert "too large" not in str(info.value)
+
+
+def test_validate_quantities_messages_stay_small_for_hostile_input():
+    many_keys = {f"k{i}": [1.0, 2.0] for i in range(100_000)}
+    many_keys["x"] = [0.0, 1.0]
+    with pytest.raises(ValueError, match="and 99") as info:
+        validate_quantities({"p": many_keys})
+    assert len(str(info.value)) < 1000
+
+    long_name = "q" * 5_000_000
+    for bad in (
+        {long_name: {"y": [0.0, 1.0]}},
+        {long_name: True},
+        {long_name: [1.0]},
+        {long_name: {"x": [0.0], "value": [1.0]}},
+        {long_name: {"x": [0.0, 1.0], "value": [1.0, math.nan]}},
+        {"p": {long_name: [1.0, 2.0], "x": [0.0, 1.0]}},
+    ):
+        with pytest.raises(ValueError) as info:
+            validate_quantities(bad)
+        assert len(str(info.value)) < 1000

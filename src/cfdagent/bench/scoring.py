@@ -85,10 +85,12 @@ def profile_error(sim_x, sim_v, ref_x, ref_v, metric: str) -> float:
             f"[{lo:g}, {hi:g}] (e.g. x={float(bad[0]):g}); refusing to extrapolate"
         )
 
-    difference = np.interp(rx, sx, sv) - rv
-    if metric == "max_abs_error":
-        return float(np.max(np.abs(difference)))
-    return float(np.sqrt(np.mean(difference**2)))
+    # values near the float limit overflow to inf; the caller rejects a non-finite error
+    with np.errstate(over="ignore", invalid="ignore"):
+        difference = np.interp(rx, sx, sv) - rv
+        if metric == "max_abs_error":
+            return float(np.max(np.abs(difference)))
+        return float(np.sqrt(np.mean(difference**2)))
 
 
 def _read_reference(path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -153,6 +155,9 @@ def _score_criterion(
 
     if criterion.normalise_by is not None:
         error /= criterion.normalise_by
+    # finite inputs near the float limit can still give an infinite error; never report it
+    if not math.isfinite(error):
+        return failed("the error is not a finite number")
     if criterion.metric == "in_range":
         passed = error == 0.0
         reason = "within range" if passed else "outside the reference range"
@@ -170,6 +175,10 @@ def score(benchmark: Benchmark, quantities: Quantities) -> ScoreResult:
     oversized or unusable quantity, or a reference file that cannot be read, gives a failed
     criterion with a reason. The result passes only if there is at least one criterion and all
     of them pass.
+
+    Precondition: ``quantities`` is a dict, normally the output of
+    ``cfdagent.quantities.validate_quantities``. A non-dict raises ``TypeError``; that is a caller
+    bug, outside the "bad simulation data" contract above.
     """
     results = [_score_criterion(c, benchmark, quantities) for c in benchmark.criteria]
     return ScoreResult(passed=bool(results) and all(r.passed for r in results), criteria=results)
