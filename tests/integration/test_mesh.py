@@ -9,6 +9,7 @@ import gmsh
 import pytest
 
 import cfdagent
+from cfdagent.errors import ToolFailure
 from cfdagent.gates import GateResult
 from cfdagent.manifest import MANIFEST_FILE_NAME, BoundaryManifest, BoundaryPatch, Locator
 from cfdagent.tools.geometry import check_geometry, run_geometry_script
@@ -251,7 +252,7 @@ def test_apply_patch_types_requires_converted_mesh(tmp_path):
         dimensionality="3D",
         patches=[BoundaryPatch(name="a", type="wall", locators=[_plane("x", 0.0)])],
     )
-    with pytest.raises(MeshError, match="convert_to_foam"):
+    with pytest.raises(ToolFailure, match="convert_to_foam"):
         apply_patch_types(tmp_path / "no_case", manifest)
 
 
@@ -361,7 +362,7 @@ def test_foamdictionary_failure_is_not_reported_as_absent_patch(cavity, tmp_path
     boundary = case_dir / "constant" / "polyMesh" / "boundary"
     boundary.write_text("this is { not a ( boundary file", encoding="utf-8")
     manifest = _cavity_manifest_with()
-    with pytest.raises(MeshError) as exc:
+    with pytest.raises(ToolFailure) as exc:
         apply_patch_types(case_dir, manifest)
     assert "not in" not in str(exc.value)
     assert "foamDictionary" in str(exc.value)
@@ -438,6 +439,6 @@ def test_convert_to_foam_refuses_existing_polymesh(cavity, tmp_path):
     _, source = cavity
     case_dir = _copy_case(source, tmp_path)
     before = (case_dir / "constant" / "polyMesh" / "boundary").read_bytes()
-    with pytest.raises(MeshError, match="polyMesh"):
+    with pytest.raises(ToolFailure, match="polyMesh"):
         convert_to_foam(source.parent / "mesh.msh", case_dir)
     assert (case_dir / "constant" / "polyMesh" / "boundary").read_bytes() == before

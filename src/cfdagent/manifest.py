@@ -10,7 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from cfdagent.errors import AgentInputError
 
@@ -81,7 +81,13 @@ class BoundaryManifest(BaseModel):
 
     @classmethod
     def from_file(cls, path: Path) -> BoundaryManifest:
-        return cls.model_validate_json(Path(path).read_text(encoding="utf-8"))
+        """Read a manifest; every failure to read or validate it raises ``ManifestError``."""
+        try:
+            return cls.model_validate_json(Path(path).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValidationError) as exc:
+            raise ManifestError(
+                f"{Path(path).name} could not be read as a manifest: {exc}"
+            ) from exc
 
     def to_file(self, path: Path) -> None:
         with open(path, "w", encoding="utf-8", newline="\n") as f:  # LF on every platform

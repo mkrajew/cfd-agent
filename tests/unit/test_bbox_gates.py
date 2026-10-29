@@ -13,7 +13,7 @@ import pytest
 from cfdagent.manifest import MANIFEST_FILE_NAME, BoundaryManifest, BoundaryPatch, Locator
 from cfdagent.tools import mesh
 from cfdagent.tools.geometry import STEP_FILE_NAME, check_geometry
-from cfdagent.tools.mesh import check_mesh
+from cfdagent.tools.mesh import CheckMeshReport, check_mesh
 from cfdagent.tools.process import ToolResult
 
 LOGS = Path(__file__).parents[1] / "fixtures" / "logs"
@@ -135,6 +135,8 @@ def test_mesh_gate_accepts_matching_box_with_stub(tmp_path, monkeypatch):
     _stub_checkmesh(monkeypatch, tmp_path)
     gate = check_mesh(tmp_path, _manifest(), BOX)
     assert gate.ok, gate.errors
+    assert isinstance(gate.data, CheckMeshReport)
+    assert gate.data.patches == {"movingWall": 20, "fixedWalls": 60, "frontAndBack": 800}
 
 
 @pytest.mark.parametrize(
@@ -157,6 +159,7 @@ def test_mesh_gate_rejects_non_finite_expected(tmp_path, monkeypatch, bad):
     _stub_checkmesh(monkeypatch, tmp_path)
     gate = check_mesh(tmp_path, _manifest(), (0, 0, 0, bad, 0.1, 0.01))
     assert not gate.ok
+    assert gate.data is None
     assert any("bounding box" in e for e in gate.errors)
 
 
@@ -166,3 +169,28 @@ def test_mesh_gate_rejects_non_positive_tolerance(tmp_path, monkeypatch, rel_tol
     gate = check_mesh(tmp_path, _manifest(), BOX, rel_tol=rel_tol)
     assert not gate.ok
     assert any("bounding box" in e for e in gate.errors)
+
+
+# --------------------------------------------------------------------------------------------
+# Manifest errors in the geometry gate
+# --------------------------------------------------------------------------------------------
+
+
+def test_geometry_gate_reports_an_invalid_manifest(tmp_path, monkeypatch):
+    _fake_cadquery(monkeypatch, BOX)
+    (tmp_path / STEP_FILE_NAME).write_text("stub", encoding="utf-8")
+    (tmp_path / MANIFEST_FILE_NAME).write_bytes(bytes([0xFF, 0xFE]) + b" not a manifest")
+    gate = check_geometry(tmp_path, BOX)
+    assert not gate.ok
+    assert any(MANIFEST_FILE_NAME in e and "invalid" in e for e in gate.errors)
+
+
+def test_geometry_gate_does_not_hide_programmer_errors(tmp_path, monkeypatch):
+    _fake_cadquery(monkeypatch, BOX)
+
+    def broken(_path):
+        raise KeyError("bug in our code")
+
+    monkeypatch.setattr(BoundaryManifest, "from_file", staticmethod(broken))
+    with pytest.raises(KeyError):
+        check_geometry(_geometry_dir(tmp_path), BOX)

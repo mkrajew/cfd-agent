@@ -17,7 +17,7 @@ import subprocess
 import sys
 from collections import deque
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 ALLOWED_EXECUTABLES: frozenset[str] = frozenset(
@@ -117,6 +117,17 @@ def _read_tail(log_path: Path) -> str:
     if len(encoded) > TAIL_MAX_BYTES:
         text = _trim_to_char_boundary(encoded[-TAIL_MAX_BYTES:]).decode("utf-8", errors="replace")
     return text
+
+
+def fail_after_run(result: ToolResult, problem: str) -> ToolResult:
+    """Turn a finished run into a failure: append ``[cfdagent] <problem>`` to the log.
+
+    Returns ``result`` with ``ok=False`` and a ``tail`` re-read from the log (so it shows the
+    reason and obeys the same line and byte caps as every other tail).
+    """
+    with open(result.log_path, "a", encoding="utf-8") as log:
+        log.write(f"\n[cfdagent] {problem}\n")
+    return replace(result, ok=False, tail=_read_tail(result.log_path))
 
 
 def _child_env(cwd: Path) -> dict[str, str]:

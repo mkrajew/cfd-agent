@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import dataclasses
 from pathlib import Path
 
 from cfdagent.gates import GateResult
-from cfdagent.manifest import MANIFEST_FILE_NAME, BoundaryManifest
+from cfdagent.manifest import MANIFEST_FILE_NAME, BoundaryManifest, ManifestError
 from cfdagent.tools.bbox import compare_bbox, validate_expected_bbox
-from cfdagent.tools.process import ToolResult, run_tool
+from cfdagent.tools.process import ToolResult, fail_after_run, run_tool
 
 STEP_FILE_NAME = "geometry.step"
 GEOMETRY_LOG_NAME = "geometry.log"
@@ -41,10 +40,7 @@ def run_geometry_script(script: Path, workdir: Path, timeout_s: float = 300.0) -
     if not missing:
         return result
     problem = f"the geometry script finished but did not write {', '.join(missing)} in {workdir}"
-    with open(result.log_path, "a", encoding="utf-8") as log:
-        log.write(f"\n[cfdagent] {problem}\n")
-    lines = result.log_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
-    return dataclasses.replace(result, ok=False, tail="".join(lines[-50:]))
+    return fail_after_run(result, problem)
 
 
 def check_geometry(
@@ -73,7 +69,7 @@ def check_geometry(
     else:
         try:
             BoundaryManifest.from_file(manifest_path)
-        except Exception as exc:  # pydantic ValidationError, JSON or encoding errors
+        except ManifestError as exc:
             errors.append(f"{MANIFEST_FILE_NAME} is invalid: {exc}")
 
     if not step_path.is_file():
