@@ -82,4 +82,5 @@ class BoundaryManifest(BaseModel):
         return cls.model_validate_json(Path(path).read_text(encoding="utf-8"))
 
     def to_file(self, path: Path) -> None:
-        Path(path).write_text(self.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:  # LF on every platform
+            f.write(self.model_dump_json(indent=2) + "\n")

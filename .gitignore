@@ -10,6 +10,8 @@ build/
 
 # Secrets
 .env
+.env.*
+!.env.example
 
 # CFD run outputs
 runs/

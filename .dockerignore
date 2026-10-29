@@ -25,3 +25,6 @@ processor*
 docs
 infra
 tests
+
+# Benchmark references and criteria must never reach an image (blind evaluation).
+benchmarks
