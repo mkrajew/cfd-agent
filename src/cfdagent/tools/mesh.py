@@ -17,10 +17,11 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from cfdagent.errors import AgentInputError, ToolFailure
 from cfdagent.gates import GateResult
 from cfdagent.manifest import BoundaryManifest
 from cfdagent.tools.bbox import BBox, compare_bbox, validate_expected_bbox
-from cfdagent.tools.process import ToolResult, run_tool
+from cfdagent.tools.process import ToolResult, fail_after_run, run_tool
 
 MESH_FILE_NAME = "mesh.msh"
 MESH_LOG_NAME = "mesh.log"
@@ -57,7 +58,7 @@ _SKELETON_FILES = {
 }
 
 
-class MeshError(Exception):
+class MeshError(AgentInputError):
     """A mesh-stage step could not be carried out (not a gate verdict)."""
 
 
@@ -233,10 +234,7 @@ def run_mesh_script(script: Path, workdir: Path, timeout_s: float = 900.0) -> To
     )
     if problem is None:
         return result
-    with open(result.log_path, "a", encoding="utf-8") as log:
-        log.write(f"\n[cfdagent] {problem}\n")
-    lines = result.log_path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)
-    return dataclasses.replace(result, ok=False, tail="".join(lines[-50:]))
+    return fail_after_run(result, problem)
 
 
 def _ensure_case_skeleton(case_dir: Path) -> None:
@@ -254,10 +252,16 @@ def convert_to_foam(msh: Path, case_dir: Path) -> ToolResult:
 
     ``gmshToFoam -case`` and the later ``checkMesh`` refuse to start without ``system/controlDict``,
     ``fvSchemes`` and ``fvSolution``; any of them that is missing is created with minimal content
-    (existing files are left alone). Output goes to ``gmshToFoam.log`` in ``case_dir``. Patches come
+    (existing files are left alone). Raises ``ToolFailure`` if ``constant/polyMesh`` already
+    exists. Output goes to ``gmshToFoam.log`` in ``case_dir``. Patches come
     out with type ``patch``; ``apply_patch_types`` sets the real types.
     """
     case_dir = Path(case_dir)
+    if (case_dir / "constant" / "polyMesh").exists():
+        raise ToolFailure(
+            f"{case_dir / 'constant' / 'polyMesh'} already exists; convert into a fresh case "
+            "directory so old and new mesh files are never mixed"
+        )
     _ensure_case_skeleton(case_dir)
     return run_tool(
         ["gmshToFoam", str(Path(msh).resolve()), "-case", str(case_dir.resolve())],
@@ -303,7 +307,7 @@ def _foam_dictionary(case_dir: Path, *args: str) -> ToolResult:
 def _read_entry(case_dir: Path, entry: str) -> str | None:
     """Entry value as printed by ``foamDictionary -value``; ``None`` if the entry is absent.
 
-    Any other foamDictionary failure (unreadable file, timeout, parse error) raises ``MeshError``
+    Any other foamDictionary failure (unreadable file, timeout, parse error) raises ``ToolFailure``
     and is never reported as an absent entry.
     """
     result = _foam_dictionary(case_dir, "-entry", entry, "-value")
@@ -312,7 +316,7 @@ def _read_entry(case_dir: Path, entry: str) -> str | None:
         if "Cannot find entry" in log:
             return None
         reason = "timed out" if result.timed_out else f"exited with code {result.returncode}"
-        raise MeshError(f"foamDictionary {reason} reading {entry}:\n{result.tail}")
+        raise ToolFailure(f"foamDictionary {reason} reading {entry}:\n{result.tail}")
     return log.strip()
 
 
@@ -324,14 +328,15 @@ def apply_patch_types(case_dir: Path, manifest: BoundaryManifest) -> None:
     (OpenFOAM's convention, e.g. ``(wall)``); a plain ``patch`` has any ``inGroups`` removed. The
     result is read back with ``foamDictionary -value`` and compared.
 
-    Raises ``MeshError`` if a manifest patch is not in the boundary file or an edit or read-back
-    fails. Boundary patches that are not in the manifest (e.g. ``defaultFaces``) are not touched;
+    Raises ``MeshError`` if a manifest patch is not in the boundary file. Raises ``ToolFailure``
+    if the mesh was not converted yet or an edit, read or read-back of the boundary file fails.
+    Boundary patches that are not in the manifest (e.g. ``defaultFaces``) are not touched;
     ``check_mesh`` rejects them.
     """
     case_dir = Path(case_dir).resolve()
     boundary = _boundary_file(case_dir)
     if not boundary.is_file():
-        raise MeshError(f"{boundary} does not exist; run convert_to_foam first")
+        raise ToolFailure(f"{boundary} does not exist; run convert_to_foam first")
 
     for patch in manifest.patches:
         base = f"entry0/{patch.name}"
@@ -344,7 +349,7 @@ def apply_patch_types(case_dir: Path, manifest: BoundaryManifest) -> None:
         for flag, entry, value in edits:
             result = _foam_dictionary(case_dir, "-entry", entry, flag, value)
             if not result.ok:
-                raise MeshError(
+                raise ToolFailure(
                     f"foamDictionary could not set {entry} to '{value}':\n{result.tail}"
                 )
         if (
@@ -353,22 +358,24 @@ def apply_patch_types(case_dir: Path, manifest: BoundaryManifest) -> None:
         ):
             result = _foam_dictionary(case_dir, "-entry", f"{base}/inGroups", "-remove")
             if not result.ok:
-                raise MeshError(f"foamDictionary could not remove {base}/inGroups:\n{result.tail}")
+                raise ToolFailure(
+                    f"foamDictionary could not remove {base}/inGroups:\n{result.tail}"
+                )
 
         actual = _read_entry(case_dir, f"{base}/type")
         if actual != patch.type:
-            raise MeshError(
+            raise ToolFailure(
                 f"patch '{patch.name}': type reads back as {actual!r}, expected '{patch.type}'"
             )
         groups = _read_entry(case_dir, f"{base}/inGroups")
         if patch.type in _GROUPED_TYPES:
             if groups is None or f"({patch.type})" not in groups:
-                raise MeshError(
+                raise ToolFailure(
                     f"patch '{patch.name}': inGroups reads back as {groups!r}, "
                     f"expected a group list holding '{patch.type}'"
                 )
         elif groups is not None:
-            raise MeshError(f"patch '{patch.name}': inGroups is still set to {groups!r}")
+            raise ToolFailure(f"patch '{patch.name}': inGroups is still set to {groups!r}")
 
 
 # --------------------------------------------------------------------------------------------
@@ -398,7 +405,7 @@ def check_mesh(
     manifest: BoundaryManifest,
     expected_bbox: tuple[float, ...],
     rel_tol: float = 1e-3,
-) -> tuple[GateResult, CheckMeshReport | None]:
+) -> GateResult:
     """Run ``checkMesh`` in ``case_dir`` and gate the mesh.
 
     The gate fails if any of these holds: checkMesh reports failed checks; the patch names differ
@@ -410,32 +417,30 @@ def check_mesh(
     manifest the mesh does not have exactly 2 solution directions. All violations are reported,
     not just the first.
 
-    Returns the gate result and the parsed report (``None`` if checkMesh did not run to a
-    parseable end). The checkMesh output is kept in ``checkMesh.log`` in ``case_dir``.
+    Returns the gate result; ``data`` is the parsed ``CheckMeshReport`` (``None`` if checkMesh did
+    not run to a parseable end). The checkMesh output is kept in ``checkMesh.log`` in ``case_dir``.
     """
     case_dir = Path(case_dir).resolve()
     invalid = validate_expected_bbox(expected_bbox, rel_tol)
     if invalid is not None:
-        return GateResult(False, [invalid]), None
+        return GateResult(False, [invalid])
 
     result = run_tool(["checkMesh"], cwd=case_dir, log_path=case_dir / CHECKMESH_LOG_NAME)
     if not result.ok:
         reason = "timed out" if result.timed_out else f"exited with code {result.returncode}"
-        return GateResult(False, [f"checkMesh {reason}:\n{result.tail}"]), None
+        return GateResult(False, [f"checkMesh {reason}:\n{result.tail}"])
     log_text = result.log_path.read_text(encoding="utf-8", errors="replace")
     try:
         report = parse_checkmesh(log_text)
     except ValueError as exc:
-        return GateResult(
-            False, [f"checkMesh output could not be parsed ({exc}):\n{result.tail}"]
-        ), None
+        return GateResult(False, [f"checkMesh output could not be parsed ({exc}):\n{result.tail}"])
 
     # Patch names and face counts come from the boundary file: the checkMesh table cannot be read
     # reliably for names of 20 or more characters.
     try:
         file_patches = _read_boundary_patches(case_dir)
     except MeshError as exc:
-        return GateResult(False, [str(exc)]), report
+        return GateResult(False, [str(exc)], data=report)
     errors: list[str] = []
     if len(file_patches) != len(report.patches):
         errors.append(
@@ -478,11 +483,7 @@ def check_mesh(
     for patch in manifest.patches:
         if patch.name not in report.patches:
             continue  # already reported as a missing patch
-        try:
-            actual_type = _read_entry(case_dir, f"entry0/{patch.name}/type")
-        except MeshError as exc:
-            errors.append(f"patch type of '{patch.name}' could not be read: {exc}")
-            continue
+        actual_type = _read_entry(case_dir, f"entry0/{patch.name}/type")
         if actual_type != patch.type:
             errors.append(
                 f"patch '{patch.name}' has type {actual_type!r} in constant/polyMesh/boundary, "
@@ -495,4 +496,4 @@ def check_mesh(
             "directions (expected exactly 2: one direction must be removed by 'empty' patches)"
         )
 
-    return GateResult(not errors, errors), report
+    return GateResult(not errors, errors, data=report)

@@ -60,7 +60,7 @@ def test_handwritten_cavity_re100_matches_ghia(tmp_path):
     assert converted.ok, converted.tail
     manifest = BoundaryManifest.from_file(tmp_path / MANIFEST_FILE_NAME)
     apply_patch_types(case_dir, manifest)
-    mesh_gate, _ = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    mesh_gate = check_mesh(case_dir, manifest, CAVITY_BBOX)
     assert mesh_gate.ok, mesh_gate.errors
 
     # 3. solver (serial: 64 x 64 x 1 cells need no parallel run)

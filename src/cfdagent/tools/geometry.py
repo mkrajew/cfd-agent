@@ -5,9 +5,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from cfdagent.gates import GateResult
-from cfdagent.manifest import MANIFEST_FILE_NAME, BoundaryManifest
+from cfdagent.manifest import MANIFEST_FILE_NAME, BoundaryManifest, ManifestError
 from cfdagent.tools.bbox import compare_bbox, validate_expected_bbox
-from cfdagent.tools.process import ToolResult, run_tool
+from cfdagent.tools.process import ToolResult, fail_after_run, run_tool
 
 STEP_FILE_NAME = "geometry.step"
 GEOMETRY_LOG_NAME = "geometry.log"
@@ -17,16 +17,30 @@ def run_geometry_script(script: Path, workdir: Path, timeout_s: float = 300.0) -
     """Run a geometry script with ``cwd=workdir``.
 
     The script must write ``geometry.step`` and ``boundary_manifest.json`` into its working
-    directory. Output goes to ``geometry.log`` in ``workdir``.
+    directory. Output goes to ``geometry.log`` in ``workdir``. Stale copies of both files from an
+    earlier run are removed first. If the script exits normally but did not write both, the
+    returned result has ``ok=False`` and the reason is appended to the log (and shown in ``tail``).
     """
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
-    return run_tool(
+    outputs = [workdir / STEP_FILE_NAME, workdir / MANIFEST_FILE_NAME]
+    for path in outputs:
+        path.unlink(missing_ok=True)
+
+    result = run_tool(
         ["python", str(Path(script).resolve())],
         cwd=workdir,
         log_path=workdir / GEOMETRY_LOG_NAME,
         timeout_s=timeout_s,
     )
+    if not result.ok:
+        return result
+
+    missing = [path.name for path in outputs if not path.is_file()]
+    if not missing:
+        return result
+    problem = f"the geometry script finished but did not write {', '.join(missing)} in {workdir}"
+    return fail_after_run(result, problem)
 
 
 def check_geometry(
@@ -55,7 +69,7 @@ def check_geometry(
     else:
         try:
             BoundaryManifest.from_file(manifest_path)
-        except Exception as exc:  # pydantic ValidationError, JSON or encoding errors
+        except ManifestError as exc:
             errors.append(f"{MANIFEST_FILE_NAME} is invalid: {exc}")
 
     if not step_path.is_file():

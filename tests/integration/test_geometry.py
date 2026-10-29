@@ -48,7 +48,9 @@ def test_missing_manifest_fails(tmp_path):
         "import cadquery as cq\n"
         "cq.exporters.export(cq.Workplane('XY').box(1, 1, 0.1), 'geometry.step')\n",
     )
-    assert run_geometry_script(script, tmp_path).ok
+    result = run_geometry_script(script, tmp_path)
+    assert not result.ok  # the runner already reports the missing output
+    assert MANIFEST_FILE_NAME in result.tail
     gate = check_geometry(tmp_path, expected_bbox=(-0.5, -0.5, -0.05, 0.5, 0.5, 0.05))
     assert not gate.ok
     assert any(MANIFEST_FILE_NAME in e for e in gate.errors)
@@ -72,12 +74,11 @@ def test_step_without_solid_fails(tmp_path):
     script = _write_script(
         tmp_path,
         "import cadquery as cq\n"
-        "cq.exporters.export(cq.Workplane('XY').rect(1, 1), 'geometry.step')\n",
+        "cq.exporters.export(cq.Workplane('XY').rect(1, 1), 'geometry.step')\n"
+        "import json\n"
+        "json.dump({'dimensionality': '3D', 'patches': []}, open('boundary_manifest.json', 'w'))\n",
     )
     assert run_geometry_script(script, tmp_path).ok
-    (tmp_path / MANIFEST_FILE_NAME).write_text(
-        '{"dimensionality": "3D", "patches": []}', encoding="utf-8"
-    )
     gate = check_geometry(tmp_path, expected_bbox=(-0.5, -0.5, 0, 0.5, 0.5, 0))
     assert not gate.ok
     assert any("solid" in e for e in gate.errors)

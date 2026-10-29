@@ -84,3 +84,34 @@ def test_2d_manifest_requires_an_empty_patch():
 def test_patch_requires_at_least_one_locator():
     with pytest.raises(ValidationError):
         BoundaryPatch(name="a", type="wall", locators=[])
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"{not json",
+        b'{"dimensionality": "3D", "patches": [{"name": "1bad"}]}',
+        b'{"dimensionality": "4D", "patches": []}',
+        b"\xff\xfe\x00 not utf-8 \xc3\x28",
+        b"",
+    ],
+    ids=["bad-json", "bad-schema", "bad-value", "not-utf8", "empty"],
+)
+def test_from_file_wraps_bad_content_in_manifest_error(tmp_path, content):
+    path = tmp_path / "boundary_manifest.json"
+    path.write_bytes(content)
+    with pytest.raises(ManifestError, match="boundary_manifest.json"):
+        BoundaryManifest.from_file(path)
+
+
+def test_from_file_wraps_read_errors_in_manifest_error(tmp_path):
+    with pytest.raises(ManifestError):
+        BoundaryManifest.from_file(tmp_path / "missing.json")
+    with pytest.raises(ManifestError):
+        BoundaryManifest.from_file(tmp_path)  # a directory cannot be read as a file
+
+
+def test_manifest_error_is_an_agent_input_error():
+    from cfdagent.errors import AgentInputError
+
+    assert issubclass(ManifestError, AgentInputError)
