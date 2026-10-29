@@ -6,8 +6,28 @@ packages:
   - docker.io
   - curl
   - python3
+  - fail2ban
 
 write_files:
+  # SSH is open to the Internet (owner decision 2026-10-29): keys only, no root, fail2ban below.
+  # 10- sorts before the cloud image's 50-cloud-init.conf, and sshd uses the first value it reads.
+  - path: /etc/ssh/sshd_config.d/10-cfdagent-hardening.conf
+    permissions: "0644"
+    owner: root:root
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin no
+  - path: /etc/fail2ban/jail.d/cfdagent-sshd.local
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [sshd]
+      enabled = true
+      backend = systemd
+      maxretry = 5
+      findtime = 10m
+      bantime = 1h
   - path: /usr/local/sbin/cfdagent-idle-shutdown
     permissions: "0755"
     owner: root:root
@@ -37,6 +57,8 @@ write_files:
 runcmd:
   - [mkdir, -p, /var/lib/cfdagent]
   - [systemctl, enable, --now, docker]
+  - [sh, -c, "sshd -t && systemctl reload ssh"]
+  - [systemctl, enable, --now, fail2ban]
   - [usermod, -aG, docker, "__ADMIN_USER__"]
   - [systemctl, daemon-reload]
   - [systemctl, enable, --now, cfdagent-idle-shutdown.timer]

@@ -217,7 +217,7 @@ Resource group `rg-cfdagent` in `italynorth`, deployed/destroyed with one comman
 | Resource | Details |
 |---|---|
 | VM | `Standard_D4as_v4` (4 vCPU, 16 GB) in `belgiumcentral`, Ubuntu 24.04, Docker, OS disk sized by builder (cost-aware), system-assigned managed identity. **Owner decision 2026-10-28** (see §3): VM, network and storage in belgiumcentral; the resource group and AI Services stay in italynorth |
-| Network | VNet, public IP, NSG: SSH (22) only from the owner's IP (parameter); SSH key auth only |
+| Network | VNet, public IP, NSG: SSH 22 open to the Internet, key-only + fail2ban — owner decision 2026-10-29 (the owner switches networks and uses a VPN); no other inbound port |
 | Auto-shutdown | Daily shutdown at a time parameter (Europe/Warsaw) by a systemd timer on the VM, because DevTestLab schedules are not offered in any allowed region (**owner decision 2026-10-28**) |
 | Idle shutdown | On-VM timer: no SSH sessions and no running `cfdagent` for 30 min → VM deallocates itself (identity scoped to deallocate only that VM) |
 | AI Foundry | AI Services account + deployments: `gpt-oss-120b` (primary), `Llama-3.3-70B-Instruct` (comparison). `qwen3-32b` is **not deployable** on an AIServices account in italynorth (ARM preflight rejects `GlobalStandard` and `DeveloperTier`), so it is not in the Bicep; the Task 11 fallback rule applies |

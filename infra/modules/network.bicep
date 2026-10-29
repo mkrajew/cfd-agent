@@ -1,9 +1,8 @@
-// VNet, NSG and a static public IP. SSH (22) is open only to the owner's IP.
+// VNet, NSG and a static public IP. SSH (22) is open to the Internet (owner decision 2026-10-29: the
+// owner connects from changing networks and a VPN); the VM allows key authentication only and runs
+// fail2ban (infra/vm/cloud-init.yaml). Every other inbound port is denied by the NSG default rules.
 param location string
 param tags object
-
-@description('Single public IPv4 address allowed to reach SSH; the rule source is ownerIp/32.')
-param ownerIp string
 
 var vnetName = 'vnet-cfdagent'
 var subnetName = 'snet-cfdagent'
@@ -17,14 +16,13 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
   properties: {
     securityRules: [
       {
-        // vm-up.ps1 -UpdateIp rewrites the source of this rule by name.
-        name: 'Allow-SSH-Owner'
+        name: 'Allow-SSH-Internet'
         properties: {
           priority: 100
           direction: 'Inbound'
           access: 'Allow'
           protocol: 'Tcp'
-          sourceAddressPrefix: '${ownerIp}/32'
+          sourceAddressPrefix: 'Internet'
           sourcePortRange: '*'
           destinationAddressPrefix: '*'
           destinationPortRange: '22'

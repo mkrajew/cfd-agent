@@ -9,7 +9,7 @@ owner's explicit approval**, and every change carries a cost estimate.
 | Resource | Details |
 |---|---|
 | Resource group | `rg-cfdagent` in `italynorth` |
-| Network (`vmLocation`) | VNet `vnet-cfdagent`, NSG `nsg-cfdagent` (SSH 22 only from `ownerIp`), Standard static public IP `pip-cfdagent` |
+| Network (`vmLocation`) | VNet `vnet-cfdagent`, NSG `nsg-cfdagent` (one inbound allow rule: SSH 22 from the Internet; everything else denied), Standard static public IP `pip-cfdagent` |
 | VM (`vmLocation`) | `vm-cfdagent`, `Standard_D4as_v4` (4 vCPU, 16 GB), Ubuntu 24.04 LTS (Canonical `ubuntu-24_04-lts` / `server`, Gen2), SSH key only, system-assigned identity, 64 GiB StandardSSD_LRS OS disk |
 | Daily shutdown | systemd timer on the VM, 23:00 `Europe/Warsaw` (parameters `shutdownTime`, `shutdownTimeZone`; applied only when the VM is created, see "Redeploying") |
 | Idle shutdown | systemd timer every 5 min; deallocates after 30 idle minutes (see below) |
@@ -22,6 +22,14 @@ Outputs: `vmPublicIp`, `aiEndpoint` (OpenAI v1 base URL `https://<account>.servi
 `storageAccountName`, `resourceGroupName`, `vmName`.
 
 ### Decisions that differ from the first sketch
+
+- **SSH is open to the Internet (owner decision 2026-10-29).** The owner switches networks and uses a university
+  VPN, so a source-IP rule is not workable. The NSG allows TCP 22 from `Internet`; there is no `ownerIp`
+  parameter. Compensating controls, installed by cloud-init: `PasswordAuthentication no`,
+  `KbdInteractiveAuthentication no` and `PermitRootLogin no` in
+  `/etc/ssh/sshd_config.d/10-cfdagent-hardening.conf`, and `fail2ban` with an sshd jail (5 failures in 10 minutes
+  ban the address for 1 hour). Authentication is by the ed25519 key only. Check with
+  `sudo fail2ban-client status sshd` and `sudo sshd -T | grep -Ei 'passwordauth|kbdinteractive|permitroot'`.
 
 - **VM region and size (owner decision 2026-10-28).** `italynorth` has no usable 4-vCPU size for this
   subscription (`Standard_F4s_v2` is `NotAvailableForSubscription`, the available v7 sizes have quota 0;
@@ -45,7 +53,6 @@ Outputs: `vmPublicIp`, `aiEndpoint` (OpenAI v1 base URL `https://<account>.servi
 
 | Variable | Meaning | `deploy.ps1` default |
 |---|---|---|
-| `CFDAGENT_OWNER_IP` | one public IPv4 address allowed to SSH (no CIDR, `*` or `Internet`; the NSG rule uses `<address>/32`; the scripts reject anything else) | current address from `api.ipify.org` |
 | `CFDAGENT_SSH_PUBLIC_KEY` | SSH public key of the admin user | contents of `~/.ssh/id_cfdagent.pub` |
 | `CFDAGENT_OWNER_OBJECT_ID` | owner's Entra object id | `az ad signed-in-user show --query id -o tsv` |
 | `CFDAGENT_BUDGET_EMAIL` | budget alert address | none, must be set |
@@ -67,7 +74,7 @@ infra/scripts/deploy.ps1 -WhatIfOnly
 infra/scripts/deploy.ps1
 
 # daily use
-infra/scripts/vm-up.ps1 -UpdateIp    # start, re-point SSH at the current IP, print the ssh command
+infra/scripts/vm-up.ps1              # start, print the ssh command
 infra/scripts/vm-down.ps1            # deallocate
 ```
 
@@ -102,6 +109,8 @@ Over SSH on the VM (`ssh cfdagent`), after the first boot:
 systemctl list-timers 'cfdagent-*'          # both timers listed with a next run time
 sudo cfdagent-idle-shutdown --dry-run       # prints the decision, no Azure call
 sudo cfdagent-idle-shutdown --check         # expects: check ok (role assignments may take a few minutes)
+sudo fail2ban-client status sshd            # sshd jail active
+sudo sshd -T | grep -Ei 'passwordauth|kbdinteractive|permitroot'   # no, no, no
 docker image ls ghcr.io/mkrajew/cfd-agent   # pre-pulled image, if the package is public
 sudo tail -n 50 /var/log/cloud-init-output.log   # package install, timers, image pull
 cloud-init status --long

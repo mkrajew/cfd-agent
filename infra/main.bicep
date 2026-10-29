@@ -28,10 +28,6 @@ param vmLocation string = 'belgiumcentral'
 @description('Resource group that holds everything except the budget.')
 param resourceGroupName string = 'rg-cfdagent'
 
-@description('Single public IPv4 address allowed to reach SSH (no CIDR, no keywords). The NSG rule uses ownerIp/32, so a value such as *, Internet or 0.0.0.0/0 produces an invalid prefix and is rejected. Passed at deploy time, never committed.')
-@minLength(7)
-param ownerIp string
-
 @description('SSH public key of the VM administrator. Passwords are disabled.')
 @minLength(20)
 param sshPublicKey string
@@ -119,7 +115,6 @@ module network 'modules/network.bicep' = {
   scope: rg
   params: {
     location: vmLocation
-    ownerIp: ownerIp
     tags: tags
   }
 }
