@@ -448,3 +448,66 @@ def test_load_registry_rejects_non_finite_values(tmp_path, old, new):
     edit_toml(directory, old, new)
     with pytest.raises(RegistryError, match="alpha"):
         load_registry(tmp_path)
+
+
+# --------------------------------------------------------------------------- hardening
+
+
+def test_score_survives_400_digit_integer(tmp_path):
+    write_csv(tmp_path / "reference/prof.csv", [0.0, 1.0], [0.0, 1.0])
+    huge = 10**400
+    benchmark = make_benchmark(tmp_path, [profile_criterion(), scalar_criterion()])
+
+    result = score(benchmark, {"prof": {"x": [0.0, 1.0], "value": [0.0, huge]}, "cd": huge})
+
+    assert not result.passed
+    assert [c.passed for c in result.criteria] == [False, False]
+    assert all(c.reason for c in result.criteria)
+
+    # huge abscissa, and a range criterion
+    in_range = Criterion(quantity="r", kind="scalar", metric="in_range", reference_range=(0, 1))
+    other = make_benchmark(tmp_path, [profile_criterion(), in_range])
+    result = score(other, {"prof": {"x": [0.0, huge], "value": [0.0, 1.0]}, "r": huge})
+    assert [c.passed for c in result.criteria] == [False, False]
+
+
+def test_score_survives_malformed_reference_csv(tmp_path):
+    reference = tmp_path / "reference/prof.csv"
+    reference.parent.mkdir(parents=True)
+    benchmark = make_benchmark(tmp_path, [profile_criterion()])
+    sim = {"prof": {"x": [0.0, 1.0], "value": [0.0, 1.0]}}
+
+    # a field above the csv module's size limit makes csv.reader raise csv.Error
+    reference.write_text("x,value\n" + "1" * 200_000 + ",2\n", encoding="utf-8")
+    result = score(benchmark, sim)
+    assert not result.passed
+    assert "reference" in result.criteria[0].reason
+
+    # a NUL byte, binary garbage and an empty file
+    for content in (b"x,value\n0,\x00\n1,1\n", b"\xff\xfe\x00\x01", b""):
+        reference.write_bytes(content)
+        result = score(benchmark, sim)
+        assert not result.passed
+        assert result.criteria[0].reason
+
+
+def test_score_survives_reference_path_that_is_a_directory(tmp_path):
+    (tmp_path / "reference/prof.csv").mkdir(parents=True)
+    benchmark = make_benchmark(tmp_path, [profile_criterion()])
+    result = score(benchmark, {"prof": {"x": [0.0, 1.0], "value": [0.0, 1.0]}})
+    assert not result.passed
+
+
+def test_benchmark_root_is_absolute_after_chdir(tmp_path, monkeypatch):
+    write_benchmark(tmp_path, "alpha")
+    monkeypatch.chdir(tmp_path)
+    registry = load_registry(Path("."))
+    root = registry["alpha"].root
+    assert root.is_absolute()
+    assert root == (tmp_path / "alpha").resolve()
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    result = score(registry["alpha"], {"prof": {"x": [0.0, 1.0], "value": [0.0, 1.0]}, "cd": 1.5})
+    assert result.passed

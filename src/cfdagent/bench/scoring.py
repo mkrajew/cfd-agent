@@ -96,7 +96,7 @@ def _read_reference(path: Path) -> tuple[np.ndarray, np.ndarray]:
     try:
         with path.open(newline="", encoding="utf-8") as handle:
             rows = list(csv.reader(handle))
-    except (OSError, UnicodeDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, csv.Error) as exc:
         raise ValueError(f"cannot read reference file {path.name}: {exc}") from exc
     if not rows or [cell.strip() for cell in rows[0]] != ["x", "value"]:
         raise ValueError(f"reference file {path.name} must have the header 'x,value'")
@@ -146,7 +146,9 @@ def _score_criterion(
         return failed("missing quantity")
     try:
         error = _evaluate(criterion, benchmark, quantities[criterion.quantity])
-    except ValueError as exc:
+    except OverflowError:
+        return failed("a number is too large to be a float")
+    except (ValueError, csv.Error) as exc:  # csv.Error: a reference file the reader cannot parse
         return failed(str(exc))
 
     if criterion.normalise_by is not None:
@@ -164,7 +166,8 @@ def _score_criterion(
 def score(benchmark: Benchmark, quantities: Quantities) -> ScoreResult:
     """Score ``quantities`` against every criterion of ``benchmark``.
 
-    Never raises on bad simulation data: a missing, mistyped or unusable quantity gives a failed
+    Never raises on bad simulation data or an unreadable reference file: a missing, mistyped,
+    oversized or unusable quantity, or a reference file that cannot be read, gives a failed
     criterion with a reason. The result passes only if there is at least one criterion and all
     of them pass.
     """

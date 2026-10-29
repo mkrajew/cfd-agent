@@ -80,7 +80,11 @@ class Criterion(BaseModel):
 
 
 class Benchmark(BaseModel):
-    """A benchmark: task, citation and acceptance criteria. ``root`` is set by the loader."""
+    """A benchmark: task, citation and acceptance criteria.
+
+    ``root`` is set by the loader to the absolute, resolved benchmark directory, so that scoring
+    does not depend on the current working directory.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -119,7 +123,7 @@ def _load_one(directory: Path) -> Benchmark:
             "the directory name"
         )
     try:
-        benchmark = Benchmark(**data, root=directory)
+        benchmark = Benchmark(**data, root=directory.resolve())
     except ValidationError as exc:
         raise RegistryError(f"{directory.name}: invalid {BENCHMARK_FILE_NAME}: {exc}") from exc
 
