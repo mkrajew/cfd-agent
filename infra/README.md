@@ -43,9 +43,11 @@ Outputs: `vmPublicIp`, `aiEndpoint` (OpenAI v1 base URL `https://<account>.servi
 - **`qwen3-32b` is not deployed.** ARM preflight rejects it on an AIServices account in `italynorth`
   (`GlobalStandard` and `DeveloperTier` both "not supported by the model"). Add it to `modelDeployments`
   if a later model list shows it deployable.
-- **Local auth on the AI account stays enabled** (`disableLocalAuth = false`) until Entra access is verified
-  for each deployment (M0 spike). `Cognitive Services OpenAI User` may not cover non-OpenAI models such as
-  Llama; if the spike shows that, add `Cognitive Services User` for the VM identity.
+- **Key authentication on the AI account is off** (`disableLocalAuth = true`, Entra ID only). Entra access was
+  verified in the M0 spike (ADR-0002) and from the VM's managed identity, and key auth is not needed. The
+  deployed account still has keys enabled until an owner-approved redeploy applies this default. If Entra
+  access fails for a model, set the parameter to `false` temporarily; `Cognitive Services OpenAI User` may not
+  cover non-OpenAI models, in which case add `Cognitive Services User` for the VM identity.
 
 ## Parameters from the environment
 
@@ -133,8 +135,10 @@ From the owner's machine: `az vm get-instance-view` shows the VM running,
   `az cognitiveservices account list-deleted`, then
   `az cognitiveservices account purge --location italynorth --resource-group rg-cfdagent --name <account>`.
   Otherwise the next deployment fails with a subdomain conflict. Deleting needs the owner's approval.
-- **Budget start date** defaults to the first day of the current month at deployment time, so a later redeploy moves
-  it to the new month.
+- **Budget start date** defaults to the first day of the current month at deployment time, so a redeploy in a later
+  month would move the start of an existing budget (the effect on an existing budget is unverified). The budget
+  was created with start date 2026-10-01, so **a redeploy after 1 November 2026 must pass
+  `budgetStartDate=2026-10-01T00:00:00Z`** (or the first of the month in which the budget was created).
 
 ## Cost estimate (Azure retail prices API, belgiumcentral, checked 2026-10-28)
 

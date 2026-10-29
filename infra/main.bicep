@@ -91,8 +91,10 @@ param modelDeployments array = [
   }
 ]
 
-@description('Disable key authentication on the AI account (Entra ID only). Turn on after Entra access is verified for every deployment.')
-param disableLocalAuth bool = false
+// Default true: Entra access was verified for the deployed models (ADR-0002 spike and a check from the
+// VM's managed identity), so key authentication is switched off. Set to false only to debug an Entra problem.
+@description('Disable key authentication on the AI account (Entra ID only).')
+param disableLocalAuth bool = true
 
 @description('Monthly budget in USD.')
 param budgetAmount int = 100
