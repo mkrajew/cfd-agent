@@ -1,6 +1,7 @@
 """Pure-Python reading of ASCII polyMesh files and the patch placement check."""
 
 import shutil
+import time
 from pathlib import Path
 
 import numpy as np
@@ -187,3 +188,90 @@ def test_placement_skips_patches_missing_from_the_mesh(tmp_path):
 )
 def test_locator_contains(locator, point, tol, expected):
     assert locator_contains(locator, point, tol) is expected
+
+
+# --- malformed large files must be rejected quickly (no regex backtracking) ---------------------
+
+
+def _write_list_file(case: Path, name: str, body: str, count: int) -> None:
+    """Replace the list of a polyMesh file, keeping its header; ``body`` is the list contents."""
+    path = case / "constant" / "polyMesh" / name
+    text = path.read_text(encoding="utf-8")
+    header = text[: text.index("// * * *")]
+    path.write_text(f"{header}\n{count}\n(\n{body}", encoding="utf-8", newline="\n")
+
+
+def _assert_rejected_quickly(case: Path) -> None:
+    start = time.perf_counter()
+    with pytest.raises(MeshError):
+        read_patch_face_centres(case)
+    assert time.perf_counter() - start < 2.0
+
+
+def test_truncated_faces_with_large_indices_are_rejected_quickly(tmp_path):
+    case = _case(tmp_path)
+    faces = "\n".join(f"4({10000 + i} {20000 + i} {30000 + i} {40000 + i})" for i in range(3000))
+    _write_list_file(case, "faces", faces + "\n", 3000)  # the closing ')' is missing
+    _assert_rejected_quickly(case)
+
+
+def test_garbled_faces_with_large_indices_are_rejected_quickly(tmp_path):
+    case = _case(tmp_path)
+    faces = "\n".join(f"4({10000 + i} {20000 + i} {30000 + i} {40000 + i})" for i in range(2000))
+    _write_list_file(case, "faces", faces + "\n4(12345 23456 3456\n)\n", 2001)
+    _assert_rejected_quickly(case)
+
+
+def test_truncated_points_with_integer_coordinates_are_rejected_quickly(tmp_path):
+    case = _case(tmp_path)
+    points = "\n".join(f"({100 + i % 800} {200 + i % 700} {1000 + i % 9000})" for i in range(70000))
+    _write_list_file(case, "points", points + "\n", 70000)  # the closing ')' is missing
+    _assert_rejected_quickly(case)
+
+
+def test_points_with_a_broken_vector_in_the_middle_are_rejected_quickly(tmp_path):
+    case = _case(tmp_path)
+    good = "\n".join(f"({100 + i % 800} {200 + i % 700} {1000 + i % 9000})" for i in range(50000))
+    _write_list_file(case, "points", good + "\n(1234 5678)\n)\n", 50001)
+    _assert_rejected_quickly(case)
+
+
+def test_large_valid_lists_are_read(tmp_path):
+    """A well-formed list of 70 000 integer-valued points is not mistaken for garbage."""
+    case = _case(tmp_path)
+    points = "\n".join(f"({100 + i % 800} {200 + i % 700} {1000 + i % 9000})" for i in range(70000))
+    _write_list_file(case, "points", points + "\n)\n", 70000)
+    start = time.perf_counter()
+    read_patch_face_centres(case)
+    assert time.perf_counter() - start < 5.0
+
+
+# --- placement follows the manifest's locator semantics (face bounding box) --------------------
+
+
+def test_face_with_centre_on_the_plane_but_vertices_off_it_is_rejected(tmp_path):
+    case = _case(tmp_path)
+    _edit(case, "points", "(0 0 0.5) (0 0 0) (0 1 0.5)", "(-0.4 0 0.5) (0 0 0) (0.4 1 0.5)")
+    assert read_patch_face_centres(case)["inlet"] == pytest.approx(np.array([[0.0, 0.5, 0.25]]))
+    errors = placement_errors(case, _manifest(), tol=1e-5 * BOX_LENGTH)
+    assert any("inlet" in e for e in errors)
+
+
+def test_box_locator_uses_the_face_bounding_box(tmp_path):
+    case = _case(tmp_path)
+    inlet_box = Locator(kind="box", box=(0.0, 0.0, 0.0, 0.0, 0.4, 0.5))  # covers y <= 0.4 only
+    manifest = _manifest()
+    manifest.patches[0].locators = [inlet_box]  # the inlet face spans y 0..1, its centre y = 0.5
+    errors = placement_errors(case, manifest, tol=1e-5 * BOX_LENGTH)
+    assert len(errors) == 1 and "inlet" in errors[0]
+    manifest.patches[0].locators = [Locator(kind="box", box=(-0.1, -0.1, -0.1, 0.1, 1.1, 0.6))]
+    assert placement_errors(case, manifest, tol=1e-5 * BOX_LENGTH) == []
+
+
+def test_placement_error_lists_locators_and_gives_a_remedy(tmp_path):
+    errors = placement_errors(
+        _case(tmp_path), _manifest(inlet_x=2.0, outlet_x=0.0), tol=1e-5 * BOX_LENGTH
+    )
+    inlet = next(e for e in errors if "'inlet'" in e)
+    assert "plane x=2" in inlet
+    assert "physical group" in inlet and "box" in inlet

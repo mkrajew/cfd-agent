@@ -6,9 +6,14 @@ says it does. ``points``, ``faces`` and ``boundary`` are parsed in pure Python (
 framing are handled, and lists may be written inline (``8((0 0 0) ...)``, as OpenFOAM does for
 short lists) or one entry per line. A binary file or any malformed content raises ``MeshError``.
 
-The ASCII ``points`` file has 6 significant digits unless the ``controlDict`` that wrote it sets
-``writePrecision``; coordinate comparisons therefore carry a floor relative to the coordinate
-(``REPR_EPS``, shared with the bounding-box check).
+Parsing is linear in the file size: the lists are scanned entry by entry with patterns that cannot
+backtrack (possessive quantifiers), never with one pattern over the whole file, so a truncated or
+garbled file is rejected immediately instead of hanging the gate.
+
+Precision: gmshToFoam writes points with far more than 6 significant digits, but the bounding box
+that checkMesh prints has 6 (see ``REPR_EPS`` in ``tools/bbox.py``). Coordinate comparisons
+against locators keep the same floor relative to the coordinate, which is conservative for the
+points themselves.
 """
 
 from __future__ import annotations
@@ -25,22 +30,21 @@ from cfdagent.manifest import BoundaryManifest, Locator
 from cfdagent.tools.bbox import REPR_EPS
 
 _AXES = {"x": 0, "y": 1, "z": 2}
-_NUM = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
+# Possessive quantifiers (``++``, ``*+``, ``?+``) make every pattern below match without
+# backtracking, so scanning is linear even on malformed input.
+_NUM = r"[-+]?+(?:\d++(?:\.\d*+)?+|\.\d++)(?:[eE][-+]?+\d++)?+"
 _COMMENT_BLOCK_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
-_COMMENT_LINE_RE = re.compile(r"//[^\n]*")
-_HEADER_RE = re.compile(r"FoamFile\s*\{([^{}]*)\}")
-_FORMAT_RE = re.compile(r"\bformat\s+(\w+)\s*;")
-_CLASS_RE = re.compile(r"\bclass\s+(\w+)\s*;")
-_POINTS_RE = re.compile(
-    rf"\s*(\d+)\s*\(\s*((?:\(\s*{_NUM}\s+{_NUM}\s+{_NUM}\s*\)\s*)*)\)\s*", re.ASCII
-)
-_VECTOR_RE = re.compile(rf"\(\s*({_NUM})\s+({_NUM})\s+({_NUM})\s*\)")
-_FACES_RE = re.compile(r"\s*(\d+)\s*\(\s*((?:\d+\s*\(\s*(?:\d+\s*)+\)\s*)*)\)\s*", re.ASCII)
-_FACE_RE = re.compile(r"(\d+)\s*\(([^()]*)\)")
-_LIST_START_RE = re.compile(r"\s*(\d+)\s*\(")
-_PATCH_BLOCK_RE = re.compile(r"\s*([^\s{}()]+)\s*\{([^{}]*)\}")
-_NFACES_RE = re.compile(r"\bnFaces\s+(\d+)\s*;")
-_START_FACE_RE = re.compile(r"\bstartFace\s+(\d+)\s*;")
+_COMMENT_LINE_RE = re.compile(r"//[^\n]*+")
+_HEADER_RE = re.compile(r"FoamFile\s*+\{([^{}]*+)\}")
+_FORMAT_RE = re.compile(r"\bformat\s++(\w++)\s*+;")
+_CLASS_RE = re.compile(r"\bclass\s++(\w++)\s*+;")
+_LIST_START_RE = re.compile(r"\s*+(\d++)\s*+\(")
+_VECTOR_RE = re.compile(rf"\s*+\(\s*+({_NUM})\s++({_NUM})\s++({_NUM})\s*+\)")
+_FACE_RE = re.compile(r"\s*+(\d++)\s*+\(\s*+((?:\d++\s*+)++)\)")
+_LIST_END_RE = re.compile(r"\s*+\)\s*+")
+_PATCH_BLOCK_RE = re.compile(r"\s*+([^\s{}()]++)\s*+\{([^{}]*+)\}")
+_NFACES_RE = re.compile(r"\bnFaces\s++(\d++)\s*+;")
+_START_FACE_RE = re.compile(r"\bstartFace\s++(\d++)\s*+;")
 
 
 class MeshError(AgentInputError):
@@ -92,32 +96,50 @@ def _read_body(path: Path, expected_class: str) -> str:
 
 def _read_points(case_dir: Path) -> np.ndarray:
     path = _polymesh_dir(case_dir) / "points"
-    match = _POINTS_RE.fullmatch(_read_body(path, "vectorField"))
-    if match is None:
-        raise MeshError(f"{path.name} is malformed: expected a count and a list of (x y z) vectors")
-    values = _VECTOR_RE.findall(match.group(2))
-    if len(values) != int(match.group(1)):
+    body = _read_body(path, "vectorField")
+    start = _LIST_START_RE.match(body)
+    if start is None:
+        raise MeshError(f"{path.name} is malformed: expected a point count and '('")
+    values: list[tuple[str, str, str]] = []
+    pos = start.end()
+    while vector := _VECTOR_RE.match(body, pos):
+        values.append(vector.groups())  # type: ignore[arg-type]
+        pos = vector.end()
+    if _LIST_END_RE.fullmatch(body, pos) is None:
         raise MeshError(
-            f"{path.name} declares {match.group(1)} points but contains {len(values)} vectors"
+            f"{path.name} is malformed after {len(values)} points: expected '(x y z)' or ')' "
+            f"near {body[pos : pos + 40].strip()!r}"
         )
+    if len(values) != int(start.group(1)):
+        raise MeshError(f"{path.name} declares {start.group(1)} points but contains {len(values)}")
     return np.array(values, dtype=float).reshape(len(values), 3)
 
 
 def _read_faces(case_dir: Path, n_points: int) -> list[list[int]]:
     path = _polymesh_dir(case_dir) / "faces"
-    match = _FACES_RE.fullmatch(_read_body(path, "faceList"))
-    if match is None:
-        raise MeshError(f"{path.name} is malformed: expected a count and a list of n(a b c ...)")
+    body = _read_body(path, "faceList")
+    start = _LIST_START_RE.match(body)
+    if start is None:
+        raise MeshError(f"{path.name} is malformed: expected a face count and '('")
     faces: list[list[int]] = []
-    for size, body in _FACE_RE.findall(match.group(2)):
-        indices = [int(v) for v in body.split()]
-        if len(indices) != int(size):
-            raise MeshError(f"{path.name} has a face declared with {size} points but {indices}")
+    pos = start.end()
+    while face := _FACE_RE.match(body, pos):
+        indices = [int(v) for v in face.group(2).split()]
+        if len(indices) != int(face.group(1)):
+            raise MeshError(
+                f"{path.name} has a face declared with {face.group(1)} points but {indices}"
+            )
         if max(indices) >= n_points:
             raise MeshError(f"{path.name} refers to point {max(indices)} but there are {n_points}")
         faces.append(indices)
-    if len(faces) != int(match.group(1)):
-        raise MeshError(f"{path.name} declares {match.group(1)} faces but contains {len(faces)}")
+        pos = face.end()
+    if _LIST_END_RE.fullmatch(body, pos) is None:
+        raise MeshError(
+            f"{path.name} is malformed after {len(faces)} faces: expected 'n(a b c ...)' or ')' "
+            f"near {body[pos : pos + 40].strip()!r}"
+        )
+    if len(faces) != int(start.group(1)):
+        raise MeshError(f"{path.name} declares {start.group(1)} faces but contains {len(faces)}")
     return faces
 
 
@@ -145,11 +167,39 @@ def read_boundary(case_dir: Path) -> dict[str, PatchRange]:
             raise MeshError(f"patch '{name}' is defined twice in {path}")
         patches[name] = PatchRange(int(start_face.group(1)), int(n_faces.group(1)))
         pos = block.end()
-    if re.fullmatch(r"\s*\)\s*", body[pos:]) is None:
+    if _LIST_END_RE.fullmatch(body, pos) is None:
         raise MeshError(f"{path.name} is malformed near: {body[pos : pos + 60].strip()!r}")
     if len(patches) != int(start.group(1)):
         raise MeshError(f"{path.name} declares {start.group(1)} patches but defines {len(patches)}")
     return patches
+
+
+class _FaceGeometry(NamedTuple):
+    """Per face of a patch: centre, and the smallest and largest vertex coordinate per axis."""
+
+    centres: np.ndarray  # (n_faces, 3)
+    mins: np.ndarray  # (n_faces, 3)
+    maxs: np.ndarray  # (n_faces, 3)
+
+
+def _patch_geometry(case_dir: Path) -> dict[str, _FaceGeometry]:
+    boundary = read_boundary(case_dir)
+    points = _read_points(case_dir)
+    faces = _read_faces(case_dir, len(points))
+    result: dict[str, _FaceGeometry] = {}
+    for name, (start, n_faces) in boundary.items():
+        if start + n_faces > len(faces):
+            raise MeshError(
+                f"patch '{name}' covers faces {start} to {start + n_faces - 1} but the mesh "
+                f"has {len(faces)} faces"
+            )
+        vertices = [points[face] for face in faces[start : start + n_faces]]
+        result[name] = _FaceGeometry(
+            np.array([v.mean(axis=0) for v in vertices], dtype=float).reshape(n_faces, 3),
+            np.array([v.min(axis=0) for v in vertices], dtype=float).reshape(n_faces, 3),
+            np.array([v.max(axis=0) for v in vertices], dtype=float).reshape(n_faces, 3),
+        )
+    return result
 
 
 def read_patch_face_centres(case_dir: Path) -> dict[str, np.ndarray]:
@@ -159,37 +209,26 @@ def read_patch_face_centres(case_dir: Path) -> dict[str, np.ndarray]:
     ``boundary`` in ``case_dir/constant/polyMesh``. A missing file raises ``ToolFailure``; a
     binary or malformed file, or a patch that reaches beyond the face list, raises ``MeshError``.
     """
-    boundary = read_boundary(case_dir)
-    points = _read_points(case_dir)
-    faces = _read_faces(case_dir, len(points))
-    centres: dict[str, np.ndarray] = {}
-    for name, (start, n_faces) in boundary.items():
-        if start + n_faces > len(faces):
-            raise MeshError(
-                f"patch '{name}' covers faces {start} to {start + n_faces - 1} but the mesh "
-                f"has {len(faces)} faces"
-            )
-        centres[name] = np.array(
-            [points[face].mean(axis=0) for face in faces[start : start + n_faces]], dtype=float
-        ).reshape(n_faces, 3)
-    return centres
+    return {name: geometry.centres for name, geometry in _patch_geometry(case_dir).items()}
 
 
 def _slack(tol: float, bound: float) -> float:
-    """Tolerance at a locator coordinate: ``tol``, but at least the 6-digit representation floor."""
+    """Tolerance at a locator coordinate: ``tol``, but at least the representation floor."""
     return max(tol, REPR_EPS * abs(bound))
 
 
-def _contains_mask(locator: Locator, centres: np.ndarray, tol: float) -> np.ndarray:
+def _contains_mask(locator: Locator, mins: np.ndarray, maxs: np.ndarray, tol: float) -> np.ndarray:
+    """Which faces (given by their per-axis minimum and maximum vertex coordinates) fit."""
     if locator.kind == "plane":
         assert locator.axis is not None and locator.value is not None
         axis, value = _AXES[locator.axis], locator.value
-        return np.abs(centres[:, axis] - value) <= _slack(tol, value)
+        slack = _slack(tol, value)
+        return (np.abs(mins[:, axis] - value) <= slack) & (np.abs(maxs[:, axis] - value) <= slack)
     assert locator.box is not None
-    mask = np.ones(len(centres), dtype=bool)
+    mask = np.ones(len(mins), dtype=bool)
     for i in range(3):
         lo, hi = locator.box[i], locator.box[3 + i]
-        mask &= (centres[:, i] >= lo - _slack(tol, lo)) & (centres[:, i] <= hi + _slack(tol, hi))
+        mask &= (mins[:, i] >= lo - _slack(tol, lo)) & (maxs[:, i] <= hi + _slack(tol, hi))
     return mask
 
 
@@ -197,35 +236,49 @@ def locator_contains(locator: Locator, point: Sequence[float], tol: float) -> bo
     """Whether ``point`` lies on a plane locator or inside a box locator.
 
     ``tol`` is absolute; at every locator coordinate the effective tolerance is at least
-    ``REPR_EPS * abs(coordinate)``, because mesh points carry about 6 significant digits. NaN is
-    never contained.
+    ``REPR_EPS * abs(coordinate)``, a conservative allowance for 6-digit printed coordinates.
+    NaN is never contained.
     """
-    centres = np.asarray(point, dtype=float).reshape(1, 3)
-    return bool(_contains_mask(locator, centres, tol)[0])
+    p = np.asarray(point, dtype=float).reshape(1, 3)
+    return bool(_contains_mask(locator, p, p, tol)[0])
+
+
+def describe_locator(locator: Locator) -> str:
+    """Short text for an error message, e.g. ``plane x=0`` or ``box (0, 0, 0, 1, 1, 1)``."""
+    if locator.kind == "plane":
+        return f"plane {locator.axis}={locator.value:g}"
+    assert locator.box is not None
+    return "box (" + ", ".join(f"{v:g}" for v in locator.box) + ")"
 
 
 def placement_errors(case_dir: Path, manifest: BoundaryManifest, tol: float) -> list[str]:
     """Check that each manifest patch's faces lie on its locators; return one error per patch.
 
-    Every face centre of a patch must lie on at least one of that patch's locators (within
-    ``tol``, see ``locator_contains``). This catches patch names attached to the wrong faces,
-    for example inlet and outlet swapped. Manifest patches that are not in the mesh, and patches
+    Locator semantics are those of the manifest: a face belongs to a ``plane`` locator if its
+    bounding box lies on the plane, and to a ``box`` locator if its bounding box lies inside the
+    box (within ``tol``, see ``locator_contains``). Every face of a patch must satisfy at least
+    one of the patch's locators. This catches patch names attached to the wrong faces, for
+    example inlet and outlet swapped. Manifest patches that are not in the mesh, and patches
     without faces, are skipped (the mesh gate reports them separately).
     """
-    centres = read_patch_face_centres(case_dir)
+    geometry = _patch_geometry(case_dir)
     errors: list[str] = []
     for patch in manifest.patches:
-        found = centres.get(patch.name)
-        if found is None or len(found) == 0:
+        found = geometry.get(patch.name)
+        if found is None or len(found.centres) == 0:
             continue
-        inside = np.zeros(len(found), dtype=bool)
+        inside = np.zeros(len(found.centres), dtype=bool)
         for locator in patch.locators:
-            inside |= _contains_mask(locator, found, tol)
+            inside |= _contains_mask(locator, found.mins, found.maxs, tol)
         outside = np.flatnonzero(~inside)
         if len(outside):
-            first = ", ".join(f"{v:.6g}" for v in found[outside[0]])
+            first = ", ".join(f"{v:.6g}" for v in found.centres[outside[0]])
+            locators = "; ".join(describe_locator(loc) for loc in patch.locators)
             errors.append(
-                f"patch '{patch.name}': {len(outside)} of {len(found)} face(s) lie on none of the "
-                f"patch's locators (first offending face centre: ({first}))"
+                f"patch '{patch.name}': {len(outside)} of {len(found.centres)} face(s) do not lie "
+                f"on any of the patch's locators [{locators}] (first offending face centre: "
+                f"({first})). The faces named '{patch.name}' are not where the manifest places "
+                "them: patch names swapped or wrong surfaces in the physical group. Assign "
+                "physical groups from the manifest locators; a curved patch needs a 'box' locator."
             )
     return errors

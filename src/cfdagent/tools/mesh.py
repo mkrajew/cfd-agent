@@ -67,14 +67,23 @@ _SKELETON_FILES = {
 class MeshThresholds:
     """Largest acceptable mesh quality values; a value above its limit, or NaN, fails the gate.
 
-    The defaults are the point where OpenFOAM's own checkMesh limits start to flag a mesh (70
-    degrees non-orthogonality, skewness 4) plus a generous aspect ratio that only rejects
-    degenerate cells; a mesh passing them is usable, not necessarily good.
+    70 degrees is where checkMesh warns about severely non-orthogonal faces (it fails only at 90),
+    so this gate is the real enforcement of that limit; skewness 4 and aspect ratio 1000 are
+    checkMesh's own failure limits. A mesh within them is usable, not necessarily good.
+
+    A limit that is NaN or not positive raises ``ValueError``: it could never reject anything or
+    would reject everything silently.
     """
 
     max_non_orthogonality: float = 70.0
     max_skewness: float = 4.0
     max_aspect_ratio: float = 1000.0
+
+    def __post_init__(self) -> None:
+        for field in dataclasses.fields(self):
+            value = getattr(self, field.name)
+            if not value > 0:  # also true for NaN
+                raise ValueError(f"{field.name} must be a positive number, got {value!r}")
 
 
 DEFAULT_THRESHOLDS = MeshThresholds()
@@ -112,7 +121,7 @@ _BBOX_RE = re.compile(
 )
 _SOLUTION_DIRS_RE = re.compile(r"Mesh has (\d+) solution \(non-empty\) directions")
 _NON_ORTHO_RE = re.compile(rf"Mesh non-orthogonality Max:\s*({_NUMBER})", re.IGNORECASE)
-_SKEWNESS_RE = re.compile(rf"Max skewness\s*[=:]\s*({_NUMBER})", re.IGNORECASE)
+_SKEWNESS_RE = re.compile(rf"Max skewness\s*=\s*({_NUMBER})", re.IGNORECASE)
 _ASPECT_RE = re.compile(rf"Max aspect ratio\s*[=:]\s*({_NUMBER})", re.IGNORECASE)
 _FAILED_RE = re.compile(r"Failed (\d+) mesh checks?\.")
 _OK_RE = re.compile(r"^\s*Mesh OK\.", re.MULTILINE)
@@ -207,11 +216,18 @@ def parse_checkmesh(log_text: str) -> CheckMeshReport:
     )
 
 
+_QUALITY_HINT = (
+    " Refine or smooth the mesh near the offending faces; avoid abrupt size changes and "
+    "strongly skewed cells."
+)
+
+
 def quality_errors(report: CheckMeshReport, thresholds: MeshThresholds) -> list[str]:
     """One error per quality metric that exceeds its limit or was not printed (NaN).
 
-    checkMesh skips some geometry checks after it finds open cells; a metric that is missing is
-    unknown, and an unknown value never passes.
+    checkMesh skips some geometry checks after it finds open cells, and prints no
+    non-orthogonality for a mesh without internal faces; a metric that is missing is unknown, and
+    an unknown value never passes (the comparison is written so that NaN fails).
     """
     errors = []
     for label, value, limit in (
@@ -220,9 +236,52 @@ def quality_errors(report: CheckMeshReport, thresholds: MeshThresholds) -> list[
         ("aspect ratio", report.max_aspect_ratio, thresholds.max_aspect_ratio),
     ):
         if math.isnan(value):
-            errors.append(f"max {label} was not reported by checkMesh (the check was skipped)")
-        elif value > limit:
-            errors.append(f"max {label} is {value:.6g}, above the limit {limit:g}")
+            if label == "non-orthogonality":
+                errors.append(
+                    "max non-orthogonality was not reported: checkMesh did not report "
+                    "non-orthogonality (a mesh without internal faces prints none)"
+                )
+            else:
+                errors.append(f"max {label} was not reported by checkMesh (the check was skipped)")
+        elif not value <= limit:
+            errors.append(f"max {label} is {value:.6g}, above the limit {limit:g}." + _QUALITY_HINT)
+    return errors
+
+
+def thickness_errors(manifest: BoundaryManifest, report: CheckMeshReport) -> list[str]:
+    """Check that a 2D or axisymmetric mesh is exactly one cell thick.
+
+    Every cell has one face on each of the two bounding patches (``empty`` for ``2D``, ``wedge``
+    for ``axisymmetric``), so their faces must add up to ``2 * n_cells``. A ``2D`` mesh also needs
+    exactly 2 solution directions; an axisymmetric (wedge) mesh reports 3, so that is not
+    checked there. An axisymmetric manifest without a ``wedge`` patch is an error.
+    """
+    if manifest.dimensionality == "3D":
+        return []
+    errors: list[str] = []
+    if manifest.dimensionality == "2D":
+        kind = "empty"
+        if report.solution_directions != 2:
+            errors.append(
+                f"the manifest is 2D but checkMesh reports {report.solution_directions} solution "
+                "directions (expected exactly 2: one direction must be removed by 'empty' "
+                "patches)"
+            )
+    else:
+        kind = "wedge"
+    names = [p.name for p in manifest.patches if p.type == kind]
+    if not names:
+        errors.append(
+            f"the manifest is {manifest.dimensionality} but has no patch of type '{kind}'"
+        )
+        return errors
+    faces = sum(report.patches.get(name, 0) for name in names)
+    if faces != 2 * report.n_cells:
+        errors.append(
+            f"the mesh is not one cell thick: the '{kind}' patches {names} hold {faces} faces, "
+            f"but a {manifest.dimensionality} mesh with {report.n_cells} cells and one cell "
+            f"through the thickness has exactly {2 * report.n_cells}"
+        )
     return errors
 
 
@@ -334,7 +393,15 @@ def convert_to_foam(msh: Path, case_dir: Path) -> ToolResult:
         if not produced.is_dir():
             return fail_after_run(result, "gmshToFoam finished but wrote no constant/polyMesh")
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(produced, target)
+        partial = target.parent / (target.name + ".partial")
+        shutil.rmtree(partial, ignore_errors=True)
+        try:
+            shutil.copytree(produced, partial)
+            partial.rename(target)  # a failed copy leaves no polyMesh behind
+        except OSError as exc:
+            raise ToolFailure(f"could not copy the converted mesh into {target}: {exc}") from exc
+        finally:
+            shutil.rmtree(partial, ignore_errors=True)
     return result
 
 
@@ -473,12 +540,14 @@ def check_mesh(
     with a floor for the 6-digit output of checkMesh), or contains NaN/inf
     (a non-finite expected box or a ``rel_tol`` that is not finite and positive is rejected as
     well); a patch type in ``constant/polyMesh/boundary`` differs from the manifest; a patch has a
-    face whose centre lies on none of the patch's locators (names attached to the wrong faces,
+    face whose bounding box lies on none of the patch's locators (names attached to the wrong faces,
     for example inlet and outlet swapped; tolerance ``1e-5`` times the largest expected extent,
-    with the 6-digit representation floor of ``locator_contains``); a quality metric is above its
+    with the representation floor of ``locator_contains``); a quality metric is above its
     limit in ``thresholds`` or was not printed (NaN); for a ``2D`` manifest the mesh does not have
     exactly 2 solution directions, or its ``empty`` patches do not hold exactly ``2 * n_cells``
-    faces (one cell through the thickness: every cell has one front and one back face). All
+    faces (one cell through the thickness: every cell has one front and one back face); for an
+    ``axisymmetric`` manifest there must be a ``wedge`` patch and the ``wedge`` patches must hold
+    exactly ``2 * n_cells`` faces (a wedge mesh reports 3 solution directions, not checked). All
     violations are reported, not just the first.
 
     ``rel_tol`` defaults to 1e-2, looser than the geometry gate (1e-3): a mesh of a curved boundary
@@ -554,11 +623,16 @@ def check_mesh(
     mismatch = compare_bbox(report.bbox, expected, rel_tol, _unit_hint(expected, report.bbox))
     if mismatch is not None:
         errors.append(mismatch)
-
     try:
-        errors.extend(placement_errors(case_dir, manifest, _placement_tolerance(expected)))
+        misplaced = placement_errors(case_dir, manifest, _placement_tolerance(expected))
     except MeshError as exc:
-        errors.append(str(exc))
+        misplaced = [str(exc)]
+    if misplaced and mismatch is not None:
+        errors.append(
+            "the patch placement errors below are probably a consequence of the bounding box "
+            "mismatch above; fix the size first"
+        )
+    errors.extend(misplaced)
 
     for patch in manifest.patches:
         if patch.name not in report.patches:
@@ -570,20 +644,7 @@ def check_mesh(
                 f"but the manifest says '{patch.type}'"
             )
 
-    if manifest.dimensionality == "2D" and report.solution_directions != 2:
-        errors.append(
-            f"the manifest is 2D but checkMesh reports {report.solution_directions} solution "
-            "directions (expected exactly 2: one direction must be removed by 'empty' patches)"
-        )
-    if manifest.dimensionality == "2D":
-        empty_names = [p.name for p in manifest.patches if p.type == "empty"]
-        empty_faces = sum(report.patches.get(name, 0) for name in empty_names)
-        if empty_faces != 2 * report.n_cells:
-            errors.append(
-                f"the mesh is not one cell thick: the 'empty' patches {empty_names} hold "
-                f"{empty_faces} faces, but a 2D mesh with {report.n_cells} cells and one cell "
-                f"through the thickness has exactly {2 * report.n_cells}"
-            )
+    errors.extend(thickness_errors(manifest, report))
 
     errors.extend(quality_errors(report, thresholds))
 
