@@ -45,9 +45,12 @@ def match_surfaces(manifest: BoundaryManifest, tol: float = 1e-6) -> dict[str, l
     A plane locator selects surfaces whose bounding box lies within ``tol`` of the plane. A box
     locator selects surfaces whose bounding box lies inside the box (grown by ``tol``).
 
-    Raises ``ManifestError`` (naming the surface tag and bounding box) if a boundary surface is
-    matched by no patch or by more than one patch, or if a patch matches no surface.
+    Raises ``ManifestError`` (naming the surface tag and bounding box) if the manifest has no
+    patches, if a boundary surface is matched by no patch or by more than one patch, or if a patch
+    matches no surface.
     """
+    if not manifest.patches:
+        raise ManifestError("the manifest has no patches, so no boundary surface can be named")
     surfaces = _boundary_surfaces()
     bboxes = {tag: tuple(gmsh.model.getBoundingBox(2, tag)) for tag in surfaces}
 

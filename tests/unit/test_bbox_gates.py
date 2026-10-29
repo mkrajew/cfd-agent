@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from cfdagent.manifest import MANIFEST_FILE_NAME, BoundaryManifest, BoundaryPatch, Locator
-from cfdagent.tools import mesh
+from cfdagent.tools import geometry, mesh
 from cfdagent.tools.geometry import STEP_FILE_NAME, check_geometry
 from cfdagent.tools.mesh import CheckMeshReport, check_mesh
 from cfdagent.tools.process import ToolResult
@@ -63,6 +63,8 @@ def _fake_cadquery(monkeypatch, bbox):
     shape = types.SimpleNamespace(solids=lambda: solids)
     importers = types.SimpleNamespace(importStep=lambda _path: shape)
     monkeypatch.setitem(sys.modules, "cadquery", types.SimpleNamespace(importers=importers))
+    # The manifest coverage check needs a real STEP file and Gmsh; it is tested in integration.
+    monkeypatch.setattr(geometry, "_manifest_coverage_error", lambda _step, _manifest: None)
 
 
 def _geometry_dir(tmp_path):

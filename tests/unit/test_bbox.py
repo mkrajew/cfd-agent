@@ -71,3 +71,35 @@ def test_wrong_length_is_rejected():
 
 def test_valid_expected_box_is_accepted():
     assert validate_expected_bbox(BOX, 1e-3) is None
+
+
+def test_per_axis_tolerance_rejects_small_radius_error():
+    # Slender box 0.01 x 0.01 x 1: a 10 % error in x is 1e-3 in absolute terms. The old rule
+    # (rel_tol times the largest extent, here 1e-2 * 1 = 1e-2) accepted it; the per-axis rule
+    # (rel_tol times the extent of that axis, here 1e-2 * 0.01 = 1e-4) must not.
+    expected = (0.0, 0.0, 0.0, 0.01, 0.01, 1.0)
+    actual = (0.0, 0.0, 0.0, 0.011, 0.01, 1.0)
+    old_tol = 1e-2 * 1.0
+    assert abs(actual[3] - expected[3]) <= old_tol  # premise: the old rule would pass this
+    message = compare_bbox(actual, expected, 1e-2)
+    assert message is not None
+    assert "bounding box mismatch" in message
+
+
+def test_per_axis_tolerance_accepts_small_error_on_every_axis():
+    expected = (0.0, 0.0, 0.0, 0.01, 0.01, 1.0)
+    actual = (0.0, 0.0, 0.0, 0.01 * (1 + 5e-3), 0.01, 1.0 * (1 + 5e-3))
+    assert compare_bbox(actual, expected, 1e-2) is None
+
+
+def test_zero_extent_axis_uses_largest_extent():
+    # A flat expected box has extent 0 in z; that axis falls back to rel_tol * largest extent.
+    flat = (0.0, 0.0, 0.0, 1.0, 1.0, 0.0)
+    assert compare_bbox((0, 0, 0.0005, 1, 1, 0.0005), flat, 1e-3) is None
+    assert compare_bbox((0, 0, 0.01, 1, 1, 0.01), flat, 1e-3) is not None
+
+
+def test_inverted_expected_box_is_rejected():
+    message = validate_expected_bbox((0, 0, 0, -1, 1, 1), 1e-3)
+    assert message is not None
+    assert "bounding box" in message
