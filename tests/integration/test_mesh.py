@@ -9,8 +9,9 @@ import gmsh
 import pytest
 
 import cfdagent
+from cfdagent.gates import GateResult
 from cfdagent.manifest import MANIFEST_FILE_NAME, BoundaryManifest, BoundaryPatch, Locator
-from cfdagent.tools.geometry import GateResult, check_geometry, run_geometry_script
+from cfdagent.tools.geometry import check_geometry, run_geometry_script
 from cfdagent.tools.mesh import (
     CheckMeshReport,
     MeshError,

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from cfdagent.bench.scoring import Quantities
+from cfdagent.quantities import Quantities
 
 
 def latest_time_dir(func_dir: Path) -> Path:

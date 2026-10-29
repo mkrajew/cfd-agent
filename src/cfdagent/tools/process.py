@@ -1,7 +1,12 @@
 """Allowlisted process runner used by every tool that launches an external program.
 
 Only bare executable names from ``ALLOWED_EXECUTABLES`` can be run; there is no shell. stdout and
-stderr are merged into one log file. Network and credential sandboxing is out of scope here.
+stderr are merged into one log file. The child gets a scrubbed environment (``SAFE_ENV_KEYS`` and
+``SAFE_ENV_PREFIXES`` plus ``PWD``), so credentials in the parent environment do not reach it.
+
+The allowlist is not a security boundary: ``python`` and ``mpirun`` can run anything. Confinement
+(no network, no credentials, bounded resources) is the job of the container sandbox, not of this
+module.
 """
 
 from __future__ import annotations
@@ -34,6 +39,34 @@ ALLOWED_EXECUTABLES: frozenset[str] = frozenset(
 )
 
 TAIL_LINES = 50
+TAIL_MAX_BYTES = 8000
+
+# Environment passed to the child. Everything else (cloud credentials, API keys, ...) is dropped.
+# SYSTEMROOT, PATHEXT, TEMP, TMP and COMSPEC are needed to start a process on Windows.
+SAFE_ENV_KEYS: tuple[str, ...] = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "USER",
+    "LD_LIBRARY_PATH",
+    "SYSTEMROOT",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "COMSPEC",
+)
+SAFE_ENV_PREFIXES: tuple[str, ...] = (
+    "FOAM_",
+    "WM_",
+    "MPI_",
+    "OMPI_",
+    "PYTHON",
+    "VTK_",
+    "PYVISTA_",
+    "MPL",
+)
 
 
 class ToolNotAllowed(Exception):
@@ -46,12 +79,52 @@ class ToolResult:
     returncode: int | None
     timed_out: bool
     log_path: Path
-    tail: str  # last 50 log lines
+    tail: str  # last 50 log lines, at most TAIL_MAX_BYTES bytes (UTF-8)
+
+
+def _trim_to_char_boundary(data: bytes) -> bytes:
+    """Drop leading UTF-8 continuation bytes left by cutting in the middle of a character."""
+    start = 0
+    while start < len(data) and (data[start] & 0xC0) == 0x80:
+        start += 1
+    return data[start:]
 
 
 def _read_tail(log_path: Path) -> str:
-    with open(log_path, encoding="utf-8", errors="replace") as f:
-        return "".join(deque(f, maxlen=TAIL_LINES))
+    """Last ``TAIL_LINES`` lines of the log, at most ``TAIL_MAX_BYTES`` bytes when encoded.
+
+    When the byte cap cuts into a line, that broken first line is dropped, unless the kept bytes
+    contain no complete line at all (one huge line): then its end is kept.
+    """
+    with open(log_path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        # A few spare bytes so a cut in the middle of a character can be repaired.
+        f.seek(max(0, size - TAIL_MAX_BYTES - 4))
+        data = f.read()
+    truncated = size > len(data)
+    if truncated:
+        data = _trim_to_char_boundary(data)
+    text = data.decode("utf-8", errors="replace")
+    lines = text.splitlines(keepends=True)
+    if truncated and len(lines) > 1:
+        lines = lines[1:]
+    text = "".join(deque(lines, maxlen=TAIL_LINES))
+    encoded = text.encode("utf-8")
+    if len(encoded) > TAIL_MAX_BYTES:
+        text = _trim_to_char_boundary(encoded[-TAIL_MAX_BYTES:]).decode("utf-8", errors="replace")
+    return text
+
+
+def _child_env(cwd: Path) -> dict[str, str]:
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key in SAFE_ENV_KEYS or key.startswith(SAFE_ENV_PREFIXES)
+    }
+    # A shell updates PWD on cd; without this OpenFOAM utilities warn about a stale PWD.
+    env["PWD"] = str(cwd)
+    return env
 
 
 def _resolve(name: str) -> str | None:
@@ -86,8 +159,10 @@ def run_tool(
 
     ``argv[0]`` must be a bare allowlisted name (a path is rejected). On timeout the process (and,
     where the platform allows, its children) is killed and the result has ``timed_out=True`` and
-    ``returncode=None``. An allowlisted executable that is not installed gives ``ok=False`` with a
-    message in the log.
+    ``returncode=None``. An allowlisted executable that is not installed, or a ``cwd`` that is not
+    a directory, gives ``ok=False`` with the reason in the log. Environment problems never raise;
+    only a bad ``argv`` raises ``ToolNotAllowed`` (a programmer error). Any exception while waiting,
+    ``KeyboardInterrupt`` included, kills the child's process group before it propagates.
     """
     if not argv:
         raise ToolNotAllowed("empty command")
@@ -100,6 +175,11 @@ def run_tool(
     cwd = Path(cwd).resolve()
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not cwd.is_dir():
+        message = f"cwd {str(cwd)!r} does not exist or is not a directory\n"
+        log_path.write_text(message, encoding="utf-8")
+        return ToolResult(False, None, False, log_path, _read_tail(log_path))
 
     exe = _resolve(name)
     if exe is None:
@@ -116,24 +196,30 @@ def run_tool(
         popen_kwargs["start_new_session"] = True
 
     timed_out = False
+    returncode: int | None = None
     with open(log_path, "wb") as log:
         proc = subprocess.Popen(
             [exe, *argv[1:]],
             cwd=cwd,
-            # A shell updates PWD on cd; without this OpenFOAM utilities warn about a stale PWD.
-            env={**os.environ, "PWD": str(cwd)},
+            env=_child_env(cwd),
             stdin=subprocess.DEVNULL,
             stdout=log,
             stderr=subprocess.STDOUT,
             shell=False,
             **popen_kwargs,
         )
+        finished = False
         try:
-            returncode: int | None = proc.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            returncode = None
-            _kill_tree(proc)
+            try:
+                returncode = proc.wait(timeout=timeout_s)
+                finished = True
+            except subprocess.TimeoutExpired:
+                timed_out = True
+        finally:
+            # Timeout, KeyboardInterrupt or any other exception: never leave the child (or its
+            # children) running behind us.
+            if not finished:
+                _kill_tree(proc)
 
     if timed_out:
         with open(log_path, "a", encoding="utf-8") as log:

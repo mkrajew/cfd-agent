@@ -17,9 +17,9 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from cfdagent.gates import GateResult
 from cfdagent.manifest import BoundaryManifest
 from cfdagent.tools.bbox import BBox, compare_bbox, validate_expected_bbox
-from cfdagent.tools.geometry import GateResult
 from cfdagent.tools.process import ToolResult, run_tool
 
 MESH_FILE_NAME = "mesh.msh"
