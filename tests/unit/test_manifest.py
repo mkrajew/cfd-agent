@@ -35,6 +35,9 @@ def test_roundtrip_json(tmp_path):
     manifest = _manifest()
     manifest.to_file(path)
     assert BoundaryManifest.from_file(path) == manifest
+    raw = path.read_bytes()
+    assert b"\r" not in raw  # LF on every platform
+    assert raw.endswith(b"}\n")
 
 
 def test_manifest_error_is_an_exception():

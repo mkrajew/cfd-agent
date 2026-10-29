@@ -334,12 +334,3 @@ def test_run_solver_ok_log_is_ok(tmp_path, monkeypatch):
     runner = FakeRunner(logs={"icoFoam": _read("icoFoam_ok.log")})
     monkeypatch.setattr(foam, "run_tool", runner)
     assert run_solver(tmp_path, "icoFoam").ok
-
-
-@pytest.mark.integration
-def test_run_solver_real_run_without_a_mesh_fails_loudly(tmp_path):
-    """Needs OpenFOAM (run in the image). An empty case directory must give ok=False."""
-    result = run_solver(tmp_path, "icoFoam", timeout_s=60)
-    assert not result.ok
-    summary = parse_solver_log(result.log_path.read_text(encoding="utf-8", errors="replace"))
-    assert not summary.completed

@@ -70,6 +70,7 @@ The main session coordinates: it plans, delegates, and makes sure nothing merges
 uv sync                                              # create the environment
 uv run pytest                                        # unit tests (default: tests/unit)
 uv run ruff check . && uv run ruff format --check .  # lint and format check
+uv run pre-commit install                            # once per clone: run the hooks on every commit
 uv run pre-commit run --all-files                    # ruff, gitleaks, line endings
 
 docker build -f docker/Dockerfile -t cfdagent:dev .  # build the image (OpenFOAM ESI, Gmsh, CadQuery, PyVista)

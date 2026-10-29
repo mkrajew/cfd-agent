@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cfdagent.manifest import BoundaryManifest
+from cfdagent.tools.bbox import BBox, compare_bbox, validate_expected_bbox
 from cfdagent.tools.geometry import GateResult
 from cfdagent.tools.process import ToolResult, run_tool
 
@@ -26,8 +27,6 @@ MESH_LOG_NAME = "mesh.log"
 CONVERT_LOG_NAME = "gmshToFoam.log"
 CHECKMESH_LOG_NAME = "checkMesh.log"
 DICT_LOG_NAME = "foamDictionary.log"
-
-BBox = tuple[float, float, float, float, float, float]
 
 # Patch types for which OpenFOAM conventionally lists the type itself as the only patch group.
 # ``patch`` has no group.
@@ -377,10 +376,6 @@ def apply_patch_types(case_dir: Path, manifest: BoundaryManifest) -> None:
 # --------------------------------------------------------------------------------------------
 
 
-def _fmt_bbox(bbox: tuple[float, ...]) -> str:
-    return "(" + ", ".join(f"{v:.6g}" for v in bbox) + ")"
-
-
 def _unit_hint(expected: tuple[float, ...], actual: tuple[float, ...]) -> str:
     """Point out a factor-1000 size ratio, the signature of a mm/m mix-up between STEP and Gmsh."""
     exp_size = max(expected[3 + i] - expected[i] for i in range(3))
@@ -409,21 +404,19 @@ def check_mesh(
     The gate fails if any of these holds: checkMesh reports failed checks; the patch names differ
     from the manifest (in particular a ``defaultFaces`` patch exists, i.e. some boundary faces were
     never named); a patch has no faces; the bounding box differs from ``expected_bbox`` by more
-    than ``rel_tol`` times the largest expected dimension in any coordinate; a patch type in
-    ``constant/polyMesh/boundary`` differs from the manifest; for a ``2D`` manifest the mesh does
-    not have exactly 2 solution directions. All violations are reported, not just the first.
+    than ``rel_tol`` times the largest expected dimension in any coordinate, or contains NaN/inf
+    (a non-finite expected box or a ``rel_tol`` that is not finite and positive is rejected as
+    well); a patch type in ``constant/polyMesh/boundary`` differs from the manifest; for a ``2D``
+    manifest the mesh does not have exactly 2 solution directions. All violations are reported,
+    not just the first.
 
     Returns the gate result and the parsed report (``None`` if checkMesh did not run to a
     parseable end). The checkMesh output is kept in ``checkMesh.log`` in ``case_dir``.
     """
     case_dir = Path(case_dir).resolve()
-    if len(expected_bbox) != 6:
-        return (
-            GateResult(
-                False, [f"expected bounding box must have 6 values, got {len(expected_bbox)}"]
-            ),
-            None,
-        )
+    invalid = validate_expected_bbox(expected_bbox, rel_tol)
+    if invalid is not None:
+        return GateResult(False, [invalid]), None
 
     result = run_tool(["checkMesh"], cwd=case_dir, log_path=case_dir / CHECKMESH_LOG_NAME)
     if not result.ok:
@@ -478,13 +471,9 @@ def check_mesh(
             errors.append(f"patch '{name}' has 0 faces")
 
     expected = tuple(float(v) for v in expected_bbox)
-    largest = max(expected[3 + i] - expected[i] for i in range(3))
-    tol = rel_tol * largest
-    if any(abs(a - e) > tol for a, e in zip(report.bbox, expected, strict=True)):
-        errors.append(
-            f"bounding box mismatch: expected {_fmt_bbox(expected)}, got {_fmt_bbox(report.bbox)} "
-            f"(tolerance {tol:.3g})." + _unit_hint(expected, report.bbox)
-        )
+    mismatch = compare_bbox(report.bbox, expected, rel_tol, _unit_hint(expected, report.bbox))
+    if mismatch is not None:
+        errors.append(mismatch)
 
     for patch in manifest.patches:
         if patch.name not in report.patches:

@@ -49,7 +49,7 @@ ensure_milestone() {
 }
 
 ensure_milestone "M0 Foundations" \
-  "Repo, CI, Docker image (OpenFOAM ESI + Gmsh + CadQuery + Python stack), Bicep infra, LLM capability spike for all three candidate models, benchmark references and thresholds fixed. Done when cavity passes CadQuery > Gmsh > OpenFOAM > post-processing from hand-written scripts, no LLM, locally and on the VM."
+  "Repo, CI, Docker image (OpenFOAM ESI + Gmsh + CadQuery + Python stack), Bicep infra, LLM capability spike (two models spiked, qwen3-32b excluded as not deployable), benchmark references and thresholds fixed. Done when cavity passes CadQuery > Gmsh > OpenFOAM > post-processing from hand-written scripts, no LLM, locally and on the VM."
 ensure_milestone "M1 First autonomous run" \
   "Orchestrator, agents 1-6, CLI, Blob upload, run record. Done when cavity Re = 100 goes from text to results with no human intervention."
 ensure_milestone "M2 Robustness + full benchmark set" \
