@@ -22,6 +22,10 @@ from cfdagent.tools.bbox import BBox, format_bbox
 
 _AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
 
+# Gmsh pads every bounding box of an OpenCASCADE entity by this absolute amount on each side
+# (OpenCASCADE's confusion tolerance), independent of the model size.
+_GMSH_BBOX_PADDING = 1e-7
+
 
 def _boundary_surfaces() -> list[int]:
     volumes = gmsh.model.getEntities(3)
@@ -39,11 +43,20 @@ def _locator_matches(locator: Locator, bbox: BBox, tol: float) -> bool:
     return all(bbox[i] >= lo[i] - tol and bbox[i + 3] <= hi[i] + tol for i in range(3))
 
 
+def _effective_tolerance(tol: float) -> float:
+    """Absolute matching tolerance: ``tol`` times the largest model extent plus Gmsh's padding."""
+    xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(-1, -1)
+    largest = max(xmax - xmin, ymax - ymin, zmax - zmin)
+    return _GMSH_BBOX_PADDING + tol * largest
+
+
 def match_surfaces(manifest: BoundaryManifest, tol: float = 1e-6) -> dict[str, list[int]]:
     """Map each patch name to the tags of the boundary surfaces its locators select.
 
-    A plane locator selects surfaces whose bounding box lies within ``tol`` of the plane. A box
-    locator selects surfaces whose bounding box lies inside the box (grown by ``tol``).
+    ``tol`` is relative: the effective tolerance is ``tol`` times the largest extent of the model's
+    bounding box, plus the fixed 1e-7 by which Gmsh pads every bounding box. A plane locator
+    selects surfaces whose bounding box lies within that tolerance of the plane. A box locator
+    selects surfaces whose bounding box lies inside the box (grown by the tolerance).
 
     Raises ``ManifestError`` (naming the surface tag and bounding box) if the manifest has no
     patches, if a boundary surface is matched by no patch or by more than one patch, or if a patch
@@ -52,6 +65,7 @@ def match_surfaces(manifest: BoundaryManifest, tol: float = 1e-6) -> dict[str, l
     if not manifest.patches:
         raise ManifestError("the manifest has no patches, so no boundary surface can be named")
     surfaces = _boundary_surfaces()
+    tol = _effective_tolerance(tol)
     bboxes = {tag: tuple(gmsh.model.getBoundingBox(2, tag)) for tag in surfaces}
 
     matched: dict[str, list[int]] = {}
@@ -85,6 +99,8 @@ def assign_physical_groups(
     manifest: BoundaryManifest, volume_name: str = "internal", tol: float = 1e-6
 ) -> dict[str, list[int]]:
     """Create one 2D physical group per patch and one 3D group holding all volumes.
+
+    ``tol`` is relative to the model size, as in ``match_surfaces``.
 
     Returns the patch name to surface tags mapping. Nothing is created if matching fails.
     """

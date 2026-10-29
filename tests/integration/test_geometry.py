@@ -166,15 +166,59 @@ def test_gate_reports_surface_matched_twice_and_unused_patch(tmp_path):
 
 
 def test_gate_rejects_wrong_cylinder_diameter_via_volume(tmp_path):
-    # The produced cylinder has diameter 0.9 and its bounding box equals the expected one, so the
-    # bounding-box check cannot see the problem; only the volume of the correct cylinder differs.
-    _make_cylinder(tmp_path, diameter=0.9)
-    expected_bbox = (-0.45, -0.45, 0.0, 0.45, 0.45, 1.0)
-    correct_volume = math.pi * 0.5**2 * 1.0
-    gate = check_geometry(tmp_path, expected_bbox, expected_volume=correct_volume)
+    # The hole of the channel fixture is made 10 % too small. The outer box is unchanged, so the
+    # bounding-box check cannot see the problem and the manifest still covers every surface; only
+    # the volume check can fire.
+    script = _write_script(
+        tmp_path,
+        CHANNEL_FIXTURE.read_text(encoding="utf-8").replace(
+            "CX, CY, RADIUS = 0.2, 0.2, 0.05", "CX, CY, RADIUS = 0.2, 0.2, 0.045"
+        ),
+    )
+    result = run_geometry_script(script, tmp_path)
+    assert result.ok, result.tail
+    correct_volume = (2.2 * 0.41 - math.pi * 0.05**2) * 0.1
+    gate = check_geometry(
+        tmp_path, expected_bbox=(0, 0, 0, 2.2, 0.41, 0.1), expected_volume=correct_volume
+    )
     assert not gate.ok
-    assert any("volume" in e for e in gate.errors), gate.errors
-    assert not any("bounding box" in e for e in gate.errors), gate.errors
+    assert len(gate.errors) == 1, gate.errors
+    assert "volume mismatch" in gate.errors[0]
+
+
+def test_gate_rejects_multiple_solids(tmp_path):
+    script = _write_script(
+        tmp_path,
+        "import cadquery as cq, json\n"
+        "a = cq.Workplane('XY').box(1, 1, 1, centered=False)\n"
+        "b = cq.Workplane('XY').box(1, 1, 1, centered=False).translate((3, 0, 0))\n"
+        "cq.exporters.export(a.add(b), 'geometry.step')\n"
+        "box = [-1, -1, -1, 5, 5, 5]\n"
+        "m = {'dimensionality': '3D', 'patches': [{'name': 'wall', 'type': 'wall',\n"
+        "     'locators': [{'kind': 'box', 'box': box}]}]}\n"
+        "json.dump(m, open('boundary_manifest.json', 'w'))\n",
+    )
+    assert run_geometry_script(script, tmp_path).ok
+    gate = check_geometry(tmp_path, expected_bbox=(0, 0, 0, 4, 1, 1))
+    assert not gate.ok
+    assert any("fuse the solids" in e for e in gate.errors), gate.errors
+
+
+def test_gate_leaves_a_caller_owned_gmsh_session_alone(tmp_path):
+    import gmsh
+
+    assert run_geometry_script(FIXTURE, tmp_path).ok
+    gmsh.initialize()
+    try:
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.model.add("caller_model")
+        gate = check_geometry(tmp_path, expected_bbox=(0, 0, 0, 1, 1, 0.1))
+        assert gate.ok, gate.errors
+        assert gmsh.isInitialized()
+        assert gmsh.model.getCurrent() == "caller_model"
+        assert "geometry_gate_scratch" not in gmsh.model.list()
+    finally:
+        gmsh.finalize()
 
 
 def test_gate_accepts_correct_cylinder_volume_and_skips_volume_when_none(tmp_path):

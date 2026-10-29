@@ -48,23 +48,41 @@ class _FakeBox:
 
 
 class _FakeSolid:
-    def __init__(self, bbox):
+    def __init__(self, bbox, volume=1.0, valid=True):
         self._bbox = bbox
+        self._volume = volume
+        self._valid = valid
 
     def isValid(self):  # noqa: N802 - mirrors the CadQuery API
-        return True
+        return self._valid
 
     def BoundingBox(self):  # noqa: N802
         return _FakeBox(self._bbox)
 
+    def Volume(self):  # noqa: N802
+        return self._volume
 
-def _fake_cadquery(monkeypatch, bbox):
-    solids = types.SimpleNamespace(vals=lambda: [_FakeSolid(bbox)])
-    shape = types.SimpleNamespace(solids=lambda: solids)
+
+def _fake_cadquery(monkeypatch, bbox=None, solids=None, coverage=None):
+    """Stub CadQuery's STEP import and the Gmsh coverage check; return the coverage call log.
+
+    The coverage check needs a real STEP file and Gmsh, so it is covered in integration tests.
+    ``coverage`` is the error message the stub returns (``None`` means the manifest covers it).
+    """
+    if solids is None:
+        solids = [_FakeSolid(bbox)]
+    vals = types.SimpleNamespace(vals=lambda: list(solids))
+    shape = types.SimpleNamespace(solids=lambda: vals)
     importers = types.SimpleNamespace(importStep=lambda _path: shape)
     monkeypatch.setitem(sys.modules, "cadquery", types.SimpleNamespace(importers=importers))
-    # The manifest coverage check needs a real STEP file and Gmsh; it is tested in integration.
-    monkeypatch.setattr(geometry, "_manifest_coverage_error", lambda _step, _manifest: None)
+    calls = []
+
+    def fake_coverage(step_path, manifest):
+        calls.append((step_path, manifest))
+        return coverage
+
+    monkeypatch.setattr(geometry, "_manifest_coverage_error", fake_coverage)
+    return calls
 
 
 def _geometry_dir(tmp_path):
@@ -107,6 +125,82 @@ def test_geometry_gate_rejects_non_positive_tolerance(tmp_path, monkeypatch, rel
     gate = check_geometry(_geometry_dir(tmp_path), BOX, rel_tol=rel_tol)
     assert not gate.ok
     assert any("bounding box" in e for e in gate.errors)
+
+
+def test_geometry_gate_accepts_matching_volume(tmp_path, monkeypatch):
+    _fake_cadquery(monkeypatch, solids=[_FakeSolid(BOX, volume=1.0)])
+    assert check_geometry(_geometry_dir(tmp_path), BOX, expected_volume=1.0005).ok
+
+
+def test_geometry_gate_reports_volume_mismatch(tmp_path, monkeypatch):
+    _fake_cadquery(monkeypatch, solids=[_FakeSolid(BOX, volume=0.9)])
+    gate = check_geometry(_geometry_dir(tmp_path), BOX, expected_volume=1.0)
+    assert not gate.ok
+    assert any("volume mismatch" in e for e in gate.errors), gate.errors
+    assert not any("bounding box" in e for e in gate.errors), gate.errors
+
+
+def test_geometry_gate_volume_check_is_skipped_when_none(tmp_path, monkeypatch):
+    _fake_cadquery(monkeypatch, solids=[_FakeSolid(BOX, volume=123.0)])
+    assert check_geometry(_geometry_dir(tmp_path), BOX).ok
+
+
+def test_geometry_gate_rejects_nan_actual_volume(tmp_path, monkeypatch):
+    _fake_cadquery(monkeypatch, solids=[_FakeSolid(BOX, volume=NAN)])
+    gate = check_geometry(_geometry_dir(tmp_path), BOX, expected_volume=1.0)
+    assert not gate.ok
+    assert any("volume" in e for e in gate.errors)
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, NAN, INF, "1.0", [1.0], object()])
+def test_geometry_gate_rejects_unusable_expected_volume(tmp_path, bad):
+    gate = check_geometry(tmp_path, BOX, expected_volume=bad)
+    assert not gate.ok
+    assert any("volume" in e for e in gate.errors)
+
+
+def test_geometry_gate_rejects_multiple_solids(tmp_path, monkeypatch):
+    solids = [_FakeSolid(BOX, volume=0.5), _FakeSolid(BOX, volume=0.5)]
+    calls = _fake_cadquery(monkeypatch, solids=solids)
+    gate = check_geometry(_geometry_dir(tmp_path), BOX, expected_volume=1.0)
+    assert not gate.ok
+    assert any("fuse the solids" in e for e in gate.errors), gate.errors
+    assert calls == []
+
+
+def test_geometry_gate_propagates_coverage_error(tmp_path, monkeypatch):
+    calls = _fake_cadquery(monkeypatch, BOX, coverage="geometry stage: surface 3 is unmatched")
+    gate = check_geometry(_geometry_dir(tmp_path), BOX)
+    assert not gate.ok
+    assert "geometry stage: surface 3 is unmatched" in gate.errors
+    assert len(calls) == 1
+
+
+def test_geometry_gate_skips_coverage_when_manifest_is_missing(tmp_path, monkeypatch):
+    calls = _fake_cadquery(monkeypatch, BOX)
+    (tmp_path / STEP_FILE_NAME).write_text("stub", encoding="utf-8")
+    gate = check_geometry(tmp_path, BOX)
+    assert not gate.ok
+    assert any(MANIFEST_FILE_NAME in e for e in gate.errors)
+    assert calls == []
+
+
+def test_geometry_gate_skips_coverage_when_manifest_is_invalid(tmp_path, monkeypatch):
+    calls = _fake_cadquery(monkeypatch, BOX)
+    (tmp_path / STEP_FILE_NAME).write_text("stub", encoding="utf-8")
+    (tmp_path / MANIFEST_FILE_NAME).write_text("{not json", encoding="utf-8")
+    gate = check_geometry(tmp_path, BOX)
+    assert not gate.ok
+    assert any(MANIFEST_FILE_NAME in e for e in gate.errors)
+    assert calls == []
+
+
+def test_geometry_gate_skips_coverage_when_a_solid_is_invalid(tmp_path, monkeypatch):
+    calls = _fake_cadquery(monkeypatch, solids=[_FakeSolid(BOX, valid=False)])
+    gate = check_geometry(_geometry_dir(tmp_path), BOX)
+    assert not gate.ok
+    assert any("not valid" in e for e in gate.errors)
+    assert calls == []
 
 
 # --------------------------------------------------------------------------------------------
@@ -196,3 +290,14 @@ def test_geometry_gate_does_not_hide_programmer_errors(tmp_path, monkeypatch):
     monkeypatch.setattr(BoundaryManifest, "from_file", staticmethod(broken))
     with pytest.raises(KeyError):
         check_geometry(_geometry_dir(tmp_path), BOX)
+
+
+def test_mesh_gate_default_tolerance_accepts_an_inscribed_polygon(tmp_path, monkeypatch):
+    # A 30-gon mesh of a 5 mm radius circle (axis x) is 2.7e-5 m short in z of the CAD box.
+    line = "Overall domain bounding box (0 -0.005 -0.00497261) (0.5 0.005 0.00497261)"
+    _stub_checkmesh(monkeypatch, tmp_path, bbox_line=line)
+    expected = (0, -0.005, -0.005, 0.5, 0.005, 0.005)
+    assert check_mesh(tmp_path, _manifest(), expected).ok
+    strict = check_mesh(tmp_path, _manifest(), expected, rel_tol=1e-3)
+    assert not strict.ok
+    assert any("bounding box" in e for e in strict.errors)
