@@ -37,7 +37,7 @@ jobs:
       - name: Ruff format check
         run: uv run ruff format --check .
       - name: Gitleaks
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # GITLEAKS_LICENSE is only needed for organisation accounts; this is a personal repo.
