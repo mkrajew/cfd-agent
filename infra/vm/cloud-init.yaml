@@ -57,7 +57,7 @@ write_files:
 runcmd:
   - [mkdir, -p, /var/lib/cfdagent]
   - [systemctl, enable, --now, docker]
-  - [sh, -c, "sshd -t && systemctl reload ssh"]
+  - [sh, -c, "mkdir -p /run/sshd && sshd -t && (systemctl reload ssh || true)"]
   - [systemctl, enable, --now, fail2ban]
   - [usermod, -aG, docker, "__ADMIN_USER__"]
   - [systemctl, daemon-reload]

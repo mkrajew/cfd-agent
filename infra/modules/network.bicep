@@ -16,13 +16,14 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
   properties: {
     securityRules: [
       {
-        name: 'Allow-SSH-Internet'
+        name: 'Allow-SSH-Any'
         properties: {
           priority: 100
           direction: 'Inbound'
           access: 'Allow'
           protocol: 'Tcp'
-          sourceAddressPrefix: 'Internet'
+          // '*' rather than the Internet service tag, which excludes Azure-owned ranges (Cloud Shell, VPN exits).
+          sourceAddressPrefix: '*'
           sourcePortRange: '*'
           destinationAddressPrefix: '*'
           destinationPortRange: '22'
