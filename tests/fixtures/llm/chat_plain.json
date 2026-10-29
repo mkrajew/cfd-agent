@@ -1,0 +1,19 @@
+{
+  "id": "chatcmpl-fixture-1",
+  "object": "chat.completion",
+  "created": 1790000000,
+  "model": "fixture-deployment",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {"role": "assistant", "content": "Hello."}
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 11,
+    "completion_tokens": 42,
+    "total_tokens": 53,
+    "completion_tokens_details": {"reasoning_tokens": 30}
+  }
+}

@@ -15,6 +15,7 @@ dependencies = [
     "numpy",
     "typer",
     "openai",
+    "httpx2",
     "azure-identity",
     "azure-storage-blob",
 ]
