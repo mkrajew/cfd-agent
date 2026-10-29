@@ -85,7 +85,8 @@ def cavity(tmp_path_factory):
 
 def test_cavity_mesh_passes_gate(cavity):
     manifest, case_dir = cavity
-    gate, report = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    gate = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    report = gate.data
     assert isinstance(gate, GateResult)
     assert gate.ok, gate.errors
     assert gate.errors == []
@@ -111,7 +112,8 @@ def test_check_mesh_rejects_scaled_mesh(cavity):
     """The same mesh checked against an expected box 1000x larger (a mm/m mix-up) is rejected."""
     manifest, case_dir = cavity
     scaled = tuple(1000 * v for v in CAVITY_BBOX)
-    gate, report = check_mesh(case_dir, manifest, scaled)
+    gate = check_mesh(case_dir, manifest, scaled)
+    report = gate.data
     assert not gate.ok
     assert any("bounding box" in e for e in gate.errors)
     assert any("unit" in e for e in gate.errors)
@@ -120,16 +122,17 @@ def test_check_mesh_rejects_scaled_mesh(cavity):
 
 def test_check_mesh_bbox_tolerance(cavity):
     manifest, case_dir = cavity
-    gate, _ = check_mesh(case_dir, manifest, (0, 0, 0, 1.0005, 1, 0.1), rel_tol=1e-3)
+    gate = check_mesh(case_dir, manifest, (0, 0, 0, 1.0005, 1, 0.1), rel_tol=1e-3)
     assert gate.ok, gate.errors
-    gate, _ = check_mesh(case_dir, manifest, (0, 0, 0, 1.01, 1, 0.1), rel_tol=1e-3)
+    gate = check_mesh(case_dir, manifest, (0, 0, 0, 1.01, 1, 0.1), rel_tol=1e-3)
     assert not gate.ok
 
 
 def test_check_mesh_rejects_unapplied_patch_types(tmp_path):
     """A raw gmshToFoam mesh has all patches of type 'patch' and no empty direction."""
     manifest, case_dir = _make_case(CAVITY, tmp_path, CAVITY_BBOX, apply_types=False)
-    gate, report = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    gate = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    report = gate.data
     assert not gate.ok
     assert any("movingWall" in e and "'wall'" in e for e in gate.errors)
     assert any("frontAndBack" in e and "'empty'" in e for e in gate.errors)
@@ -187,7 +190,8 @@ def test_check_mesh_rejects_default_faces(tmp_path):
         ],
     )
     apply_patch_types(case_dir, manifest)
-    gate, report = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    gate = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    report = gate.data
     assert not gate.ok
     assert any("defaultFaces" in e for e in gate.errors)
     assert report is not None
@@ -196,7 +200,8 @@ def test_check_mesh_rejects_default_faces(tmp_path):
 
 def test_cylinder_channel_mesh_passes_gate(tmp_path):
     manifest, case_dir = _make_case(CYLINDER, tmp_path, CYLINDER_BBOX)
-    gate, report = check_mesh(case_dir, manifest, CYLINDER_BBOX)
+    gate = check_mesh(case_dir, manifest, CYLINDER_BBOX)
+    report = gate.data
     assert gate.ok, gate.errors
     assert report is not None
     assert set(report.patches) == {"inlet", "outlet", "walls", "cylinder", "frontAndBack"}
@@ -327,7 +332,8 @@ def test_long_patch_name_passes_gate(tmp_path):
     assert convert_to_foam(tmp_path / "mesh.msh", case_dir).ok
     manifest = BoundaryManifest.from_file(manifest_path)
     apply_patch_types(case_dir, manifest)
-    gate, report = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    gate = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    report = gate.data
     assert gate.ok, gate.errors
     assert report is not None
     assert report.patches == {"movingWall": 64, long_name: 192, "frontAndBack": 2 * 64 * 64}
@@ -337,7 +343,8 @@ def test_relative_case_dir(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     manifest, case_dir = _make_case(CAVITY, Path("work"), CAVITY_BBOX)
     assert not case_dir.is_absolute()
-    gate, report = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    gate = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    report = gate.data
     assert gate.ok, gate.errors
     assert report is not None and report.n_cells == 64 * 64
     other = BoundaryManifest(
@@ -377,7 +384,8 @@ def test_check_mesh_rejects_failed_mesh_checks(cavity, tmp_path):
         pytest.fail("no interior point found in the polyMesh points file")
     points.write_text("\n".join(lines), encoding="utf-8")
 
-    gate, report = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    gate = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    report = gate.data
     assert not gate.ok
     assert any("failed mesh check" in e for e in gate.errors)
     assert report is not None and report.failed_checks >= 1
@@ -386,14 +394,14 @@ def test_check_mesh_rejects_failed_mesh_checks(cavity, tmp_path):
 def test_check_mesh_rejects_manifest_patch_missing_from_mesh(cavity):
     _, case_dir = cavity
     outlet = BoundaryPatch(name="outlet", type="patch", locators=[_plane("x", 1.0)])
-    gate, _ = check_mesh(case_dir, _cavity_manifest_with(patches_extra=[outlet]), CAVITY_BBOX)
+    gate = check_mesh(case_dir, _cavity_manifest_with(patches_extra=[outlet]), CAVITY_BBOX)
     assert not gate.ok
     assert any("missing ['outlet']" in e for e in gate.errors)
 
 
 def test_check_mesh_rejects_mesh_patch_missing_from_manifest(cavity):
     _, case_dir = cavity
-    gate, _ = check_mesh(case_dir, _cavity_manifest_with(drop={"fixedWalls"}), CAVITY_BBOX)
+    gate = check_mesh(case_dir, _cavity_manifest_with(drop={"fixedWalls"}), CAVITY_BBOX)
     assert not gate.ok
     assert any("unexpected ['fixedWalls']" in e for e in gate.errors)
 
@@ -418,7 +426,18 @@ def test_check_mesh_rejects_zero_face_patch(cavity, tmp_path):
 
     ghost_patch = BoundaryPatch(name="ghost", type="patch", locators=[_plane("x", 0.0)])
     manifest = _cavity_manifest_with(patches_extra=[ghost_patch])
-    gate, report = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    gate = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    report = gate.data
     assert not gate.ok
     assert any("'ghost' has 0 faces" in e for e in gate.errors)
     assert report is not None and report.patches["ghost"] == 0
+
+
+def test_convert_to_foam_refuses_existing_polymesh(cavity, tmp_path):
+    """A second conversion into the same case would mix old and new mesh files."""
+    _, source = cavity
+    case_dir = _copy_case(source, tmp_path)
+    before = (case_dir / "constant" / "polyMesh" / "boundary").read_bytes()
+    with pytest.raises(MeshError, match="polyMesh"):
+        convert_to_foam(source.parent / "mesh.msh", case_dir)
+    assert (case_dir / "constant" / "polyMesh" / "boundary").read_bytes() == before

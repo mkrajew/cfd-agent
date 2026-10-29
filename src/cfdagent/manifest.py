@@ -12,10 +12,12 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from cfdagent.errors import AgentInputError
+
 MANIFEST_FILE_NAME = "boundary_manifest.json"
 
 
-class ManifestError(Exception):
+class ManifestError(AgentInputError):
     """The boundary manifest is inconsistent with the geometry."""
 
 

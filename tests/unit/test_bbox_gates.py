@@ -133,7 +133,7 @@ def _stub_checkmesh(monkeypatch, tmp_path, bbox_line=OK_BBOX_LINE):
 
 def test_mesh_gate_accepts_matching_box_with_stub(tmp_path, monkeypatch):
     _stub_checkmesh(monkeypatch, tmp_path)
-    gate, _ = check_mesh(tmp_path, _manifest(), BOX)
+    gate = check_mesh(tmp_path, _manifest(), BOX)
     assert gate.ok, gate.errors
 
 
@@ -147,7 +147,7 @@ def test_mesh_gate_accepts_matching_box_with_stub(tmp_path, monkeypatch):
 )
 def test_mesh_gate_rejects_non_finite_actual(tmp_path, monkeypatch, bbox_line):
     _stub_checkmesh(monkeypatch, tmp_path, bbox_line)
-    gate, _ = check_mesh(tmp_path, _manifest(), BOX)
+    gate = check_mesh(tmp_path, _manifest(), BOX)
     assert not gate.ok
     assert any("bounding box" in e for e in gate.errors)
 
@@ -155,7 +155,7 @@ def test_mesh_gate_rejects_non_finite_actual(tmp_path, monkeypatch, bbox_line):
 @pytest.mark.parametrize("bad", [NAN, INF])
 def test_mesh_gate_rejects_non_finite_expected(tmp_path, monkeypatch, bad):
     _stub_checkmesh(monkeypatch, tmp_path)
-    gate, _ = check_mesh(tmp_path, _manifest(), (0, 0, 0, bad, 0.1, 0.01))
+    gate = check_mesh(tmp_path, _manifest(), (0, 0, 0, bad, 0.1, 0.01))
     assert not gate.ok
     assert any("bounding box" in e for e in gate.errors)
 
@@ -163,6 +163,6 @@ def test_mesh_gate_rejects_non_finite_expected(tmp_path, monkeypatch, bad):
 @pytest.mark.parametrize("rel_tol", [0.0, -1e-3, NAN])
 def test_mesh_gate_rejects_non_positive_tolerance(tmp_path, monkeypatch, rel_tol):
     _stub_checkmesh(monkeypatch, tmp_path)
-    gate, _ = check_mesh(tmp_path, _manifest(), BOX, rel_tol=rel_tol)
+    gate = check_mesh(tmp_path, _manifest(), BOX, rel_tol=rel_tol)
     assert not gate.ok
     assert any("bounding box" in e for e in gate.errors)

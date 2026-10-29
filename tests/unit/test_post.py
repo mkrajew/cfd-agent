@@ -7,7 +7,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from cfdagent.tools.post import latest_time_dir, read_line_sample, write_quantities
+from cfdagent.tools.post import (
+    PostProcessingError,
+    latest_time_dir,
+    read_line_sample,
+    write_quantities,
+)
 
 SAMPLES = Path(__file__).parents[1] / "fixtures" / "samples"
 
@@ -100,9 +105,9 @@ def test_latest_time_dir_ignores_files_and_non_numeric_names(tmp_path):
 
 def test_latest_time_dir_none_found(tmp_path):
     (tmp_path / "constant").mkdir()
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(PostProcessingError):
         latest_time_dir(tmp_path)
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(PostProcessingError):
         latest_time_dir(tmp_path / "missing")
 
 

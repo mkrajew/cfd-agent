@@ -9,7 +9,12 @@ from pathlib import Path
 
 import numpy as np
 
+from cfdagent.errors import AgentInputError
 from cfdagent.quantities import Quantities
+
+
+class PostProcessingError(AgentInputError):
+    """The case produced no usable post-processing output (nothing for the script to read)."""
 
 
 def latest_time_dir(func_dir: Path) -> Path:
@@ -17,11 +22,11 @@ def latest_time_dir(func_dir: Path) -> Path:
 
     ``func_dir`` is typically ``<case>/postProcessing/<functionObject>``. Names such as ``0``,
     ``0.5``, ``1e-05`` and ``100`` are compared by value; files and directories whose name is not a
-    finite number are ignored. Raises FileNotFoundError if there is none.
+    finite number are ignored. Raises ``PostProcessingError`` if there is none.
     """
     func_dir = Path(func_dir)
     if not func_dir.is_dir():
-        raise FileNotFoundError(f"{func_dir} is not a directory")
+        raise PostProcessingError(f"{func_dir} is not a directory")
     best: tuple[float, Path] | None = None
     for entry in func_dir.iterdir():
         if not entry.is_dir():
@@ -35,7 +40,7 @@ def latest_time_dir(func_dir: Path) -> Path:
         if best is None or value > best[0]:
             best = (value, entry)
     if best is None:
-        raise FileNotFoundError(f"no time directory in {func_dir}")
+        raise PostProcessingError(f"no time directory in {func_dir}")
     return best[1]
 
 
