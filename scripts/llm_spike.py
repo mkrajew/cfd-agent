@@ -202,7 +202,7 @@ def main(
     data = json.loads(out.read_text(encoding="utf-8")) if out.exists() else {}
     data[deployment] = entry
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    out.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8", newline="\n")
     typer.echo(f"{deployment}: {summary} (of {repeats}) -> {out}")
 
 
