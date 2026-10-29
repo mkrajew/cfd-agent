@@ -17,7 +17,7 @@ You are the infrastructure engineer of the `cfd-agent` research project. You wri
 ## Constraints you must design for (spec section 3)
 
 - Subscription "Azure for Students" with a $100 credit. Allowed regions: `italynorth` (default), `spaincentral`, `belgiumcentral`, `denmarkeast`, `austriaeast`.
-- Compute quota: 6 vCPU per region, at most 4 vCPU per VM family; spot 3 vCPU. The VM is `Standard_F4s_v2` (about $0.194/h), Ubuntu 24.04.
+- Compute quota: 6 vCPU per region, at most 4 vCPU per VM family; spot 3 vCPU. The VM is `Standard_D4as_v4` in `belgiumcentral` ($0.208/h), Ubuntu 24.04.
 - No GPU quota anywhere. LLMs run serverless in Azure AI Foundry, pay per token.
 - Resource group `rg-cfdagent`. The probe group `rg-cfdagent-probe` is deleted only after the IaC-managed environment exists and the owner approves.
 - Mandatory: daily auto-shutdown, on-VM idle shutdown after 30 minutes, subscription budget with alerts at 25/50/75/90 percent.

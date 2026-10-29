@@ -8,7 +8,7 @@ citation = "Ghia, U., Ghia, K. N. and Shin, C. T. (1982), High-Re solutions for 
 # Threshold 0.05 (the brief's default). A quick streamfunction-vorticity check (not OpenFOAM) gave
 # max errors against this reference of 0.08-0.11 on 10x10 cells, 0.024-0.036 on 20x20 and 0.003-0.016
 # on 40x40 (central and first-order upwind), so 0.05 accepts a 20x20 mesh and rejects a 10x10 one.
-# The reference uncertainty is far below 0.001.
+# Transcription error is far below 0.001; Ghia's own discretisation error is about 0.005-0.009 (see journal).
 
 [[criteria]]
 quantity = "u_vertical_centreline"
