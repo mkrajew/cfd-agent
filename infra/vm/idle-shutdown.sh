@@ -88,7 +88,7 @@ http() {
     tmp="$(mktemp)"
     HTTP_CODE="$(curl -sS --fail-with-body --max-time 30 -o "${tmp}" -w '%{http_code}' "$@" 2>/dev/null)" || true
     [ -n "${HTTP_CODE}" ] || HTTP_CODE=000
-    HTTP_BODY="$(head -c 500 "${tmp}" 2>/dev/null || true)"
+    HTTP_BODY="$(cat "${tmp}" 2>/dev/null || true)"
     rm -f "${tmp}"
 }
 
@@ -136,7 +136,7 @@ deallocate_once() {
     http -X POST -H "Authorization: Bearer ${TOKEN}" -H 'Content-Length: 0' \
         "${VM_URL}/deallocate?api-version=${ARM_API_VERSION}"
     if ! ok_code "${HTTP_CODE}"; then
-        err "ARM returned ${HTTP_CODE}: ${HTTP_BODY}"
+        err "ARM returned ${HTTP_CODE}: ${HTTP_BODY:0:500}"
         return 1
     fi
     log "deallocation requested for ${VM}"
@@ -146,7 +146,7 @@ check_once() {
     get_identity || return 1
     http -H "Authorization: Bearer ${TOKEN}" "${VM_URL}?api-version=${ARM_API_VERSION}"
     if ! ok_code "${HTTP_CODE}"; then
-        err "ARM returned ${HTTP_CODE}: ${HTTP_BODY}"
+        err "ARM returned ${HTTP_CODE}: ${HTTP_BODY:0:500}"
         return 1
     fi
     log "check ok: IMDS token and ARM read work for ${VM}"

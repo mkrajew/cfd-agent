@@ -6,6 +6,7 @@ The curl stub answers per URL with a status code and a body and fails the ARM de
 a configurable number of times.
 """
 
+import json
 import shutil
 import stat
 import subprocess
@@ -43,7 +44,9 @@ done
 code=200
 body='{}'
 case "$url" in
-  *instance/compute*) code=${STUB_META_CODE:-200}; body='__COMPUTE__' ;;
+  *instance/compute*)
+    code=${STUB_META_CODE:-200}; body='__COMPUTE__'
+    if [ -n "$STUB_COMPUTE_FILE" ]; then body=$(cat "$STUB_COMPUTE_FILE"); fi ;;
   *oauth2/token*) code=${STUB_TOKEN_CODE:-200}; body='__TOKEN__' ;;
   */deallocate*)
     n=$(cat "$STUB_COUNTER" 2>/dev/null || echo 0)
@@ -95,6 +98,7 @@ def env(tmp_path: Path) -> dict[str, str]:
         "STUB_DOCKER_PS": "",
         "STUB_CURL_LOG": str(tmp_path / "curl-calls.log"),
         "STUB_COUNTER": str(tmp_path / "arm-counter"),
+        "STUB_COMPUTE_FILE": "",
     }
 
 
@@ -281,3 +285,42 @@ def test_check_fails_when_arm_denies_the_read(env):
 
 def test_unknown_argument_is_rejected(env):
     assert run(env, "--bogus").returncode == 2
+
+
+def use_realistic_compute_payload(env: dict[str, str], tmp_path: Path) -> None:
+    """IMDS returns about 2 KB of JSON; subscriptionId comes long after the first 500 bytes."""
+    payload = {f"field{i:02d}": "x" * 40 for i in range(40)}
+    payload.update({"name": "v", "resourceGroupName": "g", "subscriptionId": "s"})
+    text = json.dumps(payload)
+    assert len(text) > 2000
+    assert text.index("subscriptionId") > 500
+    path = tmp_path / "compute.json"
+    path.write_text(text)
+    env["STUB_COMPUTE_FILE"] = str(path)
+
+
+def test_check_parses_a_large_imds_response(env, tmp_path):
+    use_realistic_compute_payload(env, tmp_path)
+    result = run(env, "--check")
+    assert result.returncode == 0, result.stderr
+    assert "check ok" in result.stdout
+
+
+def test_deallocation_parses_a_large_imds_response(env, tmp_path):
+    use_realistic_compute_payload(env, tmp_path)
+    set_idle_since(env, 31)
+    result = run(env)
+    assert result.returncode == 0, result.stderr
+    assert (
+        "/subscriptions/s/resourceGroups/g/providers/Microsoft.Compute/virtualMachines/v/deallocate"
+        in curl_calls(env)
+    )
+
+
+def test_imds_metadata_failure_is_reported(env):
+    set_idle_since(env, 31)
+    env["STUB_META_CODE"] = "404"
+    result = run(env)
+    assert result.returncode != 0
+    assert "IMDS metadata failed (HTTP 404)" in result.stderr
+    assert "/deallocate?" not in curl_calls(env)
