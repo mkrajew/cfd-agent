@@ -1,0 +1,60 @@
+/*---------------------------------------------------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2512                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+Build  : _87ed40d2-20251219 OPENFOAM=2512 version=2512
+Arch   : "LSB;label=32;scalar=64"
+Exec   : icoFoam
+Date   : Oct 28 2026
+Time   : 19:41:45
+Host   : 70a6b7f5fbd1
+PID    : 505
+I/O    : uncollated
+Case   : /work/ok
+nProcs : 1
+trapFpe: Floating point exception trapping enabled (FOAM_SIGFPE).
+memory pool : not available
+fileModificationChecking : Monitoring run-time modified files using timeStampMaster (fileModificationSkew 5, maxFileModificationPolls 20)
+allowSystemOperations : Allowing user-supplied system call operations
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Create time
+
+Create mesh for time = 0
+
+
+PISO: Operating solver in PISO mode
+
+Reading transportProperties
+
+Reading field p
+
+Reading field U
+
+Reading/calculating face flux field phi
+
+
+Starting time loop
+
+Time = 0.5
+
+Courant Number mean: 0.222158 max: 0.852134
+smoothSolver:  Solving for Ux, Initial residual = 1, Final residual = 9.54679e-06, No Iterations 169
+smoothSolver:  Solving for Uy, Initial residual = 0, Final residual = 0, No Iterations 0
+DICPCG:  Solving for p, Initial residual = 1, Final residual = 0.0225364, No Iterations 22
+time step continuity errors : sum local = 0.0703426, global = -3.28225e-17, cumulative = -3.28225e-17
+ExecutionTime = 0.05 s  ClockTime = 2 s
+
+Time = 1
+
+Courant Number mean: 2.3e+09 max: 8.1e+09
+smoothSolver:  Solving for Ux, Initial residual = 4.2e+12, Final residual = 3.1e+12, No Iterations 1000
+smoothSolver:  Solving for Uy, Initial residual = 7.7e+11, Final residual = 5.6e+11, No Iterations 1000
+DICPCG:  Solving for p, Initial residual = 1, Final residual = 0.5, No Iterations 1000
+time step continuity errors : sum local = 1.2e+20, global = 3.1e+15, cumulative = 3.1e+15
+ExecutionTime = 0.10 s  ClockTime = 3 s
+
+End

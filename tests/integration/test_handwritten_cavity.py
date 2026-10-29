@@ -17,9 +17,10 @@ import cfdagent
 from cfdagent.bench.registry import load_registry
 from cfdagent.bench.scoring import ScoreResult, score
 from cfdagent.manifest import MANIFEST_FILE_NAME, BoundaryManifest
-from cfdagent.tools.foam import parse_solver_log, run_solver
+from cfdagent.tools.foam import run_solver
 from cfdagent.tools.geometry import check_geometry, run_geometry_script
 from cfdagent.tools.mesh import apply_patch_types, check_mesh, convert_to_foam, run_mesh_script
+from cfdagent.tools.post import latest_time_dir
 from cfdagent.tools.process import run_tool
 
 pytestmark = pytest.mark.integration
@@ -28,6 +29,8 @@ ROOT = Path(__file__).parents[2]
 CAVITY = ROOT / "tests" / "fixtures" / "handwritten" / "cavity_re100"
 CAVITY_BBOX = (0, 0, 0, 1, 1, 0.1)
 SOLVER = "icoFoam"
+SAMPLE_FUNCTION_OBJECT = "centrelines"  # the sets function object in the case controlDict
+SOLVER_TIMEOUT_S = 1800.0  # the run takes about a minute; a hang must not stall the suite
 
 
 @pytest.fixture(autouse=True)
@@ -66,13 +69,14 @@ def test_handwritten_cavity_re100_matches_ghia(tmp_path):
     # 3. solver (serial: 64 x 64 x 1 cells need no parallel run)
     shutil.copytree(CAVITY / "case", case_dir, dirs_exist_ok=True)
     started = time.monotonic()
-    solved = run_solver(case_dir, SOLVER)
+    solved = run_solver(case_dir, SOLVER, timeout_s=SOLVER_TIMEOUT_S)
     print(f"\n{SOLVER} wall time: {time.monotonic() - started:.1f} s")
-    assert solved.ok, solved.tail
-    # Read the solver log by name: with n_procs > 1 the result would point at log.reconstructPar.
-    summary = parse_solver_log((case_dir / f"log.{SOLVER}").read_text(encoding="utf-8"))
-    assert summary.completed, summary.failure_reason
-    print(f"end time {summary.end_time}, max Courant {summary.max_courant}")
+    if not solved.ok:  # pytest shows captured stdout of a failing test
+        print(f"{SOLVER} did not succeed; tail of {solved.tool.log_path.name}:\n{solved.tool.tail}")
+    assert solved.ok, solved.tool.tail
+    assert solved.summary.completed, solved.summary.failure_reason
+    assert solved.summary.end_time == solved.case_end_time  # the run reached the requested end
+    print(f"end time {solved.summary.end_time}, max Courant {solved.summary.max_courant}")
 
     # 4. post-processing and scoring
     quantities_path = tmp_path / "quantities.json"
@@ -82,6 +86,9 @@ def test_handwritten_cavity_re100_matches_ghia(tmp_path):
         log_path=tmp_path / "post.log",
     )
     assert post.ok, post.tail
+    # The profiles were sampled at the end of the run that was just checked, not at a stale time.
+    sampled = latest_time_dir(case_dir / "postProcessing" / SAMPLE_FUNCTION_OBJECT)
+    assert float(sampled.name) == pytest.approx(solved.summary.end_time), sampled
     quantities = json.loads(quantities_path.read_text(encoding="utf-8"))
     result = score(load_registry(ROOT / "benchmarks")["cavity-re100"], quantities)
     print("\nscore:\n" + _report(result))
