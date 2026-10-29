@@ -1,11 +1,19 @@
 """Parsing of OpenFOAM checkMesh output, using logs captured inside the Docker image."""
 
+import dataclasses
 import math
 from pathlib import Path
 
 import pytest
 
-from cfdagent.tools.mesh import CheckMeshReport, parse_checkmesh
+from cfdagent.manifest import BoundaryManifest, BoundaryPatch, Locator
+from cfdagent.tools.mesh import (
+    CheckMeshReport,
+    MeshThresholds,
+    parse_checkmesh,
+    quality_errors,
+    thickness_errors,
+)
 
 LOGS = Path(__file__).parents[1] / "fixtures" / "logs"
 
@@ -101,3 +109,152 @@ def test_patch_row_count_must_match_boundary_patches_line():
         parse_checkmesh(text.replace(row + "\n", ""))
     with pytest.raises(ValueError, match="patch"):
         parse_checkmesh(text.replace("boundary patches: 3", "boundary patches: 4"))
+
+
+def test_patch_names_with_shared_long_prefix_are_not_collapsed():
+    """Real checkMesh output: names of 20+ characters ending in a digit abut the face count.
+
+    'shared_long_prefix_in_1' and '..._in_2' print as '..._in_11' and '..._in_21'; the two rows
+    must both be counted, not merged into one dict key (which looked like a missing patch).
+    """
+    report = parse_checkmesh(_read("checkMesh_long_names.log"))
+    assert report.n_patch_rows == 4
+    assert report.n_cells == 1
+    assert report.patches["walls"] == 2
+    assert report.patches["frontAndBack"] == 2
+
+
+def test_aspect_ratio_with_colon_is_parsed():
+    """OpenFOAM v2512 prints a failed aspect-ratio check with a colon instead of '='."""
+    text = _read("checkMesh_ok.log")
+    assert "    Max aspect ratio = 1 OK.\n" in text
+    text = text.replace(
+        "    Max aspect ratio = 1 OK.\n",
+        " ***High aspect ratio cells found, Max aspect ratio: 2000, number of cells 1\n",
+    ).replace("Mesh OK.", "Failed 1 mesh checks.")
+    report = parse_checkmesh(text)
+    assert report.max_aspect_ratio == 2000
+    assert report.failed_checks == 1
+
+
+def _report(**changes):
+    return dataclasses.replace(parse_checkmesh(_read("checkMesh_ok.log")), **changes)
+
+
+def test_quality_within_defaults_passes():
+    assert quality_errors(_report(), MeshThresholds()) == []
+
+
+def test_default_thresholds():
+    t = MeshThresholds()
+    assert (t.max_non_orthogonality, t.max_skewness, t.max_aspect_ratio) == (70.0, 4.0, 1000.0)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        t.max_skewness = 5.0  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "word"),
+    [
+        ("max_non_orthogonality", 70.5, "non-orthogonality"),
+        ("max_skewness", 4.5, "skewness"),
+        ("max_aspect_ratio", 1500.0, "aspect ratio"),
+    ],
+)
+def test_quality_threshold_exceeded_fails(field, value, word):
+    errors = quality_errors(_report(**{field: value}), MeshThresholds())
+    assert len(errors) == 1 and word in errors[0]
+
+
+def test_quality_exactly_at_threshold_passes():
+    report = _report(max_non_orthogonality=70.0, max_skewness=4.0, max_aspect_ratio=1000.0)
+    assert quality_errors(report, MeshThresholds()) == []
+
+
+def test_custom_thresholds_are_used():
+    errors = quality_errors(_report(max_aspect_ratio=2.0), MeshThresholds(max_aspect_ratio=1.5))
+    assert len(errors) == 1
+
+
+def test_nan_aspect_ratio_fails():
+    # checkMesh skips the aspect-ratio check after open cells; an unknown value never passes.
+    errors = quality_errors(_report(max_aspect_ratio=math.nan), MeshThresholds())
+    assert len(errors) == 1 and "aspect ratio" in errors[0] and "not reported" in errors[0]
+
+
+def test_nan_everything_reports_every_metric():
+    nan = math.nan
+    report = _report(max_non_orthogonality=nan, max_skewness=nan, max_aspect_ratio=nan)
+    assert len(quality_errors(report, MeshThresholds())) == 3
+
+
+def test_single_cell_non_orthogonality_wording():
+    report = _report(max_non_orthogonality=math.nan)
+    (error,) = quality_errors(report, MeshThresholds())
+    assert "checkMesh did not report non-orthogonality" in error
+    assert "without internal faces" in error
+
+
+def test_quality_errors_carry_a_general_remedy():
+    (error,) = quality_errors(_report(max_skewness=9.0), MeshThresholds())
+    assert "Refine or smooth the mesh" in error
+
+
+@pytest.mark.parametrize("bad", [math.nan, 0.0, -1.0])
+@pytest.mark.parametrize("name", ["max_non_orthogonality", "max_skewness", "max_aspect_ratio"])
+def test_invalid_thresholds_are_rejected(name, bad):
+    with pytest.raises(ValueError, match=name):
+        MeshThresholds(**{name: bad})
+
+
+def test_infinite_metric_fails_closed():
+    assert len(quality_errors(_report(max_skewness=math.inf), MeshThresholds())) == 1
+
+
+# --- one-cell-thick check -------------------------------------------------------------------
+
+
+def _manifest(dimensionality, types):
+    patches = [
+        BoundaryPatch(
+            name=name, type=kind, locators=[Locator(kind="plane", axis="x", value=float(i))]
+        )
+        for i, (name, kind) in enumerate(types.items())
+    ]
+    return BoundaryManifest(dimensionality=dimensionality, patches=patches)
+
+
+def _thickness_report(faces, n_cells=10, directions=2):
+    return _report(n_cells=n_cells, patches=faces, solution_directions=directions)
+
+
+def test_two_d_thickness_counts_empty_faces():
+    manifest = _manifest("2D", {"wall": "wall", "fb": "empty"})
+    assert thickness_errors(manifest, _thickness_report({"wall": 5, "fb": 20})) == []
+    (error,) = thickness_errors(manifest, _thickness_report({"wall": 5, "fb": 10}))
+    assert "one cell thick" in error and "fb" in error
+
+
+def test_two_d_needs_two_solution_directions():
+    manifest = _manifest("2D", {"fb": "empty"})
+    errors = thickness_errors(manifest, _thickness_report({"fb": 20}, directions=3))
+    assert len(errors) == 1 and "solution directions" in errors[0]
+
+
+def test_axisymmetric_counts_wedge_faces_and_ignores_solution_directions():
+    manifest = _manifest("axisymmetric", {"inlet": "patch", "front": "wedge", "back": "wedge"})
+    ok = _thickness_report({"inlet": 5, "front": 10, "back": 10}, directions=3)
+    assert thickness_errors(manifest, ok) == []
+    two_layers = _thickness_report({"inlet": 5, "front": 10, "back": 10}, n_cells=20, directions=3)
+    (error,) = thickness_errors(manifest, two_layers)
+    assert "one cell thick" in error and "wedge" in error
+
+
+def test_axisymmetric_without_a_wedge_patch_is_an_error():
+    manifest = _manifest("axisymmetric", {"inlet": "patch"})
+    (error,) = thickness_errors(manifest, _thickness_report({"inlet": 5}, directions=3))
+    assert "wedge" in error
+
+
+def test_three_d_has_no_thickness_requirement():
+    manifest = _manifest("3D", {"inlet": "patch"})
+    assert thickness_errors(manifest, _thickness_report({"inlet": 5}, directions=3)) == []

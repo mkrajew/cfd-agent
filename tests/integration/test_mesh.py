@@ -1,5 +1,6 @@
 """Mesh stage and mesh gate: Gmsh script -> MSH 2.2 -> OpenFOAM polyMesh -> checkMesh gate."""
 
+import math
 import os
 import re
 import shutil
@@ -16,6 +17,7 @@ from cfdagent.tools.geometry import check_geometry, run_geometry_script
 from cfdagent.tools.mesh import (
     CheckMeshReport,
     MeshError,
+    MeshThresholds,
     apply_patch_types,
     check_mesh,
     convert_to_foam,
@@ -199,7 +201,7 @@ def test_check_mesh_rejects_default_faces(tmp_path):
     assert report.patches["defaultFaces"] > 0
 
 
-def test_cylinder_channel_mesh_passes_gate(tmp_path):
+def test_check_mesh_passes_one_layer_cylinder(tmp_path):
     manifest, case_dir = _make_case(CYLINDER, tmp_path, CYLINDER_BBOX)
     gate = check_mesh(case_dir, manifest, CYLINDER_BBOX)
     report = gate.data
@@ -209,8 +211,99 @@ def test_cylinder_channel_mesh_passes_gate(tmp_path):
     assert report.solution_directions == 2
     assert report.failed_checks == 0
     assert report.n_cells > 500
+    assert report.patches["frontAndBack"] == 2 * report.n_cells  # one cell thick
     assert _patch_value(case_dir, "cylinder", "type") == "wall"
     assert _patch_value(case_dir, "inlet", "type") == "patch"
+
+
+def test_check_mesh_rejects_two_layer_2d_mesh(tmp_path):
+    """Two cells through the thickness still has 2 solution directions, but is not 2D-valid."""
+    source = (CYLINDER / "mesh.py").read_text(encoding="utf-8")
+    assert "numElements=[1]" in source
+    script = tmp_path / "two_layer_mesh.py"
+    script.write_text(source.replace("numElements=[1]", "numElements=[2]"), encoding="utf-8")
+    work = tmp_path / "w"
+    assert run_geometry_script(CYLINDER / "geometry.py", work).ok
+    meshed = run_mesh_script(script, work)
+    assert meshed.ok, meshed.tail
+    case_dir = work / "case"
+    assert convert_to_foam(work / "mesh.msh", case_dir).ok
+    manifest = BoundaryManifest.from_file(work / MANIFEST_FILE_NAME)
+    apply_patch_types(case_dir, manifest)
+
+    gate = check_mesh(case_dir, manifest, CYLINDER_BBOX)
+    report = gate.data
+    assert not gate.ok
+    assert report is not None and report.solution_directions == 2
+    assert report.patches["frontAndBack"] == report.n_cells  # one cell thick would give 2 * n
+    assert any("thick" in e and "frontAndBack" in e for e in gate.errors)
+
+
+def test_check_mesh_applies_quality_thresholds(cavity):
+    manifest, case_dir = cavity
+    gate = check_mesh(
+        case_dir, manifest, CAVITY_BBOX, thresholds=MeshThresholds(max_aspect_ratio=0.5)
+    )
+    assert not gate.ok
+    assert any("aspect ratio" in e for e in gate.errors)
+    assert check_mesh(case_dir, manifest, CAVITY_BBOX, thresholds=MeshThresholds()).ok
+
+
+def _swapped_cavity_manifest() -> BoundaryManifest:
+    return BoundaryManifest(
+        dimensionality="2D",
+        patches=[
+            BoundaryPatch(name="movingWall", type="wall", locators=[_plane("y", 0.0)]),
+            BoundaryPatch(
+                name="fixedWalls",
+                type="wall",
+                locators=[_plane("x", 0.0), _plane("x", 1.0), _plane("y", 1.0)],
+            ),
+            BoundaryPatch(
+                name="frontAndBack", type="empty", locators=[_plane("z", 0.0), _plane("z", 0.1)]
+            ),
+        ],
+    )
+
+
+def test_check_mesh_rejects_misplaced_patch(cavity):
+    """Patch names that do not sit where the manifest locators say (e.g. swapped) are rejected."""
+    _, case_dir = cavity
+    gate = check_mesh(case_dir, _swapped_cavity_manifest(), CAVITY_BBOX)
+    assert not gate.ok
+    assert any("movingWall" in e and "locator" in e for e in gate.errors)
+    assert any("fixedWalls" in e and "locator" in e for e in gate.errors)
+    assert not any("frontAndBack" in e for e in gate.errors)
+    assert not any("probably a consequence" in e for e in gate.errors)
+
+
+def test_placement_errors_after_a_bbox_mismatch_are_flagged_as_consequential(cavity):
+    _, case_dir = cavity
+    gate = check_mesh(case_dir, _swapped_cavity_manifest(), (0, 0, 0, 1.2, 1, 0.1))
+    assert not gate.ok
+    texts = gate.errors
+    note = next(i for i, e in enumerate(texts) if "probably a consequence" in e)
+    assert any("bounding box mismatch" in e for e in texts[:note])
+    assert any("movingWall" in e for e in texts[note + 1 :])
+
+
+def test_case_dir_has_no_skeleton_files_after_check(tmp_path):
+    manifest, case_dir = _make_case(CAVITY, tmp_path, CAVITY_BBOX)
+    assert not (case_dir / "system").exists()
+    gate = check_mesh(case_dir, manifest, CAVITY_BBOX)
+    assert gate.ok, gate.errors
+    assert not (case_dir / "system").exists()
+    assert sorted(p.name for p in case_dir.iterdir() if p.is_dir()) == ["constant"]
+
+
+def test_failed_conversion_leaves_no_polymesh(tmp_path):
+    bad = tmp_path / "bad.msh"
+    bad.write_text("$MeshFormat\n2.2 0 8\n$EndMeshFormat\n", encoding="utf-8")
+    case_dir = tmp_path / "case"
+    result = convert_to_foam(bad, case_dir)
+    assert not result.ok
+    assert not (case_dir / "constant" / "polyMesh").exists()
+    assert not (case_dir / "system").exists()
 
 
 @pytest.mark.parametrize(
@@ -442,3 +535,115 @@ def test_convert_to_foam_refuses_existing_polymesh(cavity, tmp_path):
     with pytest.raises(ToolFailure, match="polyMesh"):
         convert_to_foam(source.parent / "mesh.msh", case_dir)
     assert (case_dir / "constant" / "polyMesh" / "boundary").read_bytes() == before
+
+
+# --- axisymmetric (wedge) meshes ---------------------------------------------------------------
+
+WEDGE_ANGLE = math.radians(5.0)  # OpenFOAM wants the two wedge planes symmetric about a plane
+_C, _S = math.cos(WEDGE_ANGLE / 2), math.sin(WEDGE_ANGLE / 2)
+# A ring sector x 0..1, radius 1..2, swept about the x axis from -2.5 to +2.5 degrees.
+WEDGE_BBOX = (0.0, _C, -2 * _S, 1.0, 2.0, 2 * _S)
+
+
+def _wedge_manifest() -> BoundaryManifest:
+    return BoundaryManifest(
+        dimensionality="axisymmetric",
+        patches=[
+            BoundaryPatch(name="inlet", type="patch", locators=[_plane("x", 0.0)]),
+            BoundaryPatch(name="outlet", type="patch", locators=[_plane("x", 1.0)]),
+            BoundaryPatch(
+                name="inner",
+                type="wall",
+                locators=[Locator(kind="box", box=(0.0, _C, -_S, 1.0, 1.0, _S))],
+            ),
+            BoundaryPatch(
+                name="outer",
+                type="wall",
+                locators=[Locator(kind="box", box=(0.0, 2 * _C, -2 * _S, 1.0, 2.0, 2 * _S))],
+            ),
+            BoundaryPatch(
+                name="wedgeFront",
+                type="wedge",
+                locators=[Locator(kind="box", box=(0.0, _C, -2 * _S, 1.0, 2 * _C, -_S))],
+            ),
+            BoundaryPatch(
+                name="wedgeBack",
+                type="wedge",
+                locators=[Locator(kind="box", box=(0.0, _C, _S, 1.0, 2 * _C, 2 * _S))],
+            ),
+        ],
+    )
+
+
+def _make_wedge_case(workdir: Path, layers: int) -> tuple[BoundaryManifest, Path]:
+    """Hexahedral ring sector with ``layers`` cells around the axis; patches named by position."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    gmsh.initialize()
+    try:
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.model.add("wedge")
+        rect = gmsh.model.occ.addRectangle(0, 1, 0, 1, 1)
+        gmsh.model.occ.rotate([(2, rect)], 0, 0, 0, 1, 0, 0, -WEDGE_ANGLE / 2)
+        gmsh.model.occ.synchronize()
+        for _, curve in gmsh.model.getEntities(1):
+            gmsh.model.mesh.setTransfiniteCurve(curve, 5)
+        gmsh.model.mesh.setTransfiniteSurface(rect)
+        gmsh.model.mesh.setRecombine(2, rect)
+        gmsh.model.occ.revolve(
+            [(2, rect)], 0, 0, 0, 1, 0, 0, WEDGE_ANGLE, numElements=[layers], recombine=True
+        )
+        gmsh.model.occ.synchronize()
+        groups: dict[str, list[int]] = {n: [] for n in _wedge_manifest_names()}
+        for _, tag in gmsh.model.getEntities(2):
+            xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(2, tag)
+            if xmax < 1e-6:
+                groups["inlet"].append(tag)
+            elif xmin > 1 - 1e-6:
+                groups["outlet"].append(tag)
+            elif zmax < -1e-3:
+                groups["wedgeFront"].append(tag)
+            elif zmin > 1e-3:
+                groups["wedgeBack"].append(tag)
+            elif ymax < 1.5:
+                groups["inner"].append(tag)
+            else:
+                groups["outer"].append(tag)
+        assert all(len(g) == 1 for g in groups.values()), groups
+        for name, tags in groups.items():
+            gmsh.model.addPhysicalGroup(2, tags, name=name)
+        gmsh.model.addPhysicalGroup(3, [t for _, t in gmsh.model.getEntities(3)], name="internal")
+        gmsh.option.setNumber("Mesh.MshFileVersion", 2.2)
+        gmsh.option.setNumber("Mesh.Binary", 0)
+        gmsh.model.mesh.generate(3)
+        gmsh.write(str(workdir / "mesh.msh"))
+    finally:
+        gmsh.finalize()
+    case_dir = workdir / "case"
+    converted = convert_to_foam(workdir / "mesh.msh", case_dir)
+    assert converted.ok, converted.tail
+    manifest = _wedge_manifest()
+    apply_patch_types(case_dir, manifest)
+    return manifest, case_dir
+
+
+def _wedge_manifest_names() -> list[str]:
+    return [p.name for p in _wedge_manifest().patches]
+
+
+def test_check_mesh_passes_one_layer_wedge(tmp_path):
+    manifest, case_dir = _make_wedge_case(tmp_path, layers=1)
+    gate = check_mesh(case_dir, manifest, WEDGE_BBOX)
+    report = gate.data
+    assert gate.ok, gate.errors
+    assert report is not None and report.solution_directions == 3
+    assert report.patches["wedgeFront"] + report.patches["wedgeBack"] == 2 * report.n_cells
+
+
+def test_check_mesh_rejects_two_layer_wedge(tmp_path):
+    manifest, case_dir = _make_wedge_case(tmp_path, layers=2)
+    gate = check_mesh(case_dir, manifest, WEDGE_BBOX)
+    report = gate.data
+    assert not gate.ok
+    assert report is not None
+    assert any("one cell thick" in e and "wedge" in e for e in gate.errors)
+    assert not any("solution directions" in e for e in gate.errors)

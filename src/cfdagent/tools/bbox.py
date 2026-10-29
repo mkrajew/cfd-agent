@@ -11,11 +11,11 @@ from collections.abc import Sequence
 
 BBox = tuple[float, float, float, float, float, float]  # xmin, ymin, zmin, xmax, ymax, zmax
 
-# Representation floor: polyMesh points and checkMesh print 6 significant digits, so a printed
-# coordinate is off by up to 5e-6 of its own magnitude. 1e-5 leaves a factor of two. The floor
-# is relative to the coordinate, not to the extent: a box whose offset from the origin exceeds
-# its extent by more than about 100 times cannot be resolved at 6 digits, and for such a box
-# the floor (not ``rel_tol``) decides.
+# Representation floor: the bounding box printed by checkMesh has 6 significant digits (the
+# polyMesh points themselves have more), so a printed coordinate is off by up to 5e-6 of its own
+# magnitude. 1e-5 leaves a factor of two. The floor is relative to the coordinate, not to the
+# extent: a box whose offset from the origin exceeds its extent by more than about 100 times
+# cannot be resolved at 6 digits, and for such a box the floor (not ``rel_tol``) decides.
 REPR_EPS = 1e-5
 
 
