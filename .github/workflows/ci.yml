@@ -94,7 +94,7 @@ jobs:
           cache-from: type=gha,scope=cfdagent-image
           cache-to: type=gha,mode=max,scope=cfdagent-image
       - name: Upload image
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cfdagent-image
           path: ${{ runner.temp }}/cfdagent-image.tar
