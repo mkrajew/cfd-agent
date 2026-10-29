@@ -55,7 +55,7 @@ Source: the final whole-branch review of M0 (2026-10-29, main 034cc5e). Its bloc
   - Add a helper that echoes assistant tool-call messages back.
 - **Schema.** `strict_schema` rewrites `dict[str, X]` to `additionalProperties: false` (`client.py:82-84`), so the model can only emit `{}`; raise on maps in LLM-facing schemas. Test that `Optional` stays nullable, and check `default` keywords against Foundry with the real `CaseSpec`.
 - **Tests.** Cover `APIStatusError`, 429 and retries, `api_key` mode and token refresh; record one or two real responses as fixtures.
-- **Llama.** Make one Llama-3.3-70B call from the VM identity (cents) to prove the OpenAI-User role covers it, before the redeploy that turns key auth off (see S7).
+- **Llama.** Done: Llama-3.3-70B answered through the VM identity on 2026-10-29 (the review had asked for this check; see S7).
 
 ## E. Infra, CI and image
 
@@ -101,7 +101,7 @@ Gaps to close before any LLM-authored script or dictionary is processed:
   - Both sides must use uid 1000 (the VM's `azureuser` already does).
 - **S5. Treat the shared run directory as hostile.** Refuse symlinks when uploading or reading, resolve paths inside the run directory, and never mount the repo root or `benchmarks/` into executors.
 - **S6. Image.** Set `allowSystemOperations 0` site-wide with a test that `#codeStream` is refused; build a runtime stage without uv, dev tools or compilers where possible; add a code comment that the allowlist is not a security boundary.
-- **S7. Entra-only on the AI account.** The Bicep default is now `disableLocalAuth = true`, but the deployed account still has keys. Order: Llama call from the VM identity (D), owner-approved redeploy (pass `budgetStartDate=2026-10-01T00:00:00Z` if after 1 November), then verify. Also scope the VM's Storage Blob Data Contributor role to the `runs` container.
+- **S7. Entra-only on the AI account.** The Bicep default is now `disableLocalAuth = true`, but the deployed account still has keys. Order: owner-approved redeploy (pass `budgetStartDate=2026-10-01T00:00:00Z` if after 1 November), then verify. Also scope the VM's Storage Blob Data Contributor role to the `runs` container.
 - **S8. SSH** is public by owner decision, key only plus fail2ban. Add `MaxAuthTries 3` and `AllowUsers azureuser` by `scp` of a drop-in (`customData` is immutable) and watch `journalctl -u ssh`. The `docker` group is root-equivalent, so the key passphrase is the real control.
 - **S9. Spend and supply chain.**
   - Budget alerts only notify; enforce the $1-per-run cap in the orchestrator using real usage numbers (see D).
