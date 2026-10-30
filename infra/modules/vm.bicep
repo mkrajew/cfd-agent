@@ -19,19 +19,11 @@ param containerImage string
 
 var vmName = 'vm-cfdagent'
 
-// The daily shutdown fires at shutdownTime and then every 10 minutes for 4 hours (25 attempts), so
-// a shutdown that `cfdagent-idle-shutdown --daily` deferred for an active run is retried. Each entry
-// is one OnCalendar line; scripts/vm-host-setup.sh renders the same list for a running VM.
-var shutdownStartMinute = int(substring(shutdownTime, 0, 2)) * 60 + int(substring(shutdownTime, 2, 2))
-var attemptMinutes = map(range(0, 25), attempt => (shutdownStartMinute + attempt * 10) % 1440)
-var dailyCalendar = join(
-  map(
-    attemptMinutes,
-    minute => '*-*-* ${padLeft(string(minute / 60), 2, '0')}:${padLeft(string(minute % 60), 2, '0')}:00 ${shutdownTimeZone}'
-  ),
-  '\nOnCalendar='
+var dailyTimer = replace(
+  loadTextContent('../vm/daily-shutdown.timer'),
+  '__ON_CALENDAR__',
+  '*-*-* ${substring(shutdownTime, 0, 2)}:${substring(shutdownTime, 2, 2)}:00 ${shutdownTimeZone}'
 )
-var dailyTimer = replace(loadTextContent('../vm/daily-shutdown.timer'), '__ON_CALENDAR__', dailyCalendar)
 // The VM files are embedded in cloud-init as base64 so that they are written
 // byte for byte (LF endings, no YAML indentation issues).
 var cloudInitSteps = [

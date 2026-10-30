@@ -14,7 +14,6 @@ import pytest
 
 VM_DIR = Path(__file__).resolve().parents[2] / "infra" / "vm"
 SCRIPT = VM_DIR / "cfdagent-iptables.sh"
-UNIT = VM_DIR / "cfdagent-iptables.service"
 BASH = shutil.which("bash")
 
 IPTABLES_STUB = r"""#!/bin/sh
@@ -142,14 +141,3 @@ def test_status_reports_missing_and_present_rules(env):
     assert run(env, "status").returncode != 0
     assert run(env, "start").returncode == 0
     assert run(env, "status").returncode == 0
-
-
-def test_unit_runs_the_script_after_docker_and_removes_the_rules_on_stop():
-    unit = UNIT.read_text()
-    assert "After=docker.service" in unit
-    assert "Requires=docker.service" in unit
-    assert "Type=oneshot" in unit
-    assert "RemainAfterExit=yes" in unit
-    assert "ExecStart=/usr/local/sbin/cfdagent-iptables start" in unit
-    assert "ExecStop=/usr/local/sbin/cfdagent-iptables stop" in unit
-    assert "WantedBy=multi-user.target" in unit

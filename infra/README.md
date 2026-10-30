@@ -11,11 +11,11 @@ owner's explicit approval**, and every change carries a cost estimate.
 | Resource group | `rg-cfdagent` in `italynorth` |
 | Network (`vmLocation`) | VNet `vnet-cfdagent`, NSG `nsg-cfdagent` (one inbound allow rule: SSH 22 from any source; everything else denied), Standard static public IP `pip-cfdagent` |
 | VM (`vmLocation`) | `vm-cfdagent`, `Standard_D4as_v4` (4 vCPU, 16 GB), Ubuntu 24.04 LTS (Canonical `ubuntu-24_04-lts` / `server`, Gen2), SSH key only, system-assigned identity, 64 GiB StandardSSD_LRS OS disk |
-| Daily shutdown | systemd timer on the VM, 23:00 `Europe/Warsaw` and then every 10 minutes until 03:00 (parameters `shutdownTime`, `shutdownTimeZone`; applied only when the VM is created, see "Redeploying"); deferred while a run is active (see "Idle shutdown") |
+| Daily shutdown | systemd timer on the VM, 23:00 `Europe/Warsaw`, then every 10 minutes while the VM stays up (`OnUnitActiveSec`; a VM started after 23:00 is not touched until the next 23:00) (parameters `shutdownTime`, `shutdownTimeZone`; applied only when the VM is created, see "Redeploying"); deferred while a run is active (see "Idle shutdown") |
 | Idle shutdown | systemd timer every 5 min; deallocates after 30 idle minutes (see below) |
 | Storage (`vmLocation`) | StorageV2, LRS, Hot, shared keys disabled, TLS 1.2, no public blob access, container `runs`, lifecycle: Cool after 30 days |
 | AI Services | account `cfdagent-ai-<hash>` (custom subdomain) with deployments `gpt-oss-120b` and `Llama-3.3-70B-Instruct` (GlobalStandard, pay per token) |
-| Roles | VM identity: Storage Blob Data Contributor (container `runs` only, not the storage account), Cognitive Services OpenAI User (AI account), custom `cfdagent VM Deallocate` (read + deallocate, assigned on the VM only). Owner: Storage Blob Data Reader (storage), Cognitive Services OpenAI User (AI account) |
+| Roles | VM identity: Storage Blob Data Contributor (storage account today; scoped to the container `runs` in `roles.bicep`, effective after the owner-approved deploy and the deletion of the old account-scoped assignment), Cognitive Services OpenAI User (AI account), custom `cfdagent VM Deallocate` (read + deallocate, assigned on the VM only). Owner: Storage Blob Data Reader (storage), Cognitive Services OpenAI User (AI account) |
 | Budget | subscription budget `budget-cfdagent`, 100 USD per month, actual-cost alerts at 25/50/75/90 % |
 
 Outputs: `vmPublicIp`, `aiEndpoint` (OpenAI v1 base URL `https://<account>.services.ai.azure.com/openai/v1/`),
@@ -42,7 +42,7 @@ Outputs: `vmPublicIp`, `aiEndpoint` (OpenAI v1 base URL `https://<account>.servi
 - **Daily shutdown on the VM.** `Microsoft.DevTestLab/schedules` is not offered in any allowed region, so the
   daily shutdown is a systemd timer (`cfdagent-daily-shutdown.timer`) that runs the same deallocate call
   with `--daily`: it waits while `/var/lib/cfdagent/active-run` is younger than 4 hours, and the timer fires
-  again every 10 minutes between the shutdown time and four hours after it.
+  again every 10 minutes (`OnUnitActiveSec=10min`) for as long as the VM stays up.
 - **Metadata firewall.** `cfdagent-iptables.service` drops traffic from Docker bridge networks to the IMDS
   (169.254.169.254) and the WireServer (168.63.129.16, DNS excepted) in the `DOCKER-USER` chain, so a container
   cannot obtain the VM identity token. Executors run with `--network none` anyway. Runbook:

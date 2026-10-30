@@ -19,7 +19,7 @@ from `infra/vm/cloud-init.yaml` (through `infra/modules/vm.bicep`), so both path
 | Host environment `/opt/cfdagent-host`, `/etc/cfdagent/env`, `/usr/local/bin/cfdagent` | `vm-host-setup.sh` | not part of cloud-init; run `vm-host-setup.sh` after the first boot |
 | Metadata firewall (`cfdagent-iptables` script and unit) | `vm-host-setup.sh` | cloud-init |
 | sshd drop-in `20-cfdagent-ssh-extra.conf` | `vm-host-setup.sh`, guarded by `sshd -t` | cloud-init |
-| `idle-shutdown.sh --daily`, daily service, daily timer with 25 attempts | `vm-host-setup.sh` | cloud-init |
+| `idle-shutdown.sh --daily`, daily service, daily timer with the 10-minute retry | `vm-host-setup.sh` | cloud-init |
 | State and runs directories owned by the admin user | `vm-host-setup.sh` | cloud-init |
 | Container-scoped blob role, Entra-only AI account | Bicep deployment (owner approval) | Bicep deployment |
 
@@ -28,17 +28,33 @@ runs (about 0.5 h for the setup and the checks, about $0.10).
 
 ## 1. Prepare
 
-1. The Task 9 commit (or the ref you want) must be pushed to the public repository, and the image tag must be
-   published if you want the pull to succeed (tags are `sha-<7 characters>`, `latest` and release versions).
-2. Start the VM: `infra/scripts/vm-up.ps1`. Wait until `ssh cfdagent true` works.
-3. Look up the two endpoints (read-only):
+1. Choose `<repo-ref>`. **Prefer a commit id** (the full or short id of a commit on `main`): it is exact, and
+   the image tag `sha-<first 7 characters>` derives from it. The ref must be at or after the commit of the pull
+   request that added `scripts/vm-host-setup.sh` and the `infra/vm` files (the script checks every file and
+   stops with `ref <ref> does not contain infra/vm/<file>` otherwise). The pip build runs the repository's
+   build backend as root on the VM, so use only refs you trust.
+2. The image for that commit must be published (the CI publishes `sha-<7>`, `latest` and release tags for pushes
+   to `main` and for version tags). If it is not, the script finishes everything else, says so loudly and exits
+   with status 3; pass `--image <tag>` to use another tag.
+3. Start the VM: `infra/scripts/vm-up.ps1`. Wait until `ssh cfdagent true` works. Your `~/.ssh/config` entry
+   must contain `IdentitiesOnly yes` (see `infra/scripts/ssh-config.example`): with `MaxAuthTries 3`, an agent
+   that offers more than three keys is refused before the right key is tried.
+4. Look up the two endpoints (read-only):
    - `<llm-endpoint>`: deployment output `aiEndpoint` (`https://<account>.services.ai.azure.com/openai/v1/`).
    - `<storage-url>`: `https://<storageAccountName>.blob.core.windows.net`, with `storageAccountName` from the
      deployment outputs.
+5. No run may be under way: the script refuses while `/var/lib/cfdagent/active-run` is younger than 4 hours
+   (`--force-while-running` overrides that).
 
 ## 2. Run the setup script
 
-Over SSH (keep this session open until section 4 is done):
+Which form was verified: **none yet.** Both forms below are untested on the real VM; the script itself is tested
+offline (stubs and a local git repository) in `tests/unit/test_vm_host_setup.py`. Record in the pull request which
+form was used and its output.
+
+### 2.1 Over SSH (primary path for a person with the SSH key)
+
+Keep this session open until section 3 is done:
 
 ```bash
 scp scripts/vm-host-setup.sh cfdagent:/tmp/vm-host-setup.sh
@@ -46,29 +62,52 @@ ssh cfdagent sudo bash /tmp/vm-host-setup.sh <repo-ref> \
     --llm-endpoint <llm-endpoint> --storage-account-url <storage-url>
 ```
 
-`<repo-ref>` is a commit id, a branch or a tag. Optional: `--image <tag-or-reference>` (default `sha-<7>` for
-a commit id, otherwise `latest`), `--user <admin-user>` (default `azureuser`), `--shutdown-time <HHMM>` and
-`--timezone <zone>` (defaults 2300 and Europe/Warsaw, as in `main.bicep`).
+### 2.2 Through `az vm run-command` (primary path for the controller, who has no SSH key)
 
-Alternative without SSH, from the owner's machine (`az vm run-command` runs as root and is a write call on the
-VM, so it needs the same approval as any `az` call that changes something):
+`az vm run-command invoke --scripts @file` takes one script body and runs it as root. The tiny wrapper below
+embeds the arguments as variables and downloads the setup script from the public repository at the same ref.
+Keep the wrapper outside the repository (it holds endpoint names, not secrets, but they are deployment-specific):
+
+```bash
+#!/bin/bash
+set -euo pipefail
+REF='<repo-ref>'                       # a commit id
+LLM_ENDPOINT='<llm-endpoint>'
+STORAGE_URL='<storage-url>'
+curl -fsSL "https://raw.githubusercontent.com/mkrajew/cfd-agent/${REF}/scripts/vm-host-setup.sh" \
+    -o /tmp/vm-host-setup.sh
+bash /tmp/vm-host-setup.sh "${REF}" --llm-endpoint "${LLM_ENDPOINT}" --storage-account-url "${STORAGE_URL}"
+```
 
 ```powershell
 az vm run-command invoke --resource-group rg-cfdagent --name vm-cfdagent --command-id RunShellScript `
-    --scripts "@scripts/vm-host-setup.sh" `
-    --parameters "<repo-ref>" "--llm-endpoint" "<llm-endpoint>" "--storage-account-url" "<storage-url>"
+    --scripts "@<path-to-wrapper>.sh"
 ```
 
-The script is idempotent: run it again at any time, for example at the final commit of a milestone (Task 22).
-It prints a summary at the end. Exit status 3 means everything is in place except the image pull.
+`run-command` is a write operation on the VM (it needs the same approval as any `az` call that changes
+something). Its output is cut to the last few kilobytes: the summary at the end is what you see. Only one
+run-command can run at a time on a VM.
 
-What it does, in order: installs `git` and `python3-venv`; clones or updates `/opt/cfdagent-src`; builds
-`/opt/cfdagent-host` and pip-installs the repository (host dependencies only, no `toolchain` extra); writes
-`/etc/cfdagent/env` (mode 0640, group of the admin user); creates `~/runs` and `/var/lib/cfdagent`; installs the
-`/usr/local/bin/cfdagent` wrapper; installs the scripts and units and enables the firewall and both timers; installs the
-sshd drop-in (only after `sshd -t` accepts it; the previous drop-in is put back if not); pulls the image.
-Until the CLI of Task 21 is merged the wrapper points to a console script that does not exist yet and the
-script says so; run it again with a later ref.
+### 2.3 Options and behaviour
+
+Optional: `--image <tag-or-reference>` (default `sha-<first 7 characters of the installed commit>`),
+`--user <admin-user>` (default `azureuser`), `--shutdown-time <HHMM>` and `--timezone <zone>` (defaults 2300 and
+Europe/Warsaw, as in `main.bicep`), `--force-while-running`. The script also works when started with `sh`
+(it re-executes itself with bash).
+
+What it does, in order: refuses while a run is active; installs `git` and `python3-venv`; clones or updates
+`/opt/cfdagent-src` and checks that every `infra/vm` file exists at that ref; creates `~/runs` and
+`/var/lib/cfdagent`; installs the scripts and units and enables the firewall and both timers; installs the sshd
+drop-in (only after `sshd -t` accepts it; the previous drop-in is put back if not; sshd is reloaded only if it
+is running); builds `/opt/cfdagent-host` and pip-installs the repository (host dependencies only, no
+`toolchain` extra); writes `/etc/cfdagent/env` (mode 0640, group of the admin user, including the installed
+`CFDAGENT_COMMIT`) and the `/usr/local/bin/cfdagent` wrapper; pulls the image.
+
+The security items (firewall, SSH limits, shutdown) are installed before the steps that depend on PyPI and
+GHCR, so a network failure there leaves them in place. **A re-run is safe** at any time and after any failure;
+it is also how you move to a later ref. Until the CLI of Task 21 is merged the wrapper points to a console
+script that does not exist yet and the script says so; run it again with a later ref. Exit status 3 means
+everything is in place except the image pull.
 
 ## 3. Verify
 
@@ -124,31 +163,41 @@ sudo fail2ban-client status sshd
 
 Open a second `ssh cfdagent` session and confirm that it works before closing the first one. `AllowUsers` lets
 only the admin user in; if the check ever locks you out, use the rollback below through `az vm run-command`.
-The `docker` group is root-equivalent, so the key passphrase is the real access control.
+`MaxAuthTries 3` counts every key the client offers, so keep `IdentitiesOnly yes` in your SSH config. The
+`docker` group is root-equivalent, so the key passphrase is the real access control.
 
 ### 3.3 Shutdown deferral (E)
 
 ```bash
 systemctl list-timers 'cfdagent-*'
-systemctl cat cfdagent-daily-shutdown.timer | grep -c '^OnCalendar='          # 25
-systemctl cat cfdagent-daily-shutdown.service | grep ExecStart                 # ... --daily
+systemctl cat cfdagent-daily-shutdown.timer | grep -E '^(OnCalendar|OnUnitActiveSec)='   # 23:00 Europe/Warsaw, 10min
+systemctl cat cfdagent-daily-shutdown.service | grep ExecStart                           # ... --daily
 sudo -u <admin-user> touch /var/lib/cfdagent/active-run
 sudo cfdagent-idle-shutdown --daily --dry-run       # deferred: active run
 rm /var/lib/cfdagent/active-run
 sudo cfdagent-idle-shutdown --daily --dry-run       # dry run: would deallocate (daily shutdown)
 ```
 
-`cfdagent run` creates `/var/lib/cfdagent/active-run` and removes it when the run ends. A marker older than
-4 hours is ignored, so a crashed run cannot keep the VM up for more than 4 hours past the shutdown time. The
-daily timer fires at 23:00 and then every 10 minutes until 03:00 (Europe/Warsaw), so a deferred shutdown
-happens within 10 minutes after the run has ended; at 03:00 the last attempt only defers if the marker is
-younger than 4 hours. The 30-minute idle shutdown is unchanged and already treats a running `cfdagent` as busy.
+How the daily shutdown behaves:
+
+- The timer fires at the shutdown time (23:00 Europe/Warsaw by default) and then every 10 minutes
+  (`OnUnitActiveSec=10min`, counted from the last run of the service) for as long as the VM stays up.
+- `cfdagent run` creates `/var/lib/cfdagent/active-run` and removes it when the run ends. While the marker
+  exists and is younger than 4 hours, each attempt logs `deferred: active run` and does nothing. The shutdown
+  therefore happens within 10 minutes after the run ends, or at the latest 4 hours after the marker was last
+  written (a marker older than 4 hours is ignored with a log line, so a crashed run cannot keep the VM up).
+- A failed deallocation (ARM or IMDS error, after the script's own 3 attempts) is retried 10 minutes later.
+- **A VM started inside the night window, after the shutdown time, is not touched by the daily timer**: the
+  10-minute retries only begin after the timer's first activation in that boot (the next 23:00). The 30-minute
+  idle shutdown still applies to it.
+- The 30-minute idle shutdown is unchanged and already treats a running `cfdagent` as busy.
 
 ### 3.4 Host environment
 
 ```bash
 cfdagent --help || ls /opt/cfdagent-host/bin       # works once Task 21 is merged
 stat -c '%a %U:%G' /etc/cfdagent/env               # 640 root:<admin group>
+grep CFDAGENT_COMMIT /etc/cfdagent/env             # the installed commit
 docker image ls ghcr.io/mkrajew/cfd-agent
 ```
 
@@ -156,7 +205,8 @@ Then deallocate: `infra/scripts/vm-down.ps1` (or wait for the idle shutdown).
 
 ## 4. Entra-only redeploy and container-scoped blob role (S7)
 
-This part changes Azure resources: show the owner the `what-if` and this cost note first.
+This part changes Azure resources: show the owner the `what-if` and this cost note first. Until the steps
+below are done, the VM identity still has Storage Blob Data Contributor on the whole storage account.
 
 - Cost: no new billable resource (role assignments and the account setting are free); expected change in the
   monthly estimate: none.
@@ -168,9 +218,9 @@ This part changes Azure resources: show the owner the `what-if` and this cost no
   storage account scope is **not** removed by the deployment, because its name is derived from the scope; it
   stays until it is deleted explicitly (step 5). Until then the container scoping has no effect.
 - **Stop and ask if the what-if shows the VM, its disk, its NIC or its IP being replaced, or an error about
-  `customData`.** The VM module embeds the cloud-init files, and they changed in this task (new firewall,
-  SSH and timer files), so a full redeploy of `main.bicep` modifies `osProfile.customData` of the existing VM,
-  which Azure does not allow. If that happens, do not recreate the VM; deploy only the pieces that matter, as
+  `customData`.** The VM module embeds the cloud-init files, and they changed (new firewall, SSH and timer
+  files), so a full redeploy of `main.bicep` modifies `osProfile.customData` of the existing VM, which Azure
+  does not allow. If that happens, do not recreate the VM; deploy only the pieces that matter, as
   group-scope deployments of `infra/modules/roles.bicep` (parameters `vmName`, `vmPrincipalId` from
   `az vm show --query identity.principalId`, `storageAccountName`, `aiAccountName`, `ownerObjectId`) and
   `infra/modules/foundry.bicep` (or `az cognitiveservices account update` for `disableLocalAuth`), after the
@@ -200,7 +250,7 @@ above that only the `runs` container assignment remains.
 |---|---|
 | sshd drop-in | `rm /etc/ssh/sshd_config.d/20-cfdagent-ssh-extra.conf; sshd -t && systemctl reload ssh` |
 | Firewall | `systemctl disable --now cfdagent-iptables` (the stop action removes the rules); remove `/etc/systemd/system/cfdagent-iptables.service` and `/usr/local/sbin/cfdagent-iptables` for a full removal, then `systemctl daemon-reload` |
-| Deferral | edit `/etc/systemd/system/cfdagent-daily-shutdown.service` so that ExecStart ends in `--force`, `systemctl daemon-reload`; the timer may keep its 25 entries |
+| Deferral | edit `/etc/systemd/system/cfdagent-daily-shutdown.service` so that ExecStart ends in `--force`, remove the `OnUnitActiveSec` line from the timer, `systemctl daemon-reload && systemctl restart cfdagent-daily-shutdown.timer` |
 | Host environment | `rm -r /opt/cfdagent-host /opt/cfdagent-src /usr/local/bin/cfdagent /etc/cfdagent` |
 | Blob role | re-create the account-scoped assignment (Bicep: `scope: storage` in `roles.bicep`); needs approval |
 | Entra-only | `disableLocalAuth=false` in the parameters, redeploy; needs approval |

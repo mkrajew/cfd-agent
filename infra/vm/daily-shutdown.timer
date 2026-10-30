@@ -3,11 +3,14 @@ Description=Daily shutdown of the VM
 
 [Timer]
 # The OnCalendar placeholder below is replaced by infra/modules/vm.bicep (new VMs) or by
-# scripts/vm-host-setup.sh (running VM) with one value per attempt: the shutdown time from the
-# shutdownTime and shutdownTimeZone parameters, then every 10 minutes for 4 hours after it (23:00
-# to 03:00 by default). Every attempt runs cfdagent-idle-shutdown --daily, which defers while a run
-# is active.
+# scripts/vm-host-setup.sh (running VM) with the shutdown time from the shutdownTime and
+# shutdownTimeZone parameters (23:00 Europe/Warsaw by default).
 OnCalendar=__ON_CALENDAR__
+# After the first activation in this boot the service runs again every 10 minutes. The service
+# (cfdagent-idle-shutdown --daily) defers while a run is active and retries a failed deallocation, so
+# the shutdown happens shortly after the run has ended. A VM started after the shutdown time has had
+# no activation yet, so this timer leaves it alone until the next shutdown time.
+OnUnitActiveSec=10min
 Persistent=false
 
 [Install]

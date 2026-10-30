@@ -30,11 +30,14 @@ def test_cloud_init_installs_the_firewall_ssh_drop_in_and_daily_deferral():
     assert "cfdagent-daily-shutdown.timer" in CLOUD_INIT
 
 
-def test_the_daily_service_defers_and_the_timer_keeps_one_placeholder():
+def test_the_daily_service_defers_and_the_timer_retries_every_ten_minutes():
     service = (VM_DIR / "daily-shutdown.service").read_text(encoding="utf-8")
     assert "ExecStart=/usr/local/sbin/cfdagent-idle-shutdown --daily" in service
     timer = (VM_DIR / "daily-shutdown.timer").read_text(encoding="utf-8")
     assert timer.count("__ON_CALENDAR__") == 1, "a second mention would be replaced as well"
+    assert "OnUnitActiveSec=10min" in timer
+    assert len(re.findall(r"^OnCalendar=", timer, re.MULTILINE)) == 1
+    assert "range(" not in VM_BICEP, "the timer needs no generated list of attempts"
 
 
 def test_firewall_unit_is_ordered_after_docker_and_removes_its_rules_on_stop():
