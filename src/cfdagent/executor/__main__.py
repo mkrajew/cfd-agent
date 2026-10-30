@@ -3,8 +3,9 @@
 Reads ``<job>/.sandbox/<id>.request.json``, runs the op, writes ``<id>.response.json`` atomically.
 The job directory is the current directory (``/job`` in the container). Exit code 0 means a
 response was written (whether the op succeeded or not), 2 a bad command line (no response is
-possible; also 2 when HOME is unset or inside the job directory, see ``home_problem``), 1 that
-the response could not be written. Diagnostics go to stderr.
+possible; also 2 when HOME is unset or inside the job directory, see ``home_problem``; that check
+runs only where OpenFOAM can run, i.e. with ``WM_PROJECT_DIR`` set, which the image entrypoint
+guarantees), 1 that the response could not be written. Diagnostics go to stderr.
 
 While ops run, file descriptor 1 is pointed at stderr: OpenCASCADE and OpenFOAM libraries print
 to stdout, and nothing on stdout is ever parsed.
@@ -98,7 +99,13 @@ def _stdout_to_stderr() -> None:
 
 
 if __name__ == "__main__":
-    _problem = home_problem(os.environ.get("HOME"), Path.cwd())
+    # Only where OpenFOAM can run (the image entrypoint refuses to start without its environment):
+    # HOME is often unset on a plain Windows host, where only unit tests use local mode.
+    _problem = (
+        home_problem(os.environ.get("HOME"), Path.cwd())
+        if os.environ.get("WM_PROJECT_DIR")
+        else None
+    )
     if _problem is not None:
         print(f"the executor does not start: {_problem}", file=sys.stderr)
         sys.exit(2)

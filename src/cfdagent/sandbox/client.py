@@ -14,7 +14,9 @@ container that was created but never started.
 
 ``mode="local"`` runs ``python -m cfdagent.executor`` as a subprocess of the caller. It is NOT
 confined (no container, no network cut); it exists for the tests that already run inside the
-image. The child gets only the scrubbed environment of ``SAFE_ENV_*``.
+image. The child gets only the scrubbed environment of ``SAFE_ENV_*``. Inside the image (where
+``WM_PROJECT_DIR`` is set) the executor also refuses to start when ``HOME`` is unset or lies in
+the job directory, so local mode there needs a ``HOME`` outside the run directory.
 
 This module is host-side: it imports no tool, CAD or mesh code.
 """

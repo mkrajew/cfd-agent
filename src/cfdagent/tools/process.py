@@ -49,9 +49,8 @@ CODE_REFUSAL_HINT = (
     "OpenFOAM refused case-supplied code: dictionaries carrying their own C++ or shell commands "
     "(#codeStream, #calc, coded patch types/function objects/sources, systemCall) are disabled "
     "here, and no file can switch allowSystemOperations on. Use plain numbers, #eval "
-    "expressions, expression patch types (exprFixedValue), uniformFixedValue with a Function1 "
-    "(table, sine, ...), or compute the values in a script and write them out as plain numbers "
-    "or a nonuniform list."
+    "expressions, uniformFixedValue with a Function1 (table, sine, ...), or compute "
+    "the values in a script and write them out as plain numbers or a nonuniform list."
 )
 # Only phrases that occur in a refusal. NOT the word ``allowSystemOperations`` on its own: every
 # solver log prints a banner line ``allowSystemOperations : Disallowing user-supplied ...``.

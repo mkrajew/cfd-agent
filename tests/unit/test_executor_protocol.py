@@ -494,10 +494,11 @@ def test_code_refusal_hint_is_general_and_only_added_for_the_refusal():
     assert process.code_refusal_hint("nothing special") is None
     hint = process.code_refusal_hint(_REFUSAL)
     assert hint is not None
-    assert "#eval" in hint and "plain numbers" in hint and "exprFixedValue" in hint
+    assert "#eval" in hint and "plain numbers" in hint and "uniformFixedValue" in hint
     # The generality rule: the hint names no benchmark case.
     for word in ("cavity", "pipe", "cylinder"):
         assert word not in hint.lower()
+    assert "exprFixedValue" not in hint  # deprecated in v2512
     assert process.code_refusal_hint("Executing user-supplied system calls is disabled") == hint
 
 
@@ -577,7 +578,13 @@ def test_the_executor_refuses_to_start_with_a_home_in_the_job_directory(tmp_path
     job = tmp_path / "job"
     job.mkdir()
     source = str(Path(cfdagent.__file__).parents[1])
-    env = {**os.environ, "HOME": str(job / "home"), "PYTHONPATH": source}
+    # WM_PROJECT_DIR marks "OpenFOAM can run here": the guard only applies then.
+    env = {
+        **os.environ,
+        "HOME": str(job / "home"),
+        "PYTHONPATH": source,
+        "WM_PROJECT_DIR": "/openfoam",
+    }
     done = subprocess.run(
         [sys.executable, "-P", "-m", "cfdagent.executor", "run_script", ".sandbox/c1.request.json"],
         cwd=job,
@@ -587,3 +594,13 @@ def test_the_executor_refuses_to_start_with_a_home_in_the_job_directory(tmp_path
     )
     assert done.returncode == 2
     assert "HOME" in done.stderr
+    # Without the OpenFOAM environment (a plain host) the guard is not applied.
+    del env["WM_PROJECT_DIR"]
+    done = subprocess.run(
+        [sys.executable, "-P", "-m", "cfdagent.executor", "run_script", ".sandbox/c1.request.json"],
+        cwd=job,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert "HOME" not in done.stderr

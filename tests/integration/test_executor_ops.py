@@ -151,3 +151,25 @@ def test_an_ordinary_failure_carries_no_refusal_hint(job, op):
     assert response.ok is False and response.internal is False, response
     assert "case-supplied code" not in response.error, response.error
     assert "plain numbers" not in response.error, response.error
+
+
+UNIFORM_VALUES = {
+    "table": "uniformValue table ((0 (1 0 0)) (1 (2 0 0)));",
+    "sine": ("uniformValue { type sine; amplitude 1; frequency 2; scale (1 0 0); level (1 0 0); }"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(UNIFORM_VALUES))
+def test_uniform_fixed_value_with_a_function1_works_where_coded_patches_are_refused(job, name):
+    """The alternative the refusal hint recommends really runs, with no refusal and no warning."""
+    client, run_dir = job
+    field = run_dir.read_text("case/0/U")
+    plain = "type            fixedValue;\n        value           uniform (1 0 0);"
+    assert plain in field
+    function1 = f"type            uniformFixedValue;\n        {UNIFORM_VALUES[name]}"
+    run_dir.write_text("case/0/U", field.replace(plain, function1, 1))
+    response = client.call("run_solver", {"case_dir": "case", "solver": "icoFoam"}, timeout_s=300)
+    assert response.ok, response.error
+    log = run_dir.read_text("case/log.icoFoam", max_bytes=5_000_000)
+    assert "case-supplied code" not in log
+    assert "eprecat" not in log
