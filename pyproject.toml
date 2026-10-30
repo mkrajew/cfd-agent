@@ -18,6 +18,7 @@ dependencies = [
     "httpx2",
     "azure-identity",
     "azure-storage-blob",
+    "zstandard>=0.25.0",
 ]
 
 [project.optional-dependencies]
