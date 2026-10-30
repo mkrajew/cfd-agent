@@ -162,6 +162,56 @@ def test_planner_gate_rejects_an_empty_bbox_axis():
     assert "bbox" in result.errors[0] and "y" in result.errors[0]
 
 
+def boundary(name):
+    return {"name": name, "role": "wall", "description": "somewhere"}
+
+
+def test_planner_gate_rejects_an_empty_boundary_list():
+    result = plan_gate(make_spec(boundaries=[]), TASK, LIMITS)
+    assert not result.ok and len(result.errors) == 1
+    assert "boundaries" in result.errors[0] and "list every boundary" in result.errors[0]
+
+
+@pytest.mark.parametrize(
+    "name", ["top wall", "inlet-1", "1inlet", "_inlet", "", "région", "inlet\n"]
+)
+def test_planner_gate_rejects_boundary_names_a_patch_cannot_have(name):
+    result = plan_gate(make_spec(boundaries=[boundary("inlet"), boundary(name)]), TASK, LIMITS)
+    assert not result.ok and len(result.errors) == 1
+    assert "boundaries[1].name" in result.errors[0]
+    assert "letters, digits and underscores" in result.errors[0]
+
+
+def test_planner_gate_accepts_plain_identifier_boundary_names():
+    names = ["inlet", "Outlet_2", "a", "wall_top_1"]
+    assert plan_gate(make_spec(boundaries=[boundary(n) for n in names]), TASK, LIMITS).ok
+
+
+def test_planner_gate_rejects_duplicate_boundary_names_once_per_name():
+    boundaries = [boundary("wall"), boundary("inlet"), boundary("wall"), boundary("wall")]
+    result = plan_gate(make_spec(boundaries=boundaries), TASK, LIMITS)
+    assert not result.ok and len(result.errors) == 1
+    assert "`wall`" in result.errors[0] and "more than once" in result.errors[0]
+
+
+def test_planner_gate_shortens_a_very_long_boundary_name_in_its_message():
+    name = "x" * 400 + " bad"
+    result = plan_gate(make_spec(boundaries=[boundary(name)]), TASK, LIMITS)
+    assert not result.ok and name not in result.errors[0] and len(result.errors[0]) < 400
+
+
+def test_boundary_name_rule_is_the_one_of_the_manifest():
+    """A name that the planner accepts must be a name that a manifest patch accepts."""
+    from cfdagent import manifest
+    from cfdagent.agents import planner
+
+    assert planner.PATCH_NAME_PATTERN == manifest.PATCH_NAME_PATTERN
+    field = manifest.BoundaryPatch.model_fields["name"]
+    assert [m.pattern for m in field.metadata if hasattr(m, "pattern")] == [
+        manifest.PATCH_NAME_PATTERN
+    ]
+
+
 def test_planner_gate_rejects_a_nonpositive_end_time():
     for bad in (0.0, -5.0):
         spec = make_spec(solver={**SPEC["solver"], "end_time_s": bad})
@@ -611,6 +661,8 @@ def test_planner_prompt_states_the_required_instructions():
         "use it exactly as the `name`",
         "two separate `wedge` boundaries, one per face",
         "one `empty` boundary",
+        "letters, digits and underscores",
+        "axis line",
         "requested_outputs",
     ):
         assert phrase in text, phrase
