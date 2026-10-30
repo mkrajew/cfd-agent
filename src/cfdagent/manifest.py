@@ -15,6 +15,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from cfdagent.errors import AgentInputError
 
 MANIFEST_FILE_NAME = "boundary_manifest.json"
+# The rule for a patch name; the planner gate checks the plan's boundary names with it.
+PATCH_NAME_PATTERN = r"^[A-Za-z][A-Za-z0-9_]*$"
 
 
 class ManifestError(AgentInputError):
@@ -58,7 +60,7 @@ class BoundaryPatch(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_]*$")
+    name: str = Field(pattern=PATCH_NAME_PATTERN)
     type: Literal["patch", "wall", "empty", "symmetryPlane", "symmetry", "wedge"]
     locators: list[Locator] = Field(min_length=1)
 

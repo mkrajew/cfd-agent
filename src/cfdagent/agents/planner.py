@@ -45,6 +45,7 @@ from cfdagent.llm.client import (
     ToolCall,
     TruncatedOutputError,
 )
+from cfdagent.manifest import PATCH_NAME_PATTERN
 from cfdagent.prompts import load_prompt
 from cfdagent.record import AttemptRecord
 
@@ -61,6 +62,8 @@ MAX_FEEDBACK_CHARS = 4000
 
 _BACKTICKED = re.compile(r"`([^`\n]+)`")
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_BOUNDARY_NAME = re.compile(PATCH_NAME_PATTERN)
+MAX_NAME_CHARS_SHOWN = 40
 
 SHORTER_ADVICE = (
     "Reply again with the complete CaseSpec as one JSON object; keep every text field to one or "
@@ -195,6 +198,39 @@ def _geometry_errors(spec: CaseSpec) -> list[str]:
     return errors
 
 
+def _shown(name: str) -> str:
+    return name if len(name) <= MAX_NAME_CHARS_SHOWN else name[:MAX_NAME_CHARS_SHOWN] + "..."
+
+
+def _boundary_errors(spec: CaseSpec) -> list[str]:
+    """The boundary names become patch names of the manifest, the mesh and the case, so they
+    must be usable as such: at least one boundary, valid identifiers, each name once."""
+    if not spec.boundaries:
+        return [
+            "boundaries is empty; list every boundary surface of the fluid domain, each with a "
+            "name, a role and a description"
+        ]
+    errors = []
+    seen: set[str] = set()
+    repeated: list[str] = []
+    for index, boundary in enumerate(spec.boundaries):
+        name = boundary.name
+        if not _BOUNDARY_NAME.fullmatch(name):
+            errors.append(
+                f"boundaries[{index}].name {_shown(name)!r} cannot be a patch name; use letters, "
+                "digits and underscores only, starting with a letter (for example `topWall`)"
+            )
+        if name in seen and name not in repeated:
+            repeated.append(name)
+        seen.add(name)
+    for name in repeated:
+        errors.append(
+            f"the boundary name `{_shown(name)}` is used more than once; every boundary needs "
+            "its own name"
+        )
+    return errors
+
+
 def _solver_errors(spec: CaseSpec) -> list[str]:
     errors = []
     end = spec.solver.end_time_s
@@ -286,6 +322,7 @@ def plan_gate(spec: CaseSpec, task_text: str, limits: RunLimits) -> GateResult:
     errors += _property_errors(spec)
     errors += _reynolds_errors(spec)
     errors += _geometry_errors(spec)
+    errors += _boundary_errors(spec)
     errors += _solver_errors(spec)
     errors += _resource_errors(spec, limits)
     return GateResult(not errors, errors)
