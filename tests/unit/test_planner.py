@@ -609,6 +609,8 @@ def test_planner_prompt_states_the_required_instructions():
         "Flow regime",
         "symmetry",
         "use it exactly as the `name`",
+        "two separate `wedge` boundaries, one per face",
+        "one `empty` boundary",
         "requested_outputs",
     ):
         assert phrase in text, phrase
