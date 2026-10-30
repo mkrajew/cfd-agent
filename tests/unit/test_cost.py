@@ -75,3 +75,55 @@ def test_negative_limit_or_prices_are_rejected():
         CostTracker(limit_usd=-1.0, pricing=PRICE)
     with pytest.raises(ValueError, match="price"):
         Pricing(-0.1, 0.5)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        Usage(-1, 5, None),
+        Usage(5, -1, None),
+        Usage("5", 5, None),
+        Usage(5, 5.0, None),
+        Usage(None, 5, None),
+        Usage(5, None, None),
+        Usage(True, 5, None),
+    ],
+)
+def test_implausible_usage_is_estimated_from_chars(bad):
+    tracker = CostTracker(limit_usd=1.0, pricing=PRICE)
+    tracker.add(bad, prompt_chars=30, completion_chars=60)
+    assert tracker.estimated is True
+    assert (tracker.tokens_in, tracker.tokens_out) == (10, 20)
+
+
+def test_zero_usage_is_real_usage():
+    tracker = CostTracker(limit_usd=1.0, pricing=PRICE)
+    tracker.add(usage(0, 0), prompt_chars=300, completion_chars=300)
+    assert tracker.estimated is False
+    assert (tracker.tokens_in, tracker.tokens_out, tracker.total_usd) == (0, 0, 0.0)
+
+
+def test_add_is_atomic_when_it_fails_before_recording():
+    tracker = CostTracker(limit_usd=1.0, pricing=PRICE)
+    tracker.add(usage(100, 100), 0, 0)
+    before = (tracker.total_usd, tracker.tokens_in, tracker.tokens_out, tracker.estimated)
+    with pytest.raises(TypeError):
+        tracker.add(None, prompt_chars="many", completion_chars=3)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="chars"):
+        tracker.add(None, prompt_chars=-1, completion_chars=3)
+    after = (tracker.total_usd, tracker.tokens_in, tracker.tokens_out, tracker.estimated)
+    assert after == before
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf"), -0.5])
+def test_pricing_rejects_non_finite_and_negative(bad):
+    with pytest.raises(ValueError, match="price"):
+        Pricing(bad, 1.0)
+    with pytest.raises(ValueError, match="price"):
+        Pricing(1.0, bad)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf"), -1.0])
+def test_cost_limit_rejects_non_finite_and_negative(bad):
+    with pytest.raises(ValueError, match="limit"):
+        CostTracker(limit_usd=bad, pricing=PRICE)

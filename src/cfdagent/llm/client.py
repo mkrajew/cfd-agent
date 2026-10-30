@@ -3,11 +3,12 @@
 import json
 import os
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 import httpx2
 import openai
 from azure.core.credentials import TokenCredential
+from azure.core.exceptions import ClientAuthenticationError
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from pydantic import BaseModel, ValidationError
 
@@ -40,13 +41,41 @@ class Usage:
     reasoning_tokens: int | None
 
 
+def _is_count(value: Any) -> bool:
+    return type(value) is int and value >= 0
+
+
+def usage_is_known(usage: Usage | None) -> bool:
+    """True if `usage` holds real token counts: ints (not bool, float or str) that are >= 0."""
+    return (
+        usage is not None and _is_count(usage.prompt_tokens) and _is_count(usage.completion_tokens)
+    )
+
+
+def _usage_from_sdk(raw: Any) -> Usage | None:
+    """Build a `Usage` from the SDK's usage object, or `None` if it is missing or implausible.
+
+    The SDK does not validate responses, so a service can send `{}`, nulls, one field only,
+    negative numbers or strings. Any of that is "unknown" (never 0); the cost tracker then
+    estimates from text length.
+    """
+    if raw is None:
+        return None
+    prompt = getattr(raw, "prompt_tokens", None)
+    completion = getattr(raw, "completion_tokens", None)
+    if not (_is_count(prompt) and _is_count(completion)):
+        return None
+    reasoning = getattr(getattr(raw, "completion_tokens_details", None), "reasoning_tokens", None)
+    return Usage(prompt, completion, reasoning if _is_count(reasoning) else None)
+
+
 @dataclass(frozen=True)
 class ChatResult:
     """One model reply.
 
-    `usage` is `None` when the service reported none (unknown, never 0); `CostTracker` then
-    estimates from text length. `finish_reason` is the service's value ("stop", "tool_calls",
-    "length", ...) or `None` if it sent none.
+    `usage` is `None` when the service reported none or an implausible one (unknown, never 0);
+    `CostTracker` then estimates from text length. `finish_reason` is the service's value
+    ("stop", "tool_calls", "length", ...) or `None` if it sent none.
     """
 
     content: str | None
@@ -58,11 +87,12 @@ class ChatResult:
 
 
 class LLMError(Exception):
-    """Base class of the errors raised by this package for a bad or unusable model reply.
+    """Base class of the errors raised by this package when a model call fails or its reply is
+    unusable.
 
-    Transport and HTTP status failures (after the SDK's own retries) propagate as the `openai`
-    exceptions (`openai.APIStatusError`, `openai.APIConnectionError`, ...). Errors raised for a
-    reply that did arrive carry its `usage` (or `None`) so the caller can still bill it.
+    Errors raised for a reply that did arrive carry its `usage` (or `None`) so the caller can
+    still bill it. `SchemaError` is deliberately NOT a subclass: it is a programming error that a
+    retry loop catching `LLMError` must never swallow.
     """
 
     def __init__(self, message: str, *, usage: Usage | None = None):
@@ -70,12 +100,47 @@ class LLMError(Exception):
         self.usage = usage
 
 
+def retryable_status(status_code: int | None) -> bool:
+    """Whether an HTTP status is worth retrying later: timeouts, conflicts, rate limits, 5xx."""
+    return status_code is not None and (status_code in (408, 409, 429) or status_code >= 500)
+
+
+class LLMTransportError(LLMError):
+    """The request failed before a usable reply arrived (after the SDK's own retries).
+
+    `status_code` is the HTTP status, or `None` for connection, timeout and authentication
+    failures. `retryable` says whether the same call can succeed later (rate limit, server
+    error, timeout, dropped connection) or not (bad request, authentication failure, missing
+    permission). The original exception is kept as `__cause__`.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retryable: bool = False,
+        usage: Usage | None = None,
+    ):
+        super().__init__(message, usage=usage)
+        self.status_code = status_code
+        self.retryable = retryable
+
+
 class EmptyChoicesError(LLMError):
     """The service answered 200 with an empty `choices` list."""
 
 
-class SchemaError(LLMError):
-    """A pydantic model cannot be used as a strict structured-output schema."""
+class MalformedReplyError(LLMError):
+    """The service answered 200 but the first choice has no message."""
+
+
+class SchemaError(Exception):
+    """A pydantic model cannot be used as a strict structured-output schema.
+
+    This is a programming error in the model definition, so it derives from `Exception` and not
+    from `LLMError`: retrying cannot help and an `except LLMError` retry loop does not hide it.
+    """
 
 
 class StructuredOutputError(LLMError):
@@ -116,9 +181,14 @@ def parse_structured(
     except ValidationError as exc:
         if finish_reason == "length":
             raise TruncatedOutputError(text, finish_reason, usage=usage) from exc
-        raise StructuredOutputError("reply does not match schema", text, usage=usage) from exc
+        if finish_reason == "content_filter":
+            message = "reply withheld by the content filter (finish_reason='content_filter')"
+        else:
+            message = "reply does not match schema"
+        raise StructuredOutputError(message, text, usage=usage) from exc
 
 
+@runtime_checkable
 class ChatBackend(Protocol):
     """What an agent needs from a model: `LLMClient` and `ScriptedBackend` both provide it."""
 
@@ -159,6 +229,7 @@ def assistant_message(result: ChatResult) -> dict:
 
 _SCHEMA_MAP_KEYWORDS = ("$defs", "definitions")  # keyword -> {name: schema}
 _SCHEMA_LIST_KEYWORDS = ("anyOf", "allOf", "oneOf", "prefixItems")  # keyword -> [schema, ...]
+_TYPING_KEYWORDS = ("type", "$ref", "anyOf", "allOf", "oneOf", "enum", "const")
 
 
 def _map_error(path: str) -> SchemaError:
@@ -174,23 +245,34 @@ def strict_schema(node: Any, _path: str = "$") -> Any:
     Strict mode needs every object to be closed (`additionalProperties: false`) and to list all
     of its properties in `required`. Pydantic omits defaulted and `Optional` fields from
     `required`; here they are required too, so a model must always emit them (use a nullable type
-    to let the model say "no value"). Defaults still apply when the reply is validated.
+    to let the model say "no value"). `default` keywords are removed from properties; defaults
+    still apply when the reply is validated.
     Only schema keywords are followed, so a field that happens to be named `properties` or
     `items` is not mistaken for a keyword.
 
     Raises `SchemaError` for a map: an object whose `additionalProperties` is a schema
-    (`dict[str, X]`) or an object without declared properties (`dict`). Closing such an object
-    would leave the model only `{}` to say, silently losing the data, so it is refused.
+    (`dict[str, X]`) or an object without declared properties (`dict`), because closing it would
+    leave the model only `{}` to say and silently lose the data. A field typed `Any` (a schema
+    with no type, reference or union) is refused too: the service cannot constrain it.
     """
     if not isinstance(node, dict):
         return node
     out = dict(node)
+    if _path != "$" and not any(key in out for key in _TYPING_KEYWORDS):
+        raise SchemaError(
+            f"schema field {_path} has no type (an `Any` field); give it a concrete type so the "
+            "service can constrain it."
+        )
     props = out.get("properties")
     if isinstance(out.get("additionalProperties"), dict):
         raise _map_error(_path)
     if isinstance(props, dict):
         out["properties"] = {
-            name: strict_schema(sub, f"{_path}.{name}") for name, sub in props.items()
+            name: strict_schema(
+                {k: v for k, v in sub.items() if k != "default"} if isinstance(sub, dict) else sub,
+                f"{_path}.{name}",
+            )
+            for name, sub in props.items()
         }
         out["required"] = list(props)
         out["additionalProperties"] = False
@@ -210,6 +292,18 @@ def strict_schema(node: Any, _path: str = "$") -> Any:
 
 
 class LLMClient:
+    """Chat client; implements `ChatBackend`.
+
+    Failures that prevent a reply are raised as `LLMTransportError` (HTTP status errors,
+    connection and timeout errors, authentication failures) with the original exception as
+    `__cause__`. Replies that arrive but are unusable raise the other `LLMError` subclasses.
+
+    Cost caution: the SDK retries a failed or stalled request `settings.max_retries` times
+    (default 2) with `settings.timeout` seconds (default 120) per attempt. A call that stalls
+    after the service has started to generate can be billed up to 3 times without the cost
+    tracker seeing any of it. Runs that enforce a cost cap should use `max_retries=1`.
+    """
+
     def __init__(
         self,
         settings: LLMSettings,
@@ -268,21 +362,33 @@ class LLMClient:
         if response_format is not None:
             params["response_format"] = response_format
 
-        response = self.openai_client.chat.completions.create(**params)
+        try:
+            response = self.openai_client.chat.completions.create(**params)
+        except openai.APIStatusError as exc:
+            raise LLMTransportError(
+                f"HTTP {exc.status_code} from the model service: {exc.message}",
+                status_code=exc.status_code,
+                retryable=retryable_status(exc.status_code),
+            ) from exc
+        except openai.APIConnectionError as exc:  # includes APITimeoutError
+            raise LLMTransportError(
+                f"could not reach the model service ({type(exc).__name__}: {exc.message})",
+                retryable=True,
+            ) from exc
+        except ClientAuthenticationError as exc:
+            raise LLMTransportError(
+                f"authentication failed ({type(exc).__name__}); is `az login` current? {exc}",
+                retryable=False,
+            ) from exc
 
-        usage = None
-        if response.usage is not None:
-            details = getattr(response.usage, "completion_tokens_details", None)
-            usage = Usage(
-                prompt_tokens=response.usage.prompt_tokens,
-                completion_tokens=response.usage.completion_tokens,
-                reasoning_tokens=getattr(details, "reasoning_tokens", None),
-            )
+        usage = _usage_from_sdk(response.usage)
 
         if not response.choices:
             raise EmptyChoicesError("the service returned no choices", usage=usage)
         choice = response.choices[0]
         message = choice.message
+        if message is None:
+            raise MalformedReplyError("the first choice has no message", usage=usage)
         content = message.content
 
         tool_calls = []
@@ -305,6 +411,6 @@ class LLMClient:
             tool_calls=tool_calls,
             usage=usage,
             parsed=parsed,
-            raw=response.model_dump(),
+            raw=response.model_dump(warnings=False),
             finish_reason=choice.finish_reason,
         )

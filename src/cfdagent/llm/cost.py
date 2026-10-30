@@ -9,7 +9,7 @@ import math
 from dataclasses import dataclass
 from decimal import Decimal
 
-from cfdagent.llm.client import Usage
+from cfdagent.llm.client import Usage, usage_is_known
 
 _PER_MILLION = Decimal(1_000_000)
 # Without a usage report from the service a token count is estimated from the text length.
@@ -26,8 +26,9 @@ class Pricing:
     output_per_m: float
 
     def __post_init__(self) -> None:
-        if self.input_per_m < 0 or self.output_per_m < 0:
-            raise ValueError("price per million tokens must not be negative")
+        for value in (self.input_per_m, self.output_per_m):
+            if not math.isfinite(value) or value < 0:
+                raise ValueError("price per million tokens must be finite and not negative")
 
 
 # Keyed by Foundry deployment name. Pay-per-token global deployments, read from the public Azure
@@ -57,8 +58,8 @@ class CostTracker:
     """
 
     def __init__(self, limit_usd: float, pricing: Pricing):
-        if limit_usd < 0:
-            raise ValueError("cost limit must not be negative")
+        if not math.isfinite(limit_usd) or limit_usd < 0:
+            raise ValueError("cost limit must be finite and not negative")
         self._limit = Decimal(str(limit_usd))
         self._limit_float = limit_usd
         self._price_in = Decimal(str(pricing.input_per_m))
@@ -69,19 +70,35 @@ class CostTracker:
         self._estimated = False
 
     def add(self, usage: Usage | None, prompt_chars: int, completion_chars: int) -> None:
-        """Record one call. With `usage=None` the tokens are estimated from the character counts
-        (rounded up) and the tracker is flagged `estimated`; the flag never clears."""
-        if usage is None:
+        """Record one call. If `usage` is `None` or implausible (see `usage_is_known`) the tokens
+        are estimated from the character counts (rounded up) and the tracker is flagged
+        `estimated`; the flag never clears.
+
+        Atomic: all new totals are computed first and assigned together, so a failure while
+        computing leaves the tracker unchanged. The call is recorded before the cap is checked,
+        so the overrun is visible in the totals when `CostLimitExceeded` is raised.
+        """
+        estimated = not usage_is_known(usage)
+        if estimated:
+            for chars in (prompt_chars, completion_chars):
+                if not isinstance(chars, int) or isinstance(chars, bool):
+                    raise TypeError("prompt_chars and completion_chars must be integers")
+                if chars < 0:
+                    raise ValueError("prompt_chars and completion_chars must not be negative")
             tokens_in = math.ceil(prompt_chars / CHARS_PER_TOKEN)
             tokens_out = math.ceil(completion_chars / CHARS_PER_TOKEN)
-            self._estimated = True
         else:
+            assert usage is not None
             tokens_in = usage.prompt_tokens
             tokens_out = usage.completion_tokens
+        total = (
+            self._total + (tokens_in * self._price_in + tokens_out * self._price_out) / _PER_MILLION
+        )
         self._tokens_in += tokens_in
         self._tokens_out += tokens_out
-        self._total += (tokens_in * self._price_in + tokens_out * self._price_out) / _PER_MILLION
-        if self._total > self._limit:
+        self._estimated = self._estimated or estimated
+        self._total = total
+        if total > self._limit:
             raise CostLimitExceeded(self.total_usd, self._limit_float)
 
     @property
