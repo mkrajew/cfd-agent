@@ -1,22 +1,29 @@
 """Unit tests for the agent tool registry, the calculator and the scoped file tools."""
 
+import errno
 import os
+import sys
 
 import pytest
 from pydantic import BaseModel
 
+from cfdagent.agents import tools as tools_module
 from cfdagent.agents.tools import (
     MAX_TOOL_OUTPUT_BYTES,
     MAX_WRITE_BYTES,
+    RESERVED_FILES,
     FileScope,
+    NoArgs,
     Tool,
     ToolRegistry,
     builtin_tools,
     calculate,
+    truncate_utf8,
 )
 from cfdagent.errors import AgentInputError
 from cfdagent.llm.client import UNPARSED_KEY, ToolCall
 from cfdagent.prompts import PROMPTS_DIR, load_prompt
+from cfdagent.record import RECORD_FILE, SUMMARY_FILE
 from cfdagent.rundir import RunDir
 
 
@@ -364,3 +371,120 @@ def test_load_prompt_version_is_a_hash_of_the_file(tmp_path):
     with pytest.raises(FileNotFoundError, match="missing"):
         load_prompt("missing", prompts_dir=tmp_path)
     assert PROMPTS_DIR.name == "prompts"
+
+
+# ------------------------------------------------------------------ fix round 1
+
+SURROGATE = chr(0xD800)
+
+
+def test_calculator_min_max_need_two_arguments():
+    for expression in ("min(1)", "max(5)", "min(pi)", "max(e)", "min(-1)", "min()", "max()"):
+        with pytest.raises(AgentInputError, match="arguments"):
+            calculate(expression)
+    assert calculate("min(3, 1)") == "1"
+    assert calculate("max(3, 1, 2)") == "3"
+
+
+def test_calculator_turns_unexpected_evaluation_errors_into_text(monkeypatch):
+    def boom(*_values):
+        raise TypeError("surprise")
+
+    monkeypatch.setitem(tools_module._FUNCTIONS, "sqrt", (boom, 1, 1))
+    with pytest.raises(AgentInputError):
+        calculate("sqrt(4)")
+    for expression in ("abs(" * 120 + "1" + ")" * 120, "(" * 190 + "1" + ")" * 190):
+        try:
+            calculate(expression)  # deep nesting: an answer or text for the model, never a crash
+        except AgentInputError:
+            pass
+
+
+def test_no_argument_tools_accept_empty_and_null_arguments():
+    registry = ToolRegistry()
+    registry.add(Tool("ping", "x", NoArgs, lambda args: "pong"))
+    assert registry.dispatch(call("ping")) == "pong"
+    for raw in ("", "null", "{}", "  null "):
+        assert registry.dispatch(ToolCall("c", "ping", {UNPARSED_KEY: raw})) == "pong", raw
+    assert "not valid JSON" in registry.dispatch(ToolCall("c", "ping", {UNPARSED_KEY: "[1"}))
+    registry.add(echo_tool())
+    out = registry.dispatch(ToolCall("c", "echo", {UNPARSED_KEY: "null"}))
+    assert out.startswith("error:")  # a tool with required arguments still needs them
+
+
+def test_paths_that_cannot_be_encoded_or_are_too_long_come_back_as_text(run):
+    registry = registry_for(run, readable=("*",), writable=("*",))
+    bad_paths = [
+        "a" + SURROGATE + "b.txt",
+        "x" * 201,
+        "d/" + "y" * 201,
+        chr(0xE9) * 101,  # 202 bytes in one component
+        "/".join([chr(0xE9) * 100] * 6),  # 1205 bytes in total, 605 characters
+    ]
+    for path in bad_paths:
+        for name, args in (
+            ("write_file", {"path": path, "content": "x"}),
+            ("read_file", {"path": path}),
+            ("list_dir", {"path": path}),
+        ):
+            out = registry.dispatch(call(name, **args))
+            assert out.startswith("error:"), (name, ascii(path)[:30])
+    assert list(run.root.iterdir()) == []
+    assert FileScope.normalise("y" * 200) == "y" * 200  # exactly at the limit is fine
+
+
+def test_operating_system_path_errors_become_text_but_other_errors_propagate(run, monkeypatch):
+    registry = registry_for(run, readable=("*",), writable=("*",))
+
+    def too_long(*_args, **_kwargs):
+        raise OSError(errno.ENAMETOOLONG, "File name too long")
+
+    monkeypatch.setattr(run, "write_text", too_long)
+    out = registry.dispatch(call("write_file", path="a.txt", content="x"))
+    assert out.startswith("error:") and "cannot write" in out
+
+    def disk_full(*_args, **_kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(run, "write_text", disk_full)
+    with pytest.raises(OSError):
+        registry.dispatch(call("write_file", path="a.txt", content="x"))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs a file system that stores raw bytes")
+def test_list_dir_skips_entries_whose_names_cannot_be_used(run):
+    (run.root / "good.txt").write_text("g", encoding="utf-8")
+    (run.root / os.fsdecode(b"bad" + bytes([0xFF]) + b".txt")).write_text("b", encoding="utf-8")
+    (run.root / ("n" * 250)).write_text("n", encoding="utf-8")
+    registry = registry_for(run, readable=("*",), writable=())
+    assert registry.dispatch(call("list_dir", path=".")).splitlines() == ["good.txt"]
+
+
+def test_truncate_utf8_always_returns_valid_text_within_the_limit():
+    for text in ("a" + SURROGATE + "b", chr(0xE9) * 10, "x" * 10, ""):
+        for limit in (1, 3, 5, 100):
+            out = truncate_utf8(text, limit)
+            out.encode("utf-8")  # strict: raises on a lone surrogate
+            assert len(out.encode("utf-8")) <= limit, (ascii(text), limit)
+    assert truncate_utf8("a" + SURROGATE + "b", 100) == "a?b"
+
+
+def test_a_single_trailing_slash_is_accepted(run):
+    registry = registry_for(run, readable=("*",), writable=("*",))
+    run.write_text("attempts/toy-1/a.txt", "a")
+    assert registry.dispatch(call("list_dir", path="attempts/toy-1/")).splitlines() == ["a.txt"]
+    assert registry.dispatch(call("list_dir", path="attempts/")).splitlines() == ["toy-1/"]
+    assert registry.dispatch(call("list_dir", path="./")).splitlines() == ["attempts/"]
+    assert registry.dispatch(call("read_file", path="attempts/toy-1/a.txt/")).startswith("a")
+    for path in ("a//", "/", "//", "attempts///"):
+        assert registry.dispatch(call("list_dir", path=path)).startswith("error:"), path
+
+
+def test_scope_fields_are_tuples_and_reserved_names_include_the_record_files():
+    scope = FileScope(readable=["a/*"], writable=["b/*"])
+    assert scope.readable == ("a/*",) and scope.writable == ("b/*",)
+    assert FileScope().readable == ()
+    assert {RECORD_FILE, SUMMARY_FILE, "llm_transcript.jsonl", "comparison.json"} <= set(
+        RESERVED_FILES
+    )
+    assert not FileScope(writable=["*"]).can_write("comparison.json")

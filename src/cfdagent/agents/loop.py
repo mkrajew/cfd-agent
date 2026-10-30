@@ -28,6 +28,8 @@ replies.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -39,10 +41,12 @@ from cfdagent.agents.tools import (
     builtin_tools,
     truncate_utf8,
 )
+from cfdagent.errors import AgentInputError, ToolFailure, as_gate
 from cfdagent.llm.client import (
     ChatResult,
     LLMError,
     LLMTransportError,
+    ToolCall,
     TruncatedOutputError,
     Usage,
     assistant_message,
@@ -50,12 +54,17 @@ from cfdagent.llm.client import (
 from cfdagent.llm.cost import CostLimitExceeded
 from cfdagent.record import AttemptRecord, StageRecord, redact
 
-CONTEXT_CHAR_LIMIT = 300_000  # estimated size of the messages above which old tool output goes
+CONTEXT_CHAR_LIMIT = 200_000  # estimated size of the messages above which old tool output goes
 KEEP_LAST_MESSAGES = 6  # never elided
 ELIDED = "[output elided to save context]"
 CHECK_ERROR_BYTES = 4096  # gate errors returned to the model
 TRANSPORT_RETRIES = 2
 BACKOFF_S = (2.0, 8.0)  # pause before the first and the second retry
+CHECK_TOOL = "check_stage"
+CUT_OFF_ADVICE = (
+    "Reason briefly, then call tools with SMALLER arguments: split the work into several "
+    "smaller files; do not put everything into one huge file."
+)
 MAX_REASON_CHARS = 1500
 MAX_ECHOED_ERROR_CHARS = 600
 
@@ -99,6 +108,20 @@ def _elide_old_outputs(messages: list[dict]) -> None:
                 return
 
 
+@contextmanager
+def _internal(what: str) -> Iterator[None]:
+    """Run bookkeeping that is not the model's business.
+
+    ``RunDirError`` and friends are ``AgentInputError``s, which a tool call would show to the
+    model as text. Here they mean the run's own files misbehave, so they become ``ToolFailure``
+    and propagate to the orchestrator.
+    """
+    try:
+        yield
+    except AgentInputError as exc:
+        raise ToolFailure(f"{what} failed: {exc}") from exc
+
+
 def _short(text: object, limit: int = MAX_ECHOED_ERROR_CHARS) -> str:
     text = str(text)
     return text if len(text) <= limit else text[:limit] + "..."
@@ -133,7 +156,8 @@ class _StageRun:
 
     def _start_attempt(self) -> None:
         number = self.attempts + 1
-        self.attempt_dir = self.ctx.run.attempt_dir(self.stage.name, number)
+        with _internal("preparing the attempt directory"):
+            self.attempt_dir = self.ctx.run.attempt_dir(self.stage.name, number)
         self.attempt_started = self.ctx.clock()
         self.turns = 0
         registry = ToolRegistry()
@@ -141,7 +165,7 @@ class _StageRun:
             registry.add(tool)
         registry.add(
             Tool(
-                "check_stage",
+                CHECK_TOOL,
                 "Run the automatic checks on the current attempt directory. Call it only when "
                 "the work is complete: every call uses one of a few attempts. Returns the list "
                 "of problems to fix, or confirms that the stage passed.",
@@ -149,7 +173,9 @@ class _StageRun:
                 lambda _args: self._check(),
             )
         )
-        for tool in self.stage.extra_tools(self.ctx, self.attempt_dir):
+        with _internal("building the stage tools"):
+            extra = self.stage.extra_tools(self.ctx, self.attempt_dir)
+        for tool in extra:
             registry.add(tool)
         self.registry = registry
 
@@ -174,7 +200,8 @@ class _StageRun:
         if self._time_left() <= 0:
             self.abort = self._wall_clock_reason()
             return "The run's time budget is used up; the stage stops here."
-        result = self.stage.execute_and_gate(self.ctx, self.attempt_dir)
+        # An AgentInputError from the gate is the agent's work being wrong: a failed attempt.
+        result = as_gate(lambda: self.stage.execute_and_gate(self.ctx, self.attempt_dir))
         seconds = max(0.0, self.ctx.clock() - self.attempt_started)
         self.attempts += 1
         errors = [] if result.ok else [str(e) for e in result.errors]
@@ -208,7 +235,8 @@ class _StageRun:
 
     def _progress(self) -> None:
         if self.ctx.on_progress is not None:
-            self.ctx.on_progress(self.stage.name)
+            with _internal("saving the run record"):
+                self.ctx.on_progress(self.stage.name)
 
     # ------------------------------------------------------------------ the model
 
@@ -275,17 +303,36 @@ class _StageRun:
             self._log(sent, result)
             if self.abort is not None:
                 return None
+            if result.finish_reason == "length" or (
+                result.finish_reason == "content_filter" and not result.tool_calls
+            ):
+                # Not usable: a tool call cut off by the length limit may be incomplete in
+                # meaning even when its JSON parses, and an empty reply has nothing to act on.
+                # The reply is not echoed into the history, so no tool call is left unanswered.
+                self.messages.append({"role": "user", "content": self._discarded_text(result)})
+                return None
             self.messages.append(assistant_message(result))
             self.logged = len(self.messages)  # the echo is already in the transcript as the reply
             return result
 
     @staticmethod
+    def _discarded_text(result: ChatResult) -> str:
+        if result.finish_reason == "length":
+            return (
+                "Your last reply was cut off at the output limit and was discarded, so none of "
+                "it was done. " + CUT_OFF_ADVICE
+            )
+        return (
+            "Your last reply was withheld by the content filter and was discarded. Reply "
+            "again with a shorter, plainer answer or a tool call."
+        )
+
+    @staticmethod
     def _unusable_text(exc: LLMError) -> str:
         if isinstance(exc, TruncatedOutputError):
             return (
-                "Your last reply could not be used: it was cut off because it reached the output "
-                "length limit. Reply again with a shorter message: think less, and write large "
-                "files in several smaller steps."
+                "Your last reply could not be used: it was cut off at the output limit. "
+                + CUT_OFF_ADVICE
             )
         return (
             f"Your last reply could not be used ({type(exc).__name__}: {_short(exc)}). Reply "
@@ -324,18 +371,19 @@ class _StageRun:
                     }
                 )
                 continue
+            ran_gate = False  # at most one gate run per reply
             for call in result.tool_calls:
-                if self.passed or self.exhausted or self.abort is not None:
-                    output = "not run: the stage has already ended"
-                else:
-                    output = self.registry.dispatch(call)
+                before = self.attempts
+                output = self._answer(call, ran_gate)
+                ran_gate = ran_gate or self.attempts != before
                 self.messages.append({"role": "tool", "tool_call_id": call.id, "content": output})
             if self.passed or self.exhausted or self.abort is not None:
                 break
         if self.abort is not None:
             return self._fail(self.abort)
         if self.passed:
-            self.stage.promote(self.ctx, self.attempt_dir)
+            with _internal("promoting the accepted attempt"):
+                self.stage.promote(self.ctx, self.attempt_dir)
             self.record.ok = True
             self._progress()
             return StageOutcome(ok=True, attempts=self.attempts, errors=[], reason=None)
@@ -343,6 +391,22 @@ class _StageRun:
         return self._fail(
             f"stage {self.stage.name!r} failed after {self.attempts} attempts; last errors: {shown}"
         )
+
+    def _answer(self, call: ToolCall, ran_gate: bool) -> str:
+        """The tool result for one call of a reply. A call that cannot run is still answered."""
+        if self.abort is not None:  # only the wall-clock limit can stop a stage while tools run
+            return "not run: wall-clock limit reached"
+        if self.passed or self.exhausted:
+            return "not run: the stage has already ended"
+        if self._time_left() <= 0:
+            self.abort = self._wall_clock_reason()
+            return "not run: wall-clock limit reached"
+        if call.name == CHECK_TOOL and ran_gate:
+            return (
+                "not run: the checks already ran in this reply; work in "
+                f"{self._relative(self.attempt_dir)}"
+            )
+        return self.registry.dispatch(call)
 
     def _fail(self, reason: str) -> StageOutcome:
         self.record.ok = False

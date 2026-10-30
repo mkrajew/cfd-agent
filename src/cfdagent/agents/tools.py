@@ -13,19 +13,22 @@ and is further limited by a ``FileScope`` of glob patterns per stage.
 from __future__ import annotations
 
 import ast
+import errno
 import math
 import os
 import stat
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
 
+from cfdagent.agents.transcript import TRANSCRIPT_FILE
 from cfdagent.errors import AgentInputError
 from cfdagent.llm.client import UNPARSED_KEY, ToolCall
-from cfdagent.rundir import RunDir, split_relative
+from cfdagent.record import RECORD_FILE, SUMMARY_FILE
+from cfdagent.rundir import RunDir, UnsafePath, split_relative
 
 MAX_TOOL_OUTPUT_BYTES = 8000
 MAX_WRITE_BYTES = 200_000  # one write_file call
@@ -42,11 +45,21 @@ MAX_CALL_ARGS = 20
 # component starting with a dot, for example the sandbox exchange directory) are neither
 # readable nor writable through the file tools.
 RESERVED_FILES = (
-    "run_record.json",
-    "summary.md",
-    "llm_transcript.jsonl",
+    RECORD_FILE,
+    SUMMARY_FILE,
+    TRANSCRIPT_FILE,
+    "comparison.json",
     "status.json",
     "run.log",
+)
+MAX_COMPONENT_BYTES = 200  # the file system allows 255; atomic writes add a 20-byte temporary name
+MAX_PATH_BYTES = 1024
+# OS errors that mean "this path cannot be used" (the model's doing); anything else, a full disk
+# for example, is the environment's and propagates.
+_PATH_ERRNOS = frozenset(
+    code
+    for name in ("ENAMETOOLONG", "EILSEQ", "EINVAL", "ELOOP", "ENOTDIR", "EISDIR", "EEXIST")
+    if (code := getattr(errno, name, None)) is not None
 )
 
 
@@ -66,15 +79,20 @@ class Tool:
 
 
 def truncate_utf8(text: str, max_bytes: int, marker: str = "\n[output truncated]") -> str:
-    """Cut ``text`` so that the result, marker included, is at most ``max_bytes`` of UTF-8.
+    """Return ``text`` as valid UTF-8 text of at most ``max_bytes`` bytes, marker included.
 
-    Text that already fits is returned unchanged. A multi-byte character is never split.
+    Characters that cannot be encoded (lone surrogates) become ``?``. Text that fits is returned
+    unchanged apart from that; a multi-byte character is never split. If even the marker does
+    not fit, the text is cut without it.
     """
     data = text.encode("utf-8", "replace")
     if len(data) <= max_bytes:
-        return text
-    room = max(0, max_bytes - len(marker.encode("utf-8")))
-    return data[:room].decode("utf-8", "ignore") + marker
+        return data.decode("utf-8")
+    marker_bytes = marker.encode("utf-8", "replace")
+    if len(marker_bytes) >= max_bytes:
+        return data[:max_bytes].decode("utf-8", "ignore")
+    room = max_bytes - len(marker_bytes)
+    return data[:room].decode("utf-8", "ignore") + marker_bytes.decode("utf-8")
 
 
 def _validation_text(tool: Tool, exc: ValidationError) -> str:
@@ -130,6 +148,13 @@ class ToolRegistry:
                 self._tools
             )
         arguments = call.arguments
+        if (
+            not tool.args.model_fields
+            and isinstance(arguments, dict)
+            and set(arguments) == {UNPARSED_KEY}
+            and str(arguments[UNPARSED_KEY]).strip() in ("", "null", "{}")
+        ):
+            arguments = {}  # a tool without arguments may be called with null or nothing
         if isinstance(arguments, dict) and UNPARSED_KEY in arguments:
             raw = str(arguments[UNPARSED_KEY])[:300]
             return (
@@ -179,8 +204,8 @@ _FUNCTIONS: dict[str, tuple[Callable[..., float], int, int]] = {
     "exp": (math.exp, 1, 1),
     "pow": (_checked_pow, 2, 2),
     "abs": (abs, 1, 1),
-    "min": (min, 1, MAX_CALL_ARGS),
-    "max": (max, 1, MAX_CALL_ARGS),
+    "min": (min, 2, MAX_CALL_ARGS),  # one argument would make Python iterate over a number
+    "max": (max, 2, MAX_CALL_ARGS),
 }
 
 
@@ -281,6 +306,10 @@ def calculate(expression: str) -> str:
         raise CalculatorError("the result is not a finite number (overflow)") from None
     except ValueError as exc:
         raise CalculatorError(f"mathematical domain error ({exc})") from None
+    except (TypeError, ArithmeticError, MemoryError) as exc:  # never crash a run on odd input
+        raise CalculatorError(
+            f"the expression cannot be evaluated ({type(exc).__name__})"
+        ) from None
 
 
 class CalculatorArgs(BaseModel):
@@ -315,20 +344,40 @@ class FileScope:
     writable, whatever the patterns say. A malformed path raises ``UnsafePath``.
     """
 
-    readable: list[str] = field(default_factory=list)
-    writable: list[str] = field(default_factory=list)
+    readable: tuple[str, ...] = ()
+    writable: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "readable", tuple(self.readable))
+        object.__setattr__(self, "writable", tuple(self.writable))
 
     @staticmethod
     def normalise(path: str) -> str:
-        """The path as ``a/b/c`` (``''`` for the run directory itself); may raise UnsafePath."""
-        return "/".join(split_relative(path))
+        """The path as ``a/b/c`` (``''`` for the run directory itself).
+
+        One trailing ``/`` is ignored (``attempts/`` is ``attempts``). Raises ``UnsafePath`` for
+        a path that is malformed, escapes the run directory, cannot be encoded as UTF-8, has a
+        component longer than 200 bytes or is longer than 1024 bytes in total.
+        """
+        if isinstance(path, str) and len(path) > 1 and path.endswith("/") and path[-2] != "/":
+            path = path[:-1]
+        norm = "/".join(split_relative(path))
+        try:
+            encoded = norm.encode("utf-8")
+        except UnicodeEncodeError:
+            raise UnsafePath("the path contains characters that cannot be encoded") from None
+        if len(encoded) > MAX_PATH_BYTES:
+            raise UnsafePath(f"the path is longer than {MAX_PATH_BYTES} bytes")
+        if any(len(part.encode("utf-8")) > MAX_COMPONENT_BYTES for part in norm.split("/")):
+            raise UnsafePath(f"a path component is longer than {MAX_COMPONENT_BYTES} bytes")
+        return norm
 
     @staticmethod
     def _hidden(norm: str) -> bool:
         return any(part.startswith(".") for part in norm.split("/"))
 
     @staticmethod
-    def _matches(patterns: list[str], norm: str) -> bool:
+    def _matches(patterns: tuple[str, ...], norm: str) -> bool:
         return any(fnmatchcase(norm, pattern) for pattern in patterns)
 
     def can_read(self, path: str) -> bool:
@@ -377,7 +426,7 @@ class WriteFileArgs(BaseModel):
     content: str = Field(description="Complete new text content of the file (UTF-8)")
 
 
-def _denied(path: str, verb: str, patterns: list[str]) -> AgentInputError:
+def _denied(path: str, verb: str, patterns: tuple[str, ...]) -> AgentInputError:
     shown = ", ".join(patterns) if patterns else "nothing"
     return AgentInputError(f"{path!r} is not {verb} in this stage; allowed paths: {shown}")
 
@@ -390,7 +439,7 @@ def _read_page(run: RunDir, scope: FileScope, args: ReadFileArgs) -> str:
         text = run.read_text(norm)
     except FileNotFoundError as exc:
         raise AgentInputError(str(exc)) from None
-    if "\x00" in text or "�" in text:
+    if "\x00" in text or "\ufffd" in text:
         raise AgentInputError(
             f"{args.path!r} is binary or not valid UTF-8 text; it cannot be shown"
         )
@@ -429,6 +478,10 @@ def _list_dir(run: RunDir, scope: FileScope, args: ListDirArgs) -> str:
         entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
     except (FileNotFoundError, NotADirectoryError):
         raise AgentInputError(f"{args.path!r} is not a directory that exists") from None
+    except OSError as exc:
+        if exc.errno in _PATH_ERRNOS:
+            raise AgentInputError(f"cannot list {args.path!r}: the path cannot be used") from None
+        raise
     lines = []
     for entry in entries:
         name = entry.name
@@ -438,11 +491,14 @@ def _list_dir(run: RunDir, scope: FileScope, args: ListDirArgs) -> str:
         junction = getattr(entry, "is_junction", None)
         if junction is not None and junction():
             continue
-        if entry.is_dir(follow_symlinks=False):
-            if scope.can_list(child):
-                lines.append(_printable(name) + "/")
-        elif entry.is_file(follow_symlinks=False) and scope.can_read(child):
-            lines.append(_printable(name))
+        try:  # a name the tools could not address anyway (undecodable, too long) is not listed
+            if entry.is_dir(follow_symlinks=False):
+                if scope.can_list(child):
+                    lines.append(_printable(name) + "/")
+            elif entry.is_file(follow_symlinks=False) and scope.can_read(child):
+                lines.append(_printable(name))
+        except AgentInputError:
+            continue
     if not lines:
         return "(no entries you can read)"
     if len(lines) > MAX_LIST_ENTRIES:
@@ -472,9 +528,13 @@ def _write_file(run: RunDir, scope: FileScope, args: WriteFileArgs) -> str:
         raise AgentInputError(f"{args.path!r} is a directory; give a file path")
     try:
         run.write_text(norm, args.content, max_bytes=MAX_WRITE_BYTES)
-    except (FileExistsError, NotADirectoryError, IsADirectoryError):
+    except OSError as exc:
+        if exc.errno not in _PATH_ERRNOS:
+            raise
         raise AgentInputError(
-            f"cannot write {args.path!r}: a part of the path is a file where a directory is needed"
+            f"cannot write {args.path!r}: the path cannot be used "
+            f"({errno.errorcode.get(exc.errno or 0, 'OS error')}); a part of it may be a file "
+            "where a directory is needed"
         ) from None
     return f"wrote {size} bytes to {norm}"
 

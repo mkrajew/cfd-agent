@@ -33,10 +33,17 @@ MIN_INNER_TIMEOUT_S = 1.0  # sandbox calls refuse a timeout of zero or less
 
 @dataclass
 class StageContext:
-    """Everything a stage loop needs. ``clock`` and ``sleep`` are injectable for tests;
-    ``started_at`` (a reading of ``clock`` at the start of the run) defaults to now.
-    ``on_progress`` is called with the stage name after each attempt so the orchestrator can
-    save the run record.
+    """Everything a stage loop needs.
+
+    ``started_at`` is a reading of ``clock`` taken when the whole RUN began; it is required on
+    purpose. The wall-clock budget (``limits.wall_clock_s``) is measured from it, so build one
+    context per run (the orchestrator makes a per-stage copy with ``dataclasses.replace`` when it
+    needs to swap a field). A context created afresh for every stage would restart the two-hour
+    budget at each stage.
+
+    ``clock`` and ``sleep`` are injectable for tests. ``on_progress`` is called with the stage
+    name after each attempt so the orchestrator can save the run record; an error it raises
+    propagates (as ``ToolFailure`` if it is an ``AgentInputError``).
     """
 
     run: RunDir
@@ -46,19 +53,14 @@ class StageContext:
     cost: CostTracker
     record: RunRecord
     transcript: TranscriptWriter
+    started_at: float
     casespec: CaseSpec | None = None
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
-    started_at: float | None = None
     on_progress: Callable[[str], None] | None = None
-
-    def __post_init__(self) -> None:
-        if self.started_at is None:
-            self.started_at = self.clock()
 
     def remaining_s(self) -> float:
         """Seconds left of the run's wall-clock budget (never negative)."""
-        assert self.started_at is not None
         used = self.clock() - self.started_at
         return max(0.0, self.config.limits.wall_clock_s - used)
 
