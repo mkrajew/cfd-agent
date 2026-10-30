@@ -23,7 +23,11 @@ class LLMSettings(BaseModel):
     auth: Literal["entra", "api_key"] = "entra"
     api_key_env: str = "CFDAGENT_LLM_API_KEY"
     timeout: float = 120.0  # seconds per request
-    max_retries: int = 2  # automatic retries of failed requests (connection errors, 429, 5xx)
+    # Automatic SDK retries of failed requests (connection errors, 429, 5xx). Cost caution: each
+    # retry of a stalled call can be billed, up to (1 + max_retries) times with the default
+    # timeout of 120 s per attempt, and the cost tracker never sees it. Cost-capped runs should
+    # use max_retries=1.
+    max_retries: int = 2
 
     @classmethod
     def from_env(cls) -> Self:

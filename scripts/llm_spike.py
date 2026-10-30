@@ -80,6 +80,8 @@ def _timed(fn, endpoint: str) -> dict[str, Any]:
 
 def _usage(result: ChatResult) -> dict[str, Any]:
     u = result.usage
+    if u is None:  # the service sent no usage report: unknown, not zero
+        return {"prompt_tokens": None, "completion_tokens": None, "reasoning_tokens": None}
     return {
         "prompt_tokens": u.prompt_tokens,
         "completion_tokens": u.completion_tokens,
