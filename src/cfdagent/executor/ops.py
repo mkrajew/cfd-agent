@@ -39,7 +39,7 @@ from cfdagent.rundir import RunDir, split_relative
 from cfdagent.tools import foam as foam_tools
 from cfdagent.tools import geometry as geometry_tools
 from cfdagent.tools import mesh as mesh_tools
-from cfdagent.tools.process import ALLOWED_EXECUTABLES, ToolResult, run_tool
+from cfdagent.tools.process import ALLOWED_EXECUTABLES, ToolResult, code_refusal_hint, run_tool
 
 OPS: dict[str, Callable[[Any, RunDir], dict[str, Any]]] = {}
 
@@ -122,6 +122,15 @@ def _plain(value: Any) -> Any:
 
 def _clip(text: str, limit: int = _MAX_ERROR_LINE) -> str:
     return text if len(text) <= limit else text[:limit] + " [...]"
+
+
+def _with_refusal_hint(error: str) -> str:
+    """Put the general hint first when the error shows that OpenFOAM refused case-supplied code.
+
+    First, because a long error may be cut at the end (``protocol.MAX_ERROR_CHARS``).
+    """
+    hint = code_refusal_hint(error)
+    return error if hint is None or hint in error else f"{hint}\n{error}"
 
 
 def _gate(gate: GateResult) -> dict[str, Any]:
@@ -282,10 +291,13 @@ def check_dictionaries(args: protocol.CheckDictionariesArgs, jail: RunDir) -> di
 
     A file that does not parse is reported with the start of foamDictionary's message. The
     dictionaries are read by OpenFOAM, which can execute code embedded in them (``#codeStream``,
-    ``#calc``); the image must have ``allowSystemOperations`` off and this runs only in the
-    sandbox. foamDictionary runs in a scratch directory, so nothing is written to the case.
+    ``#calc``); the image sets ``allowSystemOperations`` to 0 site-wide, which makes OpenFOAM
+    refuse such code, and this runs only in the sandbox. Each file is read with
+    ``foamDictionary -case <case> <file>`` (absolute paths), so ``<system>/`` includes and
+    case-local ``#includeFunc`` files resolve as they do for a solver; the working directory is a
+    scratch directory, so nothing is written to the case.
     """
-    _directory(jail, args.case_dir)
+    case_path = _directory(jail, args.case_dir).resolve()
     errors: list[str] = []
     files: list[tuple[str, Path]] = []
     for folder in _DICTIONARY_DIRS:
@@ -320,7 +332,7 @@ def check_dictionaries(args: protocol.CheckDictionariesArgs, jail: RunDir) -> di
                 errors.append(f"time limit reached; {len(files) - index} file(s) not checked")
                 break
             result = run_tool(
-                ["foamDictionary", str(path)],
+                ["foamDictionary", "-case", str(case_path), str(path.resolve())],
                 cwd=scratch,
                 log_path=scratch / f"{index}.log",
                 timeout_s=_DICTIONARY_FILE_TIMEOUT_S,
@@ -402,7 +414,7 @@ def execute(request: OpRequest, jail: RunDir) -> OpResponse:
     try:
         out = dict(function(model, jail))
     except AgentInputError as exc:
-        return protocol.failure(str(exc))
+        return protocol.failure(_with_refusal_hint(str(exc)))
     except Exception as exc:
         traceback.print_exc(file=sys.stderr)
         return protocol.failure(f"{type(exc).__name__}: {exc}", internal=True)
@@ -410,4 +422,6 @@ def execute(request: OpRequest, jail: RunDir) -> OpResponse:
     error = out.pop("error", None)
     if not ok and not error:
         error = f"{request.op} failed"
+    if not ok:
+        error = _with_refusal_hint(str(error))
     return OpResponse(ok=ok, data=_plain(out), error=error if not ok else None)

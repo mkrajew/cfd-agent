@@ -73,7 +73,8 @@ uv run ruff check . && uv run ruff format --check .  # lint and format check
 uv run pre-commit install                            # once per clone: run the hooks on every commit
 uv run pre-commit run --all-files                    # ruff, gitleaks, line endings
 
-docker build -f docker/Dockerfile -t cfdagent:dev .  # build the image (OpenFOAM ESI, Gmsh, CadQuery, PyVista)
+docker build --target test -f docker/Dockerfile -t cfdagent:dev .  # test image: toolchain + pytest (the default target `runtime` is the shipped image without pytest)
+uv run pytest -m sandbox tests/sandbox              # sandbox tests drive real containers (need Docker and the image)
 # integration tests run inside the image, with the repository bind-mounted at /work
 docker run --rm -v "$PWD:/work" -w /work cfdagent:dev pytest -m integration tests/integration
 ```
@@ -121,6 +122,6 @@ At the end of a session:
 
 ## Markers and conventions
 
-- pytest markers: `integration` (needs Docker, OpenFOAM, Gmsh or services), `e2e` (real model, costs money, manual trigger only).
+- pytest markers: `integration` (needs Docker, OpenFOAM, Gmsh or services), `sandbox` (needs Docker and the image; drives real executor containers), `e2e` (real model, costs money, manual trigger only).
 - Python 3.12, `uv`, `ruff` with line length 100.
 - Deliberately omitted: CONTRIBUTING, CODE_OF_CONDUCT, CHANGELOG, project boards. Release notes replace a changelog.

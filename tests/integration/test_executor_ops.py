@@ -4,10 +4,12 @@ The client runs in ``local`` mode: the executor is a plain subprocess of the tes
 runs inside the container. Confinement itself is covered by ``tests/sandbox``.
 """
 
+import os
 import shutil
 
 import pytest
 from foam_cases import build_case, needs_4_threads
+from hostile_cases import MARKER, hostile_cases, hostile_params
 
 from cfdagent.rundir import RunDir
 from cfdagent.sandbox.client import SandboxClient
@@ -86,3 +88,88 @@ def test_unknown_case_directory_is_a_failed_op(job):
     shutil.rmtree(run_dir.root / "case")
     response = client.call("check_dictionaries", {"case_dir": "case"}, timeout_s=120)
     assert response.ok is False and response.internal is False
+
+
+def test_check_dictionaries_resolves_system_includes_and_case_local_functions(job):
+    """Includes and function objects are resolved against the case, not the scratch directory."""
+    client, run_dir = job
+    run_dir.write_text("case/system/shared", "FoamFile { version 2.0; }\nshared 42;\n")
+    run_dir.write_text("case/system/myFunc", "FoamFile { version 2.0; }\ntype probes;\n")
+    control = run_dir.read_text("case/system/controlDict")
+    run_dir.write_text(
+        "case/system/controlDict",
+        control + '#include "<system>/shared"\nfunctions { #includeFunc myFunc #includeFunc '
+        'solverInfo }\nvalue #eval "1 + 2";\n',
+    )
+    response = client.call("check_dictionaries", {"case_dir": "case"}, timeout_s=300)
+    assert response.ok, response.error
+
+
+@pytest.mark.parametrize(("name", "op"), hostile_params("/tmp"))
+def test_case_supplied_code_is_refused_with_a_general_hint(job, name, op):
+    client, run_dir = job
+    edits, _ = hostile_cases("/tmp")[name]
+    for target, text in edits:
+        path = f"case/{target}"
+        run_dir.write_text(path, run_dir.read_text(path) + text)
+    args = {"case_dir": "case"}
+    if op != "check_dictionaries":
+        args["solver"] = "icoFoam"
+    response = client.call(op, args, timeout_s=300)
+    assert response.ok is False and response.internal is False, response
+    assert "case-supplied code" in response.error, response.error
+    assert "plain numbers" in response.error and "#eval" in response.error, response.error
+    assert not os.path.exists(f"/tmp/{MARKER}")
+    assert not list(run_dir.root.rglob("dynamicCode")), "OpenFOAM prepared code for compiling"
+    assert not list(run_dir.root.rglob(MARKER))
+
+
+def test_info_switch_on_the_command_line_does_not_enable_case_code(job):
+    client, run_dir = job
+    calc = hostile_cases("/tmp")["calc in a 0/ file"][0][0][1]
+    header = "FoamFile { version 2.0; format ascii; class dictionary; object hostile; }\n"
+    run_dir.write_text("case/system/hostile", header + calc)
+    response = client.call(
+        "run_utility",
+        {
+            "argv": ["foamDictionary", "-info-switch", "allowSystemOperations=1", "system/hostile"],
+            "cwd": "case",
+        },
+        timeout_s=120,
+    )
+    assert response.ok is False, response
+    assert "case-supplied code" in response.error, response.error
+    assert not os.path.exists(f"/tmp/{MARKER}")
+
+
+@pytest.mark.parametrize("op", ["trial_run", "run_solver"])
+def test_an_ordinary_failure_carries_no_refusal_hint(job, op):
+    """Negative control: every solver log has the allowSystemOperations banner line."""
+    client, run_dir = job
+    (run_dir.root / "case" / "0" / "p").unlink()
+    response = client.call(op, {"case_dir": "case", "solver": "icoFoam"}, timeout_s=300)
+    assert response.ok is False and response.internal is False, response
+    assert "case-supplied code" not in response.error, response.error
+    assert "plain numbers" not in response.error, response.error
+
+
+UNIFORM_VALUES = {
+    "table": "uniformValue table ((0 (1 0 0)) (1 (2 0 0)));",
+    "sine": ("uniformValue { type sine; amplitude 1; frequency 2; scale (1 0 0); level (1 0 0); }"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(UNIFORM_VALUES))
+def test_uniform_fixed_value_with_a_function1_works_where_coded_patches_are_refused(job, name):
+    """The alternative the refusal hint recommends really runs, with no refusal and no warning."""
+    client, run_dir = job
+    field = run_dir.read_text("case/0/U")
+    plain = "type            fixedValue;\n        value           uniform (1 0 0);"
+    assert plain in field
+    function1 = f"type            uniformFixedValue;\n        {UNIFORM_VALUES[name]}"
+    run_dir.write_text("case/0/U", field.replace(plain, function1, 1))
+    response = client.call("run_solver", {"case_dir": "case", "solver": "icoFoam"}, timeout_s=300)
+    assert response.ok, response.error
+    log = run_dir.read_text("case/log.icoFoam", max_bytes=5_000_000)
+    assert "case-supplied code" not in log
+    assert "eprecat" not in log

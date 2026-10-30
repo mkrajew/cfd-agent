@@ -41,6 +41,27 @@ ALLOWED_EXECUTABLES: frozenset[str] = frozenset(
 TAIL_LINES = 50
 TAIL_MAX_BYTES = 8000
 
+# The image switches ``allowSystemOperations`` off, so OpenFOAM refuses dictionaries that carry
+# their own code (``#codeStream``, ``#calc``, coded patch types, function objects and sources) or
+# shell commands (``systemCall``). Its message suggests switching the option on, which an agent
+# must not try: this hint says what to do instead.
+CODE_REFUSAL_HINT = (
+    "OpenFOAM refused case-supplied code: dictionaries carrying their own C++ or shell commands "
+    "(#codeStream, #calc, coded patch types/function objects/sources, systemCall) are disabled "
+    "here, and no file can switch allowSystemOperations on. Use plain numbers, #eval "
+    "expressions, uniformFixedValue with a Function1 (table, sine, ...), or compute "
+    "the values in a script and write them out as plain numbers or a nonuniform list."
+)
+# Only phrases that occur in a refusal. NOT the word ``allowSystemOperations`` on its own: every
+# solver log prints a banner line ``allowSystemOperations : Disallowing user-supplied ...``.
+_CODE_REFUSAL_MARKERS = ("case-supplied code", "Executing user-supplied system calls")
+
+
+def code_refusal_hint(text: str) -> str | None:
+    """``CODE_REFUSAL_HINT`` if ``text`` shows that OpenFOAM refused case-supplied code."""
+    return CODE_REFUSAL_HINT if any(marker in text for marker in _CODE_REFUSAL_MARKERS) else None
+
+
 # Environment passed to the child. Everything else (cloud credentials, API keys, ...) is dropped.
 # SYSTEMROOT, PATHEXT, TEMP, TMP and COMSPEC are needed to start a process on Windows.
 # ``sandbox.client`` (host side, must not import this module) keeps a copy of both lists for its

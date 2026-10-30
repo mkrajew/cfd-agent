@@ -1,30 +1,34 @@
 # Keep the build context small and free of local state.
-.git
-.github
-.venv
-.superpowers
-.claude
-.pytest_cache
-.ruff_cache
-.mypy_cache
-__pycache__
-*.py[cod]
-*.egg-info
-dist
-build
-.env
-.env.*
+# .dockerignore is not .gitignore: a pattern is matched against paths from the context root, so
+# "/tests" and "tests" both mean only the top-level directory; a pattern at any depth needs "**/".
+# The patterns are anchored (leading "/") to say so.
+/.git
+/.github
+/.venv
+/.worktrees
+/.superpowers
+/.claude
+/.pytest_cache
+/.ruff_cache
+/.mypy_cache
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+/dist
+/build
+/.env
+/.env.*
 
 # Simulation outputs never go into an image or into git.
-runs
-*.msh
-postProcessing
-processor*
+/runs
+/*.msh
+/postProcessing
+/processor*
 
 # Docs and infra are not needed to build the image.
-docs
-infra
-tests
+/docs
+/infra
+/tests
 
 # Benchmark references and criteria must never reach an image (blind evaluation).
-benchmarks
+/benchmarks

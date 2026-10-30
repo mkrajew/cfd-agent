@@ -290,6 +290,19 @@ def test_local_mode_runs_the_executor_as_a_plain_subprocess(tmp_path):
     assert "hi from the script" in response.data["tail"]
 
 
+def test_local_mode_starts_without_home_outside_the_openfoam_environment(tmp_path, monkeypatch):
+    """HOME is unset in a plain Windows shell; the HOME guard is for where OpenFOAM can run."""
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.delenv("WM_PROJECT_DIR", raising=False)
+    root = tmp_path / "run"
+    root.mkdir()
+    (root / "hello.py").write_text("print('hi without home')\n", encoding="utf-8")
+    client = SandboxClient(_config(mode="local"), RunDir(root), RUN_ID)
+    response = client.call("run_script", {"script": "hello.py"}, timeout_s=120)
+    assert response.ok, response.error
+    assert "hi without home" in response.data["tail"]
+
+
 def test_local_mode_timeout_kills_the_executor(tmp_path):
     root = tmp_path / "run"
     root.mkdir()

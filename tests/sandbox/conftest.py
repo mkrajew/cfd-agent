@@ -2,9 +2,13 @@
 
 They run on any machine with Docker and the image (the Windows laptop through Docker Desktop, the
 VM) and are skipped, with the reason, where Docker or the image is missing. The image holds the
-installed ``cfdagent`` package: rebuild it after changing ``src/``
-(``docker build -f docker/Dockerfile -t cfdagent:dev .``), because the sandbox mounts only the run
-directory, never the repository.
+installed ``cfdagent`` package: rebuild it after changing ``src/``, because the sandbox mounts
+only the run directory, never the repository. The image for the executor containers is
+``$CFDAGENT_SANDBOX_IMAGE`` (default ``cfdagent:dev``, the ``test`` target; CI uses the shipped
+``runtime`` target, which these tests also pass against):
+``docker build -f docker/Dockerfile --target runtime -t cfdagent:runtime .``.
+``test_runtime_image_*`` inspects ``$CFDAGENT_RUNTIME_IMAGE`` (default ``cfdagent:runtime``) and is
+skipped without it.
 """
 
 import os

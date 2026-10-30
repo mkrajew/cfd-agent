@@ -79,53 +79,120 @@ jobs:
   image:
     name: image
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
-      - name: Build image
+      # Both targets share one build cache scope: the second build reuses the layers of the first.
+      - name: Build test image
         uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
+          target: test
           tags: cfdagent:dev
           # Unpublished build: write the image to a tar file that the next jobs load.
-          outputs: type=docker,dest=${{ runner.temp }}/cfdagent-image.tar
+          outputs: type=docker,dest=${{ runner.temp }}/cfdagent-test-image.tar
           cache-from: type=gha,scope=cfdagent-image
           cache-to: type=gha,mode=max,scope=cfdagent-image
-      - name: Upload image
+      - name: Build runtime image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: runtime
+          tags: cfdagent:runtime
+          outputs: type=docker,dest=${{ runner.temp }}/cfdagent-runtime-image.tar
+          cache-from: type=gha,scope=cfdagent-image
+          cache-to: type=gha,mode=max,scope=cfdagent-image
+      - name: Upload test image
         uses: actions/upload-artifact@v7
         with:
-          name: cfdagent-image
-          path: ${{ runner.temp }}/cfdagent-image.tar
+          name: cfdagent-image-test
+          path: ${{ runner.temp }}/cfdagent-test-image.tar
           compression-level: 1
           retention-days: 1
           if-no-files-found: error
+          overwrite: true
+      - name: Upload runtime image
+        uses: actions/upload-artifact@v7
+        with:
+          name: cfdagent-image-runtime
+          path: ${{ runner.temp }}/cfdagent-runtime-image.tar
+          compression-level: 1
+          retention-days: 1
+          if-no-files-found: error
+          overwrite: true
 
   integration:
     name: integration
     needs: image
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
-      - name: Download image
+      - name: Download test image
         uses: actions/download-artifact@v4
         with:
-          name: cfdagent-image
+          name: cfdagent-image-test
           path: ${{ runner.temp }}
-      - name: Load image
-        run: docker load --input "${RUNNER_TEMP}/cfdagent-image.tar"
+      - name: Load test image
+        run: docker load --input "${RUNNER_TEMP}/cfdagent-test-image.tar"
       - name: Integration tests
-        # The checkout is owned by the runner user (uid 1001); the container user (uid 1000) only
-        # reads it. Tests write to pytest's tmp_path, not to /work.
-        run: docker run --rm -v "$PWD:/work" -w /work cfdagent:dev pytest -m integration tests/integration
+        # The sandbox profile of the executor containers, so every pull request proves that the
+        # toolchain works under it: no network, no capabilities, no privilege gain, read-only root
+        # file system with a scratch /tmp, bounded processes and memory. The checkout is mounted
+        # read-only: it is owned by the runner user (uid 1001), the container user (uid 1000) only
+        # reads it, and tests write to pytest's tmp_path under /tmp, never to /work.
+        run: >
+          docker run --rm --init
+          --network none
+          --cap-drop ALL
+          --security-opt no-new-privileges
+          --read-only
+          --tmpfs /tmp
+          --pids-limit 512
+          --memory 8g
+          -v "$PWD:/work:ro" -w /work
+          cfdagent:dev pytest -m integration tests/integration -rs
+
+  sandbox:
+    name: sandbox
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - name: Download runtime image
+        uses: actions/download-artifact@v4
+        with:
+          name: cfdagent-image-runtime
+          path: ${{ runner.temp }}
+      - name: Load runtime image
+        run: |
+          set -euo pipefail
+          docker load --input "${RUNNER_TEMP}/cfdagent-runtime-image.tar"
+          # The sandbox tests skip when the image is missing; here a missing image must fail.
+          docker image inspect cfdagent:runtime > /dev/null
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Sandbox tests
+        # The executor containers run the shipped image (the runtime target: no pytest, no uv, no
+        # compilers); pytest itself runs on the runner host.
+        env:
+          CFDAGENT_SANDBOX_IMAGE: cfdagent:runtime
+          CFDAGENT_RUNTIME_IMAGE: cfdagent:runtime
+        run: uv run pytest -m sandbox tests/sandbox -rs
 
   publish:
     name: publish
     # Only on pushes to main and on version tags, after everything else is green.
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-    needs: [lint, unit, image, integration]
+    needs: [lint, infra-lint, unit, image, integration, sandbox]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -134,13 +201,13 @@ jobs:
     env:
       IMAGE: ghcr.io/mkrajew/cfd-agent
     steps:
-      - name: Download image
+      - name: Download runtime image
         uses: actions/download-artifact@v4
         with:
-          name: cfdagent-image
+          name: cfdagent-image-runtime
           path: ${{ runner.temp }}
-      - name: Load image
-        run: docker load --input "${RUNNER_TEMP}/cfdagent-image.tar"
+      - name: Load runtime image
+        run: docker load --input "${RUNNER_TEMP}/cfdagent-runtime-image.tar"
       - name: Image tags
         id: meta
         uses: docker/metadata-action@v5
@@ -155,11 +222,11 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Push the tested image
+      - name: Push the tested runtime image
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           for tag in ${TAGS}; do
-            docker tag cfdagent:dev "${tag}"
+            docker tag cfdagent:runtime "${tag}"
             docker push "${tag}"
           done

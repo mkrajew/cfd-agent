@@ -17,6 +17,7 @@ from pydantic import ValidationError
 
 import cfdagent
 from cfdagent.errors import AgentInputError, ToolFailure
+from cfdagent.executor import __main__ as executor_main
 from cfdagent.executor import ops, protocol
 from cfdagent.executor.__main__ import main
 from cfdagent.rundir import RunDir
@@ -476,3 +477,130 @@ def test_stdout_is_redirected_to_stderr_while_ops_run():
     assert done.returncode == 0, done.stderr
     assert done.stdout == ""
     assert "python-level" in done.stderr and "fd-level" in done.stderr
+
+
+_REFUSAL = (
+    "--> FOAM FATAL IO ERROR: (openfoam-2512)\n"
+    "Loading shared libraries using case-supplied code may have been disabled\n"
+    "by default for security reasons.\n"
+)
+
+
+_BANNER = "allowSystemOperations : Disallowing user-supplied system call operations\n"
+_MISSING = 'cannot find file "0/p"'
+
+
+def test_code_refusal_hint_is_general_and_only_added_for_the_refusal():
+    assert process.code_refusal_hint("nothing special") is None
+    hint = process.code_refusal_hint(_REFUSAL)
+    assert hint is not None
+    assert "#eval" in hint and "plain numbers" in hint and "uniformFixedValue" in hint
+    # The generality rule: the hint names no benchmark case.
+    for word in ("cavity", "pipe", "cylinder"):
+        assert word not in hint.lower()
+    assert "exprFixedValue" not in hint  # deprecated in v2512
+    assert process.code_refusal_hint("Executing user-supplied system calls is disabled") == hint
+
+
+def test_the_solver_banner_is_not_a_refusal():
+    """Every solver log prints the switch (here: off); that alone must never trigger the hint."""
+    tail = f"Exec   : icoFoam\n{_BANNER}\n--> FOAM FATAL IO ERROR:\n{_MISSING}\n"
+    assert process.code_refusal_hint(tail) is None
+    assert process.code_refusal_hint("allowSystemOperations 1;") is None
+
+
+def test_refused_case_code_gets_the_hint_once(run, monkeypatch):
+    def refuse(*_a, **_k):
+        raise AgentInputError(f"cannot read 'startTime':\n{_REFUSAL}")
+
+    monkeypatch.setattr(foam, "trial_run", refuse)
+    _, answer = _call(run, "trial_run", {"case_dir": ".", "solver": "icoFoam"})
+    assert answer.ok is False and answer.internal is False
+    assert "case-supplied code" in answer.error
+    assert answer.error.count(process.CODE_REFUSAL_HINT) == 1
+    # An error that has nothing to do with it gets no hint.
+    monkeypatch.setattr(
+        foam,
+        "trial_run",
+        lambda *a, **k: (_ for _ in ()).throw(AgentInputError("deltaT must be positive")),
+    )
+    _, other = _call(run, "trial_run", {"case_dir": ".", "solver": "icoFoam"}, name="c2")
+    assert other.error == "deltaT must be positive"
+
+
+def test_check_dictionaries_reads_files_against_the_case_from_a_scratch_directory(run, monkeypatch):
+    for name in ("0/U", "constant/transportProperties", "system/controlDict"):
+        run.write_text(f"case/{name}", "FoamFile { version 2.0; }\n")
+    calls = []
+
+    def fake_run_tool(argv, cwd, log_path, timeout_s=600.0):
+        calls.append((list(argv), Path(cwd)))
+        log_path.write_text("", encoding="utf-8")
+        return process.ToolResult(True, 0, False, log_path, "")
+
+    monkeypatch.setattr(ops, "run_tool", fake_run_tool)
+    _, answer = _call(run, "check_dictionaries", {"case_dir": "case"})
+    assert answer.ok, answer
+    case = (run.root / "case").resolve()
+    assert len(calls) == 3
+    for argv, cwd in calls:
+        assert argv[:3] == ["foamDictionary", "-case", str(case)]
+        assert Path(argv[3]).is_absolute() and Path(argv[3]).parent.parent == case
+        assert len(argv) == 4
+        assert case not in cwd.parents and cwd != case  # the scratch directory, not the case
+
+
+def test_a_failure_that_only_shows_the_banner_gets_no_hint(run, monkeypatch):
+    message = _BANNER + _MISSING
+
+    def fail(*_a, **_k):
+        raise AgentInputError(message)
+
+    monkeypatch.setattr(foam, "trial_run", fail)
+    _, answer = _call(run, "trial_run", {"case_dir": ".", "solver": "icoFoam"})
+    assert answer.error == message
+
+
+def test_home_must_be_set_and_outside_the_job_directory(tmp_path):
+    job = tmp_path / "job"
+    job.mkdir()
+    problem = executor_main.home_problem
+    assert problem(str(tmp_path / "home"), job) is None
+    assert "HOME" in problem(None, job)
+    assert "HOME" in problem("", job)
+    assert "HOME" in problem(str(job), job)
+    assert "HOME" in problem(str(job / ".hidden" / "home"), job)
+    assert "HOME" in problem(str(job / ".." / "job" / "x"), job)  # dots are resolved first
+    assert problem(str(tmp_path / "job2"), job) is None  # same prefix, different directory
+
+
+def test_the_executor_refuses_to_start_with_a_home_in_the_job_directory(tmp_path):
+    job = tmp_path / "job"
+    job.mkdir()
+    source = str(Path(cfdagent.__file__).parents[1])
+    # WM_PROJECT_DIR marks "OpenFOAM can run here": the guard only applies then.
+    env = {
+        **os.environ,
+        "HOME": str(job / "home"),
+        "PYTHONPATH": source,
+        "WM_PROJECT_DIR": "/openfoam",
+    }
+    done = subprocess.run(
+        [sys.executable, "-P", "-m", "cfdagent.executor", "run_script", ".sandbox/c1.request.json"],
+        cwd=job,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 2
+    assert "HOME" in done.stderr
+    # Without the OpenFOAM environment (a plain host) the guard is not applied.
+    del env["WM_PROJECT_DIR"]
+    done = subprocess.run(
+        [sys.executable, "-P", "-m", "cfdagent.executor", "run_script", ".sandbox/c1.request.json"],
+        cwd=job,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert "HOME" not in done.stderr

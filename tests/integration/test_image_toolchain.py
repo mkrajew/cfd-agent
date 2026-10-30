@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -83,3 +84,114 @@ def test_pyvista_offscreen_render(tmp_path):
     assert png.is_file()
     assert png.stat().st_size > 1024
     assert image.std() > 0  # not a uniform (blank) frame
+
+
+# --- Case-supplied code must be refused site-wide (allowSystemOperations 0) ---------------------
+
+REFUSAL = "case-supplied code"  # OpenFOAM's own wording when dynamic code is not allowed
+FOAM_HEADER = "FoamFile { version 2.0; format ascii; class dictionary; object d; }\n"
+
+
+def _foam_dictionary(path, *extra, cwd=None):
+    return subprocess.run(
+        ["foamDictionary", *extra, str(path)],
+        cwd=cwd or path.parent,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def test_system_operations_switch_is_off():
+    listed = subprocess.run(["icoFoam", "-listSwitches"], capture_output=True, text=True)
+    assert listed.returncode == 0, listed.stderr
+    line = next((x for x in listed.stdout.splitlines() if "allowSystemOperations" in x), "")
+    assert "Disallowing user-supplied system call operations" in line, listed.stdout[-500:]
+
+
+def test_codestream_refused_site_wide(tmp_path):
+    dictionary = tmp_path / "hostile"
+    dictionary.write_text(
+        FOAM_HEADER
+        + "trap #codeStream\n{\n    codeInclude #{ #include <fstream> #};\n"
+        + f'    code #{{ std::ofstream("{tmp_path}/EXECUTED") << "ran"; os << 1; #}};\n}};\n',
+        encoding="utf-8",
+    )
+    done = _foam_dictionary(dictionary)
+    assert done.returncode != 0
+    assert REFUSAL in done.stdout + done.stderr
+    assert not (tmp_path / "EXECUTED").exists()
+    assert not (tmp_path / "dynamicCode").exists()  # nothing was even generated for compiling
+
+
+def test_calc_is_refused_site_wide(tmp_path):
+    dictionary = tmp_path / "hostile"
+    dictionary.write_text(
+        FOAM_HEADER + f'x #calc "system(\\"touch {tmp_path}/EXECUTED\\")";\n', encoding="utf-8"
+    )
+    done = _foam_dictionary(dictionary)
+    assert done.returncode != 0
+    assert REFUSAL in done.stdout + done.stderr
+    assert not (tmp_path / "EXECUTED").exists()
+
+
+def test_eval_still_works_with_system_operations_off(tmp_path):
+    dictionary = tmp_path / "plain"
+    dictionary.write_text(FOAM_HEADER + 'x #eval "1 + 2";\n', encoding="utf-8")
+    done = _foam_dictionary(dictionary, "-entry", "x", "-value")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.strip() == "3"
+
+
+def test_user_level_controldict_could_reenable_the_switch_but_nothing_can_compile(tmp_path):
+    """HOME must stay out of agent-writable places (a ~/.OpenFOAM/controlDict beats the site file).
+
+    Second line of defence: the image has no compiler, so even an enabled switch cannot run
+    #calc, #codeStream or coded patch types and function objects. That is ALL it closes: a plain
+    ``libs ("x.so")`` entry (dlopen of a library an agent made earlier, on a mount that is not
+    noexec), the ``-libs`` option and the ``systemCall`` function object are not governed by the
+    switch. They are acceptable only because the container itself is the confinement (no
+    network, no capabilities, read-only root, resource limits).
+    """
+    home = tmp_path / "home"
+    (home / ".OpenFOAM").mkdir(parents=True)
+    (home / ".OpenFOAM" / "controlDict").write_text(
+        "InfoSwitches { allowSystemOperations 1; }\n", encoding="utf-8"
+    )
+    environment = {**os.environ, "HOME": str(home)}
+    listed = subprocess.run(
+        ["icoFoam", "-listSwitches"],
+        capture_output=True,
+        text=True,
+        errors="replace",
+        env=environment,
+    )
+    assert "Allowing user-supplied system call operations" in listed.stdout  # the override works
+    assert shutil.which("gcc") is None and shutil.which("g++") is None
+    dictionary = tmp_path / "hostile"
+    dictionary.write_text(
+        FOAM_HEADER + f'x #calc "system(\\"touch {tmp_path}/EXECUTED\\")";\n', encoding="utf-8"
+    )
+    done = subprocess.run(
+        ["foamDictionary", str(dictionary)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        env=environment,
+    )
+    assert done.returncode != 0
+    assert not (tmp_path / "EXECUTED").exists()
+
+
+def test_tutorials_are_in_the_image():
+    """Curated knowledge and the tutorial search read $FOAM_TUTORIALS; it must survive the purge."""
+    tutorials = Path(os.environ["FOAM_TUTORIALS"])
+    assert tutorials.is_dir(), tutorials
+    assert (tutorials / "incompressible").is_dir()
+    assert sum(1 for _ in tutorials.rglob("controlDict")) > 100
+
+
+def test_no_build_tools_in_the_image():
+    for tool in ("gcc", "g++", "cc", "c++", "cpp", "gfortran", "make", "wmake", "ld", "as"):
+        assert shutil.which(tool) is None, tool
