@@ -33,6 +33,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pydantic import BaseModel
+
 from cfdagent.agents.stage import Stage, StageContext
 from cfdagent.agents.tools import (
     NoArgs,
@@ -50,6 +52,7 @@ from cfdagent.llm.client import (
     TruncatedOutputError,
     Usage,
     assistant_message,
+    strict_schema,
 )
 from cfdagent.llm.cost import CostLimitExceeded
 from cfdagent.record import AttemptRecord, StageRecord, redact
@@ -109,7 +112,7 @@ def _elide_old_outputs(messages: list[dict]) -> None:
 
 
 @contextmanager
-def _internal(what: str) -> Iterator[None]:
+def internal(what: str) -> Iterator[None]:
     """Run bookkeeping that is not the model's business.
 
     ``RunDirError`` and friends are ``AgentInputError``s, which a tool call would show to the
@@ -122,32 +125,188 @@ def _internal(what: str) -> Iterator[None]:
         raise ToolFailure(f"{what} failed: {exc}") from exc
 
 
-def _short(text: object, limit: int = MAX_ECHOED_ERROR_CHARS) -> str:
+def short(text: object, limit: int = MAX_ECHOED_ERROR_CHARS) -> str:
     text = str(text)
     return text if len(text) <= limit else text[:limit] + "..."
 
 
-class _StageRun:
-    """The state of one ``run_stage`` call."""
+class ModelConversation:
+    """One conversation with the model of one agent: the message history, the model calls, their
+    billing and logging, and the reasons that stop a stage (wall clock, cost, a failed service).
 
-    def __init__(self, stage: Stage, ctx: StageContext) -> None:
-        self.stage = stage
+    ``_StageRun`` builds the gated stage loop on it; the Planner builds its two phases on it.
+    Subclasses count ``attempts`` (the number shown in the transcript is ``attempts + 1``).
+    """
+
+    def __init__(self, ctx: StageContext, stage_name: str, agent: str) -> None:
         self.ctx = ctx
+        self.stage_name = stage_name
+        self.agent = agent
         self.limits = ctx.config.limits
-        self.model = ctx.config.models[stage.agent]
+        self.model = ctx.config.models[agent]
         self.messages: list[dict] = []
         self.registry = ToolRegistry()
         self.attempts = 0  # gate runs so far
         self.turns = 0  # model turns since the last gate run
-        self.last_errors: list[str] = []
+        self.abort: str | None = None  # why the stage must stop, if it must
+        self.logged = 0  # messages already written to the transcript
+        self.last_problem: str | None = None  # what the last unusable reply was reported as
+        self.last_errors: list[str] = []  # the errors of the last failed attempt
+        self.record = StageRecord(name=stage_name, ok=False)
+        ctx.record.stages.append(self.record)
+
+    def _time_left(self) -> float:
+        return self.ctx.remaining_s()
+
+    def _wall_clock_reason(self) -> str:
+        return (
+            f"wall-clock limit of {self.limits.wall_clock_s:.0f} s reached during stage "
+            f"{self.stage_name!r}"
+        )
+
+    def _progress(self) -> None:
+        if self.ctx.on_progress is not None:
+            with internal("saving the run record"):
+                self.ctx.on_progress(self.stage_name)
+
+    # ------------------------------------------------------------------ the model
+
+    def _fail(self, reason: str) -> StageOutcome:
+        self.record.ok = False
+        return StageOutcome(
+            ok=False,
+            attempts=self.attempts,
+            errors=list(self.last_errors),
+            reason=redact(reason, MAX_REASON_CHARS),
+        )
+
+    def _prompt_chars(
+        self, response_schema: type[BaseModel] | None = None, with_tools: bool = True
+    ) -> int:
+        total = sum(message_chars(m) for m in self.messages)
+        if with_tools:
+            total += len(json.dumps(self.registry.schemas()))
+        if response_schema is not None:
+            total += len(json.dumps(strict_schema(response_schema.model_json_schema())))
+        return total
+
+    def _bill(self, usage: Usage | None, prompt_chars: int, completion_chars: int) -> None:
+        try:
+            self.ctx.cost.add(usage, prompt_chars, completion_chars)
+        except CostLimitExceeded as exc:
+            self.abort = f"cost limit: {exc}"
+
+    def _log(self, sent: int, result: ChatResult | None, error: str | None = None) -> None:
+        self.ctx.transcript.append(
+            self.stage_name,
+            self.agent,
+            self.attempts + 1,
+            self.model.deployment,
+            self.messages[self.logged : sent],
+            result,
+            error=error,
+        )
+        self.logged = sent
+
+    def _ask(
+        self, *, response_schema: type[BaseModel] | None = None, with_tools: bool = True
+    ) -> ChatResult | None:
+        """One model turn. Returns the reply, or ``None`` when there is none to act on: the
+        problem was reported to the model as a user message (and kept in ``last_problem``), or
+        ``self.abort`` is set.
+
+        With ``response_schema`` the reply must validate against it (``result.parsed``);
+        ``with_tools=False`` sends no tool definitions.
+        """
+        _elide_old_outputs(self.messages)
+        self.last_problem = None
+        retries = 0
+        while True:
+            if self._time_left() <= 0:
+                self.abort = self._wall_clock_reason()
+                return None
+            sent = len(self.messages)
+            prompt_chars = self._prompt_chars(response_schema, with_tools)
+            try:
+                result = self.ctx.backend.chat(
+                    self.messages,
+                    self.model,
+                    tools=self.registry.schemas() if with_tools else None,
+                    response_schema=response_schema,
+                )
+            except LLMTransportError as exc:
+                self._log(sent, None, error=f"{type(exc).__name__}: {exc}")
+                if exc.retryable and retries < TRANSPORT_RETRIES:
+                    self.ctx.sleep(BACKOFF_S[retries])
+                    retries += 1
+                    continue
+                status = f"HTTP {exc.status_code}" if exc.status_code else "no HTTP status"
+                again = f" after {retries} retries" if retries else ""
+                self.abort = f"the model service failed{again} ({status}): {redact(str(exc), 300)}"
+                return None
+            except LLMError as exc:
+                self.turns += 1
+                raw = getattr(exc, "raw_text", "") or ""
+                self._bill(exc.usage, prompt_chars, len(raw))
+                self._log(sent, None, error=f"{type(exc).__name__}: {exc}")
+                if self.abort is None:
+                    self.last_problem = self._unusable_text(exc)
+                    self.messages.append({"role": "user", "content": self.last_problem})
+                return None
+            self.turns += 1
+            completion = len(result.content or "") + sum(
+                len(json.dumps(call.arguments)) for call in result.tool_calls
+            )
+            self._bill(result.usage, prompt_chars, completion)
+            self._log(sent, result)
+            if self.abort is not None:
+                return None
+            if result.finish_reason == "length" or (
+                result.finish_reason == "content_filter" and not result.tool_calls
+            ):
+                # Not usable: a tool call cut off by the length limit may be incomplete in
+                # meaning even when its JSON parses, and an empty reply has nothing to act on.
+                # The reply is not echoed into the history, so no tool call is left unanswered.
+                self.last_problem = self._discarded_text(result)
+                self.messages.append({"role": "user", "content": self.last_problem})
+                return None
+            self.messages.append(assistant_message(result))
+            self.logged = len(self.messages)  # the echo is already in the transcript as the reply
+            return result
+
+    def _discarded_text(self, result: ChatResult) -> str:
+        if result.finish_reason == "length":
+            return (
+                "Your last reply was cut off at the output limit and was discarded, so none of "
+                "it was done. " + CUT_OFF_ADVICE
+            )
+        return (
+            "Your last reply was withheld by the content filter and was discarded. Reply "
+            "again with a shorter, plainer answer or a tool call."
+        )
+
+    def _unusable_text(self, exc: LLMError) -> str:
+        if isinstance(exc, TruncatedOutputError):
+            return (
+                "Your last reply could not be used: it was cut off at the output limit. "
+                + CUT_OFF_ADVICE
+            )
+        return (
+            f"Your last reply could not be used ({type(exc).__name__}: {short(exc)}). Reply "
+            "again with a valid tool call or a final answer."
+        )
+
+
+class _StageRun(ModelConversation):
+    """The state of one ``run_stage`` call."""
+
+    def __init__(self, stage: Stage, ctx: StageContext) -> None:
+        super().__init__(ctx, stage.name, stage.agent)
+        self.stage = stage
         self.passed = False
         self.exhausted = False
-        self.abort: str | None = None  # why the stage must stop, if it must
         self.attempt_dir = Path()
         self.attempt_started = 0.0
-        self.logged = 0  # messages already written to the transcript
-        self.record = StageRecord(name=stage.name, ok=False)
-        ctx.record.stages.append(self.record)
 
     # ------------------------------------------------------------------ attempts and tools
 
@@ -156,7 +315,7 @@ class _StageRun:
 
     def _start_attempt(self) -> None:
         number = self.attempts + 1
-        with _internal("preparing the attempt directory"):
+        with internal("preparing the attempt directory"):
             self.attempt_dir = self.ctx.run.attempt_dir(self.stage.name, number)
         self.attempt_started = self.ctx.clock()
         self.turns = 0
@@ -173,7 +332,7 @@ class _StageRun:
                 lambda _args: self._check(),
             )
         )
-        with _internal("building the stage tools"):
+        with internal("building the stage tools"):
             extra = self.stage.extra_tools(self.ctx, self.attempt_dir)
         for tool in extra:
             registry.add(tool)
@@ -184,15 +343,6 @@ class _StageRun:
             f"This is attempt {self.attempts + 1} of {self.limits.max_attempts_per_stage}. "
             f"Work in the attempt directory {self._relative(self.attempt_dir)} (paths are "
             "relative to the run directory). When the work is complete, call check_stage."
-        )
-
-    def _time_left(self) -> float:
-        return self.ctx.remaining_s()
-
-    def _wall_clock_reason(self) -> str:
-        return (
-            f"wall-clock limit of {self.limits.wall_clock_s:.0f} s reached during stage "
-            f"{self.stage.name!r}"
         )
 
     def _check(self) -> str:
@@ -231,112 +381,6 @@ class _StageRun:
             f"(attempt {self.attempts + 1} of {self.limits.max_attempts_per_stage}). Write the "
             f"corrected files there; the files of the previous attempt stay readable in "
             f"{previous}. Call check_stage again when done."
-        )
-
-    def _progress(self) -> None:
-        if self.ctx.on_progress is not None:
-            with _internal("saving the run record"):
-                self.ctx.on_progress(self.stage.name)
-
-    # ------------------------------------------------------------------ the model
-
-    def _prompt_chars(self) -> int:
-        schemas = json.dumps(self.registry.schemas())
-        return sum(message_chars(m) for m in self.messages) + len(schemas)
-
-    def _bill(self, usage: Usage | None, prompt_chars: int, completion_chars: int) -> None:
-        try:
-            self.ctx.cost.add(usage, prompt_chars, completion_chars)
-        except CostLimitExceeded as exc:
-            self.abort = f"cost limit: {exc}"
-
-    def _log(self, sent: int, result: ChatResult | None, error: str | None = None) -> None:
-        self.ctx.transcript.append(
-            self.stage.name,
-            self.stage.agent,
-            self.attempts + 1,
-            self.model.deployment,
-            self.messages[self.logged : sent],
-            result,
-            error=error,
-        )
-        self.logged = sent
-
-    def _ask(self) -> ChatResult | None:
-        """One model turn. Returns the reply, or ``None`` when there is none to act on: the
-        problem was reported to the model as a user message, or ``self.abort`` is set."""
-        _elide_old_outputs(self.messages)
-        retries = 0
-        while True:
-            if self._time_left() <= 0:
-                self.abort = self._wall_clock_reason()
-                return None
-            sent = len(self.messages)
-            prompt_chars = self._prompt_chars()
-            try:
-                result = self.ctx.backend.chat(
-                    self.messages, self.model, tools=self.registry.schemas()
-                )
-            except LLMTransportError as exc:
-                self._log(sent, None, error=f"{type(exc).__name__}: {exc}")
-                if exc.retryable and retries < TRANSPORT_RETRIES:
-                    self.ctx.sleep(BACKOFF_S[retries])
-                    retries += 1
-                    continue
-                status = f"HTTP {exc.status_code}" if exc.status_code else "no HTTP status"
-                again = f" after {retries} retries" if retries else ""
-                self.abort = f"the model service failed{again} ({status}): {redact(str(exc), 300)}"
-                return None
-            except LLMError as exc:
-                self.turns += 1
-                raw = getattr(exc, "raw_text", "") or ""
-                self._bill(exc.usage, prompt_chars, len(raw))
-                self._log(sent, None, error=f"{type(exc).__name__}: {exc}")
-                if self.abort is None:
-                    self.messages.append({"role": "user", "content": self._unusable_text(exc)})
-                return None
-            self.turns += 1
-            completion = len(result.content or "") + sum(
-                len(json.dumps(call.arguments)) for call in result.tool_calls
-            )
-            self._bill(result.usage, prompt_chars, completion)
-            self._log(sent, result)
-            if self.abort is not None:
-                return None
-            if result.finish_reason == "length" or (
-                result.finish_reason == "content_filter" and not result.tool_calls
-            ):
-                # Not usable: a tool call cut off by the length limit may be incomplete in
-                # meaning even when its JSON parses, and an empty reply has nothing to act on.
-                # The reply is not echoed into the history, so no tool call is left unanswered.
-                self.messages.append({"role": "user", "content": self._discarded_text(result)})
-                return None
-            self.messages.append(assistant_message(result))
-            self.logged = len(self.messages)  # the echo is already in the transcript as the reply
-            return result
-
-    @staticmethod
-    def _discarded_text(result: ChatResult) -> str:
-        if result.finish_reason == "length":
-            return (
-                "Your last reply was cut off at the output limit and was discarded, so none of "
-                "it was done. " + CUT_OFF_ADVICE
-            )
-        return (
-            "Your last reply was withheld by the content filter and was discarded. Reply "
-            "again with a shorter, plainer answer or a tool call."
-        )
-
-    @staticmethod
-    def _unusable_text(exc: LLMError) -> str:
-        if isinstance(exc, TruncatedOutputError):
-            return (
-                "Your last reply could not be used: it was cut off at the output limit. "
-                + CUT_OFF_ADVICE
-            )
-        return (
-            f"Your last reply could not be used ({type(exc).__name__}: {_short(exc)}). Reply "
-            "again with a valid tool call or a final answer."
         )
 
     # ------------------------------------------------------------------ the loop
@@ -382,12 +426,12 @@ class _StageRun:
         if self.abort is not None:
             return self._fail(self.abort)
         if self.passed:
-            with _internal("promoting the accepted attempt"):
+            with internal("promoting the accepted attempt"):
                 self.stage.promote(self.ctx, self.attempt_dir)
             self.record.ok = True
             self._progress()
             return StageOutcome(ok=True, attempts=self.attempts, errors=[], reason=None)
-        shown = _short("; ".join(self.last_errors), MAX_REASON_CHARS - 200)
+        shown = short("; ".join(self.last_errors), MAX_REASON_CHARS - 200)
         return self._fail(
             f"stage {self.stage.name!r} failed after {self.attempts} attempts; last errors: {shown}"
         )
@@ -407,15 +451,6 @@ class _StageRun:
                 f"{self._relative(self.attempt_dir)}"
             )
         return self.registry.dispatch(call)
-
-    def _fail(self, reason: str) -> StageOutcome:
-        self.record.ok = False
-        return StageOutcome(
-            ok=False,
-            attempts=self.attempts,
-            errors=list(self.last_errors),
-            reason=redact(reason, MAX_REASON_CHARS),
-        )
 
 
 def run_stage(stage: Stage, ctx: StageContext) -> StageOutcome:
