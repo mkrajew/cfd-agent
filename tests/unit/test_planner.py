@@ -1,6 +1,7 @@
 """Unit tests for the Planner: the gate on a CaseSpec and the two-phase planning loop."""
 
 import json
+import math
 import time
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from cfdagent.config import RunConfig, RunLimits
 from cfdagent.gates import GateResult
 from cfdagent.llm.client import (
     ChatResult,
+    EmptyChoicesError,
     LLMTransportError,
     SchemaError,
     StructuredOutputError,
@@ -173,10 +175,9 @@ def test_planner_rejects_2d_without_thickness():
         spec = make_spec(geometry={**SPEC["geometry"], "thickness_m": bad})
         result = plan_gate(spec, TASK, LIMITS)
         assert not result.ok
-        assert "thickness_m" in result.errors[0]
-    for fine in ("3D", "axisymmetric"):
-        spec = make_spec(dimensionality=fine, geometry={**SPEC["geometry"], "thickness_m": None})
-        assert plan_gate(spec, TASK, LIMITS).ok
+        assert any("thickness_m" in e for e in result.errors)
+    spec = make_spec(dimensionality="3D", geometry={**SPEC["geometry"], "thickness_m": None})
+    assert plan_gate(spec, TASK, LIMITS).ok
 
 
 @pytest.mark.parametrize(
@@ -206,6 +207,166 @@ def test_planner_gate_reports_several_resources_in_one_message():
     assert len(result.errors) == 1
     for word in ("cells", "runtime", "memory"):
         assert word in result.errors[0]
+
+
+def geometry(**changes) -> dict:
+    return {**SPEC["geometry"], **changes}
+
+
+def bbox(**changes) -> dict:
+    return {**SPEC["geometry"]["bbox"], **changes}
+
+
+def gate_errors(**changes) -> list[str]:
+    return plan_gate(make_spec(**changes), TASK, LIMITS).errors
+
+
+def test_planner_gate_checks_2d_thickness_against_the_bbox_z_extent():
+    mismatch = geometry(thickness_m=0.1, bbox=bbox(zmin=0.0, zmax=1.0))
+    errors = gate_errors(geometry=mismatch)
+    assert len(errors) == 1 and "thickness_m" in errors[0] and "zmax - zmin" in errors[0]
+    shifted = geometry(thickness_m=0.1, bbox=bbox(zmin=-0.05, zmax=0.05))
+    assert gate_errors(geometry=shifted) == []
+    tolerant = geometry(thickness_m=0.1, bbox=bbox(zmin=0.0, zmax=0.10005))  # 0.05 % off
+    assert gate_errors(geometry=tolerant) == []
+    thin = geometry(thickness_m=0.001, bbox=bbox(zmin=0.0, zmax=0.001))
+    assert gate_errors(geometry=thin) == []
+
+
+@pytest.mark.parametrize("angle", [None, 0.0, -5.0, 10.5, math.nan, math.inf])
+def test_planner_gate_requires_a_valid_wedge_angle_for_axisymmetric_cases(angle):
+    spec = make_spec(dimensionality="axisymmetric", geometry=geometry(wedge_angle_deg=angle))
+    errors = plan_gate(spec, TASK, LIMITS).errors
+    assert len(errors) == 1 and "wedge_angle_deg" in errors[0]
+
+
+@pytest.mark.parametrize("angle", [0.5, 5.0, 10.0])
+def test_planner_gate_accepts_a_wedge_for_axisymmetric_cases(angle):
+    spec = make_spec(dimensionality="axisymmetric", geometry=geometry(wedge_angle_deg=angle))
+    assert plan_gate(spec, TASK, LIMITS).ok
+
+
+@pytest.mark.parametrize("dimensionality", ["2D", "3D"])
+def test_planner_gate_rejects_a_wedge_angle_unless_axisymmetric(dimensionality):
+    spec = make_spec(dimensionality=dimensionality, geometry=geometry(wedge_angle_deg=5.0))
+    errors = plan_gate(spec, TASK, LIMITS).errors
+    assert len(errors) == 1 and "wedge_angle_deg" in errors[0] and "null" in errors[0]
+
+
+def test_planner_gate_allows_a_null_volume_but_not_a_nonpositive_one():
+    assert gate_errors(geometry=geometry(volume_m3=None)) == []
+    for bad in (0.0, -1.0, math.nan):
+        errors = gate_errors(geometry=geometry(volume_m3=bad))
+        assert len(errors) == 1 and "volume_m3" in errors[0]
+
+
+@pytest.mark.parametrize(
+    ("change", "field"),
+    [
+        ({"fluid": {"density_kg_m3": 0.0, "kinematic_viscosity_m2_s": 0.01}}, "density_kg_m3"),
+        ({"fluid": {"density_kg_m3": -1.0, "kinematic_viscosity_m2_s": 0.01}}, "density_kg_m3"),
+        ({"fluid": {"density_kg_m3": 1.0, "kinematic_viscosity_m2_s": -0.01}}, "kinematic"),
+        (
+            {"reference": {"length_m": 0.0, "velocity_m_s": 1.0, "reynolds_number": None}},
+            "length_m",
+        ),
+        (
+            {"reference": {"length_m": 1.0, "velocity_m_s": -1.0, "reynolds_number": None}},
+            "velocity_m_s",
+        ),
+    ],
+)
+def test_planner_gate_rejects_unphysical_properties_even_without_a_reynolds_number(change, field):
+    errors = gate_errors(**change)
+    assert errors and any(field in e for e in errors)
+
+
+def test_planner_gate_allows_zero_reference_velocity_only_without_a_reynolds_number():
+    ok = {"length_m": 1.0, "velocity_m_s": 0.0, "reynolds_number": None}
+    assert gate_errors(reference=ok) == []
+    errors = gate_errors(reference={**ok, "reynolds_number": 100.0})
+    assert len(errors) == 1 and "velocity" in errors[0]
+
+
+NAN = math.nan
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"fluid": {"density_kg_m3": NAN, "kinematic_viscosity_m2_s": 0.01}},
+        {"fluid": {"density_kg_m3": 1.0, "kinematic_viscosity_m2_s": NAN}},
+        {"reference": {"length_m": NAN, "velocity_m_s": 1.0, "reynolds_number": None}},
+        {"reference": {"length_m": 1.0, "velocity_m_s": NAN, "reynolds_number": None}},
+        {"reference": {"length_m": 1.0, "velocity_m_s": 1.0, "reynolds_number": NAN}},
+        {"geometry": geometry(bbox=bbox(xmax=NAN))},
+        {"geometry": geometry(bbox=bbox(zmin=NAN))},
+        {"geometry": geometry(bbox=bbox(xmax=math.inf))},
+        {"geometry": geometry(thickness_m=NAN)},
+        {"geometry": geometry(volume_m3=NAN)},
+        {"solver": {**SPEC["solver"], "end_time_s": NAN}},
+        {"solver": {**SPEC["solver"], "end_time_s": math.inf}},
+        {"resource_estimate": {"cells": 8000, "runtime_minutes": NAN, "memory_gb": 0.5}},
+        {"resource_estimate": {"cells": 8000, "runtime_minutes": 5.0, "memory_gb": NAN}},
+        {"resource_estimate": {"cells": 8000, "runtime_minutes": math.inf, "memory_gb": 0.5}},
+        {"time_dependence": "transient", "solver": {**SPEC["solver"], "time_step_s": NAN}},
+    ],
+)
+def test_planner_gate_never_lets_a_non_finite_number_pass(change):
+    assert not plan_gate(make_spec(**change), TASK, LIMITS).ok
+
+
+@pytest.mark.parametrize(
+    "estimate",
+    [
+        {"cells": 0, "runtime_minutes": 5.0, "memory_gb": 0.5},
+        {"cells": -5, "runtime_minutes": -1.0, "memory_gb": -2.0},
+        {"cells": 8000, "runtime_minutes": 0.0, "memory_gb": 0.5},
+        {"cells": 8000, "runtime_minutes": 5.0, "memory_gb": -2.0},
+    ],
+)
+def test_planner_gate_rejects_nonsense_resource_estimates_without_the_resource_prefix(estimate):
+    errors = gate_errors(resource_estimate=estimate)
+    assert errors
+    assert not any(e.startswith("exceeds resources:") for e in errors)  # retried, not terminal
+
+
+def test_planner_gate_rejects_a_nonpositive_target_cell_count():
+    errors = gate_errors(mesh={"target_cells": 0, "rationale": "x"})
+    assert any("target_cells" in e for e in errors)
+
+
+def test_planner_gate_counts_the_target_mesh_against_the_cell_limit():
+    mesh = {"target_cells": 50_000_000, "rationale": "fine"}
+    errors = gate_errors(mesh=mesh)  # the estimate says 8000 cells: contradictory
+    prefixed = [e for e in errors if e.startswith("exceeds resources:")]
+    assert len(prefixed) == 1 and "50000000" in prefixed[0]
+    assert any("smaller than mesh.target_cells" in e for e in errors)  # so it is retried
+    both = {"cells": 50_000_000, "runtime_minutes": 5.0, "memory_gb": 0.5}
+    only = gate_errors(mesh=mesh, resource_estimate=both)
+    assert len(only) == 1 and only[0].startswith("exceeds resources:")
+
+
+def test_planner_gate_requires_the_estimate_to_cover_the_target_mesh():
+    mesh = {"target_cells": 10_000, "rationale": "x"}
+    errors = gate_errors(mesh=mesh)  # estimate: 8000 cells
+    assert len(errors) == 1 and "resource_estimate.cells" in errors[0]
+    assert not errors[0].startswith("exceeds resources:")
+    covered = {"cells": 10_000, "runtime_minutes": 5.0, "memory_gb": 0.5}
+    assert gate_errors(mesh=mesh, resource_estimate=covered) == []
+
+
+@pytest.mark.parametrize("step", [None, 0.0, -0.1, 1000.0, 2000.0, NAN])
+def test_planner_gate_requires_a_usable_time_step_for_transient_cases(step):
+    solver = {**SPEC["solver"], "time_step_s": step}  # end_time_s is 1000
+    errors = gate_errors(time_dependence="transient", solver=solver)
+    assert len(errors) == 1 and "time_step_s" in errors[0]
+
+
+def test_planner_gate_accepts_a_good_transient_step_and_ignores_the_step_when_steady():
+    solver = {**SPEC["solver"], "time_step_s": 0.5}
+    assert gate_errors(time_dependence="transient", solver=solver) == []
+    assert gate_errors(time_dependence="steady", solver=solver) == []
 
 
 def test_planner_gate_collects_independent_errors():
@@ -344,6 +505,7 @@ def test_planner_does_not_retry_when_only_resources_are_exceeded(tmp_path):
     assert written["resource_estimate"]["cells"] == 5_000_000  # the recorded estimate
     stage = ctx.record.stages[-1]
     assert not stage.ok and len(stage.attempts) == 1
+    assert ctx.casespec is None  # the plan is recorded, but it is not an accepted plan
 
 
 def test_planner_retries_when_resources_are_exceeded_together_with_other_errors(tmp_path):
@@ -446,7 +608,44 @@ def test_planner_prompt_states_the_required_instructions():
         "SI units",
         "Flow regime",
         "symmetry",
-        "exact",
+        "use it exactly as the `name`",
         "requested_outputs",
     ):
         assert phrase in text, phrase
+
+
+def test_planner_gives_up_when_the_gate_rejects_every_attempt(tmp_path):
+    bad = spec_json(solver={**SPEC["solver"], "end_time_s": 0.0})
+    steps = [reply("Plan ready."), reply(bad), reply(bad), reply(bad)]
+    ctx, backend = make_ctx(tmp_path, steps)
+    outcome = run_planner(ctx, TASK)
+    assert not outcome.ok and outcome.attempts == 3
+    assert any("end_time_s" in e for e in outcome.errors)
+    assert outcome.reason and "end_time_s" in outcome.reason
+    assert not (tmp_path / "run" / "casespec.json").exists()
+    assert ctx.casespec is None
+    assert len(backend.calls) == 4
+
+
+def test_planner_discards_a_valid_looking_reply_cut_off_at_the_length_limit(tmp_path):
+    steps = [
+        reply("Plan ready."),
+        reply(spec_json(), finish_reason="length"),  # parses, but may be incomplete in meaning
+        reply(spec_json()),
+    ]
+    ctx, backend = make_ctx(tmp_path, steps)
+    outcome = run_planner(ctx, TASK)
+    assert outcome.ok and outcome.attempts == 2
+    retry = backend.calls[2].messages
+    assert "output limit" in retry[-1]["content"] and "CaseSpec" in retry[-1]["content"]
+    assert not any(m["role"] == "assistant" and m["content"] == spec_json() for m in retry)
+
+
+def test_planner_retries_after_any_other_unusable_reply(tmp_path):
+    steps = [reply("Plan ready."), EmptyChoicesError("no choices"), reply(spec_json())]
+    ctx, backend = make_ctx(tmp_path, steps)
+    outcome = run_planner(ctx, TASK)
+    assert outcome.ok and outcome.attempts == 2
+    text = backend.calls[2].messages[-1]["content"]
+    assert "EmptyChoicesError" in text and "CaseSpec" in text
+    assert "tool call" not in text  # phase 2 has no tools

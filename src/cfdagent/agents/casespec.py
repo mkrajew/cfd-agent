@@ -38,6 +38,8 @@ class Reference(_Closed):
 
 
 class BoundingBox(_Closed):
+    """Axis-aligned bounding box of the modelled fluid domain, in metres."""
+
     xmin: float = Field(description="Metres")
     ymin: float = Field(description="Metres")
     zmin: float = Field(description="Metres")
@@ -53,13 +55,18 @@ class KeyDimension(_Closed):
 
 class Geometry(_Closed):
     description: str = Field(description="What the fluid domain is, in plain words")
-    bbox: BoundingBox = Field(description="Axis-aligned bounding box of the fluid domain")
+    bbox: BoundingBox
     volume_m3: float | None = Field(
-        description="Volume of the fluid domain in m^3 when it can be computed exactly, else null"
+        description="Volume in m^3 of the modelled domain (for 2D the area times thickness_m, for "
+        "axisymmetric the wedge) when it can be computed exactly, else null"
     )
     key_dimensions: list[KeyDimension] = Field(description="Dimensions the geometry must match")
     thickness_m: float | None = Field(
-        description="Extent in the out-of-plane direction in metres for a 2D case, else null"
+        description="Extent along z in metres for a 2D case (zmax - zmin), else null"
+    )
+    wedge_angle_deg: float | None = Field(
+        description="Opening angle of the wedge in degrees (above 0, at most 10) for an "
+        "axisymmetric case, else null"
     )
 
 

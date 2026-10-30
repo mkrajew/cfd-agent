@@ -1,7 +1,7 @@
 """Unit tests for the CaseSpec model: strict-schema friendliness and the gate-facing accessors."""
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from cfdagent.agents.casespec import CaseSpec
 from cfdagent.llm.client import strict_schema
@@ -20,6 +20,7 @@ SPEC = {
         "volume_m3": 0.4,
         "key_dimensions": [{"name": "height", "value_m": 1.0}],
         "thickness_m": 0.1,
+        "wedge_angle_deg": None,
     },
     "boundaries": [
         {"name": "inlet", "role": "inlet", "description": "plane x=0"},
@@ -63,6 +64,8 @@ def _violations(schema) -> list[str]:
             found.append(f"tuple at {path}")
         if node.get("type") == "object" and not node.get("properties"):
             found.append(f"object without declared properties at {path}")
+        if "$ref" in node and len(node) > 1:  # strict services may reject siblings of a $ref
+            found.append(f"$ref with sibling keywords at {path}")
         if "default" in node:  # pydantic would also leave the field out of `required`
             found.append(f"default keyword at {path}")
         properties = node.get("properties")
@@ -84,16 +87,21 @@ def test_casespec_schema_has_no_maps_or_tuples():
 def test_casespec_schema_check_can_fail():
     """The detector must flag the constructs it is meant to flag."""
 
+    class Box(BaseModel):
+        side: float
+
     class Bad(BaseModel):
         values: dict[str, float]
         pair: tuple[float, float]
         optional: float = 1.0
+        box: Box = Field(description="has a sibling next to its $ref")
 
     found = " ".join(_violations(Bad.model_json_schema()))
     assert "map at" in found
     assert "tuple at" in found
     assert "default keyword" in found
     assert "optional field" in found
+    assert "$ref with sibling" in found
 
 
 def test_casespec_every_field_is_required():
