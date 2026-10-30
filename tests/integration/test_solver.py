@@ -5,98 +5,18 @@ fixtures only (the pipeline itself never uses blockMesh).
 """
 
 import hashlib
-import os
 import re
 import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
+from foam_cases import build_case, needs_4_threads
 
 from cfdagent.errors import AgentInputError
 from cfdagent.tools.foam import SolverRun, parse_solver_log, run_solver, trial_run
 from cfdagent.tools.process import run_tool
 
 pytestmark = pytest.mark.integration
-
-
-def _hardware_threads() -> int:
-    """CPUs this process may use; OpenMPI with --use-hwthread-cpus offers one slot per CPU."""
-    affinity = getattr(os, "sched_getaffinity", None)
-    return len(affinity(0)) if affinity else (os.cpu_count() or 1)
-
-
-needs_4_threads = pytest.mark.skipif(
-    _hardware_threads() < 4,
-    reason="mpirun --use-hwthread-cpus -np 4 needs 4 hardware threads (the project VM has 4)",
-)
-
-FIXTURE_CASE = Path(__file__).parents[1] / "fixtures" / "handwritten" / "cavity_re100" / "case"
-
-BLOCK_MESH_DICT = """FoamFile
-{
-    version 2.0;
-    format ascii;
-    class dictionary;
-    object blockMeshDict;
-}
-
-convertToMeters 1;
-
-vertices
-(
-    (0 0 0) (1 0 0) (1 1 0) (0 1 0)
-    (0 0 0.1) (1 0 0.1) (1 1 0.1) (0 1 0.1)
-);
-
-blocks ( hex (0 1 2 3 4 5 6 7) (20 20 1) simpleGrading (1 1 1) );
-
-edges ();
-
-boundary
-(
-    movingWall { type wall; faces ((3 7 6 2)); }
-    fixedWalls { type wall; faces ((0 4 7 3) (2 6 5 1) (1 5 4 0)); }
-    frontAndBack { type empty; faces ((0 3 2 1) (4 5 6 7)); }
-);
-"""
-
-CONTROL_DICT = """FoamFile
-{{
-    version 2.0;
-    format ascii;
-    class dictionary;
-    object controlDict;
-}}
-
-application icoFoam;
-startFrom startTime;
-startTime 0;
-stopAt endTime;
-endTime {end_time};
-deltaT 0.005;
-writeControl timeStep;
-writeInterval 50;
-writeFormat ascii;
-writePrecision 8;
-timeFormat general;
-timePrecision 6;
-runTimeModifiable false;
-"""
-
-
-def _build_case(root: Path, end_time: float = 0.25) -> Path:
-    """A 20 x 20 x 1 cell case with the fixture's fields and schemes, mesh from blockMesh."""
-    case = root / "case"
-    for sub in ("0", "constant", "system"):
-        shutil.copytree(FIXTURE_CASE / sub, case / sub)
-    (case / "system" / "blockMeshDict").write_text(BLOCK_MESH_DICT, encoding="utf-8")
-    (case / "system" / "controlDict").write_text(
-        CONTROL_DICT.format(end_time=end_time), encoding="utf-8"
-    )
-    made = subprocess.run(["blockMesh"], cwd=case, capture_output=True, text=True)
-    assert made.returncode == 0, made.stdout + made.stderr
-    return case
 
 
 def _snapshot(root: Path) -> dict[str, str]:
@@ -138,7 +58,7 @@ def test_run_solver_real_run_without_a_mesh_fails_closed(tmp_path):
 
 def test_missing_controldict_does_not_complete(tmp_path):
     """Regression: a case without controlDict must never pass (no skeleton file with deltaT 1)."""
-    case = _build_case(tmp_path)
+    case = build_case(tmp_path)
     (case / "system" / "controlDict").unlink()
     result = run_solver(case, "icoFoam", timeout_s=120)
     assert not result.ok
@@ -149,7 +69,7 @@ def test_missing_controldict_does_not_complete(tmp_path):
 
 
 def test_serial_run_is_ok_and_ends_at_the_case_end_time(tmp_path):
-    case = _build_case(tmp_path, end_time=0.25)
+    case = build_case(tmp_path, end_time=0.25)
     result = run_solver(case, "icoFoam", timeout_s=300)
     assert result.ok, result.tool.tail
     assert result.case_end_time == pytest.approx(0.25)
@@ -173,8 +93,8 @@ def test_mpirun_np4_hostname(tmp_path):
 
 @pytest.mark.parametrize("n_procs", [2, pytest.param(4, marks=needs_4_threads)])
 def test_parallel_cavity_matches_serial(tmp_path, n_procs):
-    serial_case = _build_case(tmp_path / "serial")
-    parallel_case = _build_case(tmp_path / "parallel")
+    serial_case = build_case(tmp_path / "serial")
+    parallel_case = build_case(tmp_path / "parallel")
 
     serial = run_solver(serial_case, "icoFoam", n_procs=1, timeout_s=300)
     parallel = run_solver(parallel_case, "icoFoam", n_procs=n_procs, timeout_s=300)
@@ -197,7 +117,7 @@ def test_parallel_cavity_matches_serial(tmp_path, n_procs):
 
 
 def test_trial_run_does_not_touch_case_dir(tmp_path):
-    case = _build_case(tmp_path, end_time=40)
+    case = build_case(tmp_path, end_time=40)
     # Leftovers a trial run must neither copy nor change.
     (case / "postProcessing").mkdir()
     (case / "postProcessing" / "old.dat").write_text("old\n", encoding="utf-8")
@@ -215,7 +135,7 @@ def test_trial_run_does_not_touch_case_dir(tmp_path):
 
 
 def test_trial_run_reports_fatal_error(tmp_path):
-    case = _build_case(tmp_path)
+    case = build_case(tmp_path)
     u_file = case / "0" / "U"
     u_file.write_text(
         u_file.read_text(encoding="utf-8").replace("noSlip", "noSlipp"), encoding="utf-8"
@@ -230,7 +150,7 @@ def test_trial_run_reports_fatal_error(tmp_path):
 
 
 def test_trial_run_without_control_dict_is_the_agents_fault(tmp_path):
-    case = _build_case(tmp_path)
+    case = build_case(tmp_path)
     (case / "system" / "controlDict").unlink()
     with pytest.raises(AgentInputError, match="controlDict"):
         trial_run(case, "icoFoam")
@@ -336,7 +256,7 @@ simulationType laminar;
 
 def _build_steady_case(root: Path) -> Path:
     """A tiny steady laminar case (simpleFoam) that stops early on ``residualControl``."""
-    case = _build_case(root)
+    case = build_case(root)
     (case / "system" / "controlDict").write_text(STEADY_CONTROL_DICT, encoding="utf-8")
     (case / "system" / "fvSchemes").write_text(STEADY_FV_SCHEMES, encoding="utf-8")
     (case / "system" / "fvSolution").write_text(STEADY_FV_SOLUTION, encoding="utf-8")
@@ -370,7 +290,7 @@ def test_steady_run_that_reaches_its_end_time_without_converging_is_ok(tmp_path)
 
 
 def test_start_from_latest_time_with_an_old_result_advances_no_step(tmp_path):
-    case = _build_case(tmp_path, end_time=0.25)
+    case = build_case(tmp_path, end_time=0.25)
     first = run_solver(case, "icoFoam", timeout_s=300)
     assert first.ok, first.tool.tail
     control = case / "system" / "controlDict"
@@ -408,7 +328,7 @@ functions
 
 
 def test_trial_run_surfaces_an_error_that_only_shows_when_writing(tmp_path):
-    case = _build_case(tmp_path, end_time=40)
+    case = build_case(tmp_path, end_time=40)
     control = case / "system" / "controlDict"
     control.write_text(control.read_text(encoding="utf-8") + BAD_FUNCTION_OBJECT, encoding="utf-8")
     # writeInterval is 50 steps, so a plain three-step run never writes and never meets the error.
@@ -446,7 +366,7 @@ PIMPLE
 
 def _build_adjustable_case(root: Path, max_co: float, max_delta_t: float) -> Path:
     """A transient pimpleFoam case with an adjustable time step."""
-    case = _build_case(root, end_time=40)
+    case = build_case(root, end_time=40)
     control = case / "system" / "controlDict"
     text = control.read_text(encoding="utf-8").replace(
         "application icoFoam;", "application pimpleFoam;"

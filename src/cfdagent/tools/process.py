@@ -43,6 +43,8 @@ TAIL_MAX_BYTES = 8000
 
 # Environment passed to the child. Everything else (cloud credentials, API keys, ...) is dropped.
 # SYSTEMROOT, PATHEXT, TEMP, TMP and COMSPEC are needed to start a process on Windows.
+# ``sandbox.client`` (host side, must not import this module) keeps a copy of both lists for its
+# local mode; change them together, a unit test compares them.
 SAFE_ENV_KEYS: tuple[str, ...] = (
     "PATH",
     "HOME",

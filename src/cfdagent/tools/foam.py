@@ -589,7 +589,12 @@ def _copy_into(source: Path, target: Path) -> None:
     try:
         shutil.copytree(source, target, symlinks=False)
     except OSError as exc:  # shutil.Error is an OSError
-        hint = "; check the free disk space" if _is_out_of_space(exc) else ""
+        hint = (
+            f"; check the free disk space in {tempfile.gettempdir()}, where the scratch copy "
+            "is made (in the sandbox this is a small tmpfs, not the disk)"
+            if _is_out_of_space(exc)
+            else ""
+        )
         raise ToolFailure(
             f"could not copy {source.name} into the scratch directory: {exc}{hint}"
         ) from exc
