@@ -11,9 +11,16 @@
 # attempt is retried 3 times; if all fail the script exits non-zero and keeps its state, so the
 # next timer run tries again.
 #
-# Usage: cfdagent-idle-shutdown [--dry-run | --force | --check]
-#   --dry-run  take the decision and print it, but do not call Azure.
-#   --force    deallocate now, whatever is running (used by the daily-shutdown timer).
+# Usage: cfdagent-idle-shutdown [--dry-run | --force | --daily | --check] [--dry-run]
+#   --dry-run  take the decision and print it, but do not call Azure (also combines with
+#              --force and --daily).
+#   --force    deallocate now, whatever is running.
+#   --daily    used by the daily-shutdown timer, which fires every 10 minutes in a window after the
+#              shutdown time. While $STATE_DIR/active-run exists and its modification time is
+#              younger than 4 hours (a `cfdagent run` is under way) it logs "deferred: active run"
+#              and exits 0 without deallocating, so the next timer run asks again. Otherwise it
+#              behaves like --force. A marker that is older, dated in the future or not a regular
+#              file is ignored. The script never creates or removes the marker.
 #   --check    get an IMDS token and read this VM through ARM; proves identity, role assignment
 #              and network without deallocating anything.
 # Test hooks (environment): CFDAGENT_STATE_DIR, CFDAGENT_IDLE_MINUTES, CFDAGENT_IMAGE,
@@ -25,22 +32,27 @@ IDLE_MINUTES="${CFDAGENT_IDLE_MINUTES:-30}"
 IMAGE_REPO="${CFDAGENT_IMAGE:-ghcr.io/mkrajew/cfd-agent}"
 RETRY_SLEEP="${CFDAGENT_RETRY_SLEEP:-10}"
 IDLE_FILE="${STATE_DIR}/idle-since"
+ACTIVE_FILE="${STATE_DIR}/active-run"
+ACTIVE_MAX_SECONDS=$((4 * 3600))
 IMDS="http://169.254.169.254/metadata"
 ARM="https://management.azure.com"
 ARM_API_VERSION="2024-07-01"
 ATTEMPTS=3
 
 MODE=idle
-case "${1:-}" in
-    --dry-run) MODE=dry-run ;;
-    --force) MODE=force ;;
-    --check) MODE=check ;;
-    "") ;;
-    *)
-        echo "usage: $0 [--dry-run | --force | --check]" >&2
-        exit 2
-        ;;
-esac
+DRY=0
+for arg in "$@"; do
+    case "${arg}" in
+        --dry-run) DRY=1 ;;
+        --force) MODE=force ;;
+        --daily) MODE=daily ;;
+        --check) MODE=check ;;
+        *)
+            echo "usage: $0 [--dry-run | --force | --daily | --check] [--dry-run]" >&2
+            exit 2
+            ;;
+    esac
+done
 
 log() { echo "$*"; }
 err() { echo "$*" >&2; }
@@ -169,12 +181,56 @@ retry() {
 
 now="${CFDAGENT_NOW:-$(date +%s)}"
 
+# Print "active <age>" (a run is under way), "stale <age>" or "none" for the active-run marker.
+# Only the modification time counts, never the content. A missing marker, something that is not a
+# regular file (a directory, a dangling link), an unreadable time and a time in the future all
+# count as "none": a damaged marker must not keep the VM running.
+active_run_state() {
+    local mtime age
+    if [ ! -f "${ACTIVE_FILE}" ]; then
+        echo none
+        return 0
+    fi
+    mtime="$(stat -L -c %Y "${ACTIVE_FILE}" 2>/dev/null || true)"
+    case "${mtime}" in
+        '' | *[!0-9]*)
+            echo none
+            return 0
+            ;;
+    esac
+    age=$((now - mtime))
+    if [ "${age}" -lt 0 ]; then
+        echo none
+    elif [ "${age}" -lt "${ACTIVE_MAX_SECONDS}" ]; then
+        echo "active ${age}"
+    else
+        echo "stale ${age}"
+    fi
+}
+
 if [ "${MODE}" = check ]; then
     retry check_once
     exit $?
 fi
 
-if [ "${MODE}" = force ]; then
+if [ "${MODE}" = daily ]; then
+    read -r marker_state marker_age <<<"$(active_run_state)"
+    case "${marker_state}" in
+        active)
+            log "deferred: active run (marker is $((marker_age / 60)) of $((ACTIVE_MAX_SECONDS / 60)) minutes old); the next timer run asks again"
+            exit 0
+            ;;
+        stale)
+            log "ignoring stale active-run marker ($((marker_age / 60)) minutes old, limit $((ACTIVE_MAX_SECONDS / 60)))"
+            ;;
+    esac
+fi
+
+if [ "${MODE}" = force ] || [ "${MODE}" = daily ]; then
+    if [ "${DRY}" = 1 ]; then
+        log "dry run: would deallocate (${MODE} shutdown)"
+        exit 0
+    fi
     log "forced shutdown"
     wall "cfdagent: daily shutdown, this VM is being deallocated now" 2>/dev/null || true
     retry deallocate_once
@@ -216,7 +272,7 @@ if [ "${idle_s}" -lt "${limit_s}" ]; then
     exit 0
 fi
 
-if [ "${MODE}" = dry-run ]; then
+if [ "${DRY}" = 1 ]; then
     log "dry run: would deallocate (idle for $((idle_s / 60)) minutes)"
     exit 0
 fi

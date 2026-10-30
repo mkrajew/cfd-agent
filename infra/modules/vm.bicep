@@ -1,5 +1,7 @@
 // The research VM: Ubuntu 24.04, SSH key only, system-assigned identity.
-// cloud-init installs Docker, the idle-shutdown timer and the daily-shutdown timer (infra/vm).
+// cloud-init installs Docker, the idle-shutdown timer, the daily-shutdown timer, the metadata
+// firewall and the SSH limits (infra/vm). The same files are applied to a running VM by
+// scripts/vm-host-setup.sh, because customData cannot change after the VM exists.
 // The daily shutdown runs on the VM because Microsoft.DevTestLab/schedules is not offered in any
 // region this subscription may use.
 param location string
@@ -17,16 +19,19 @@ param containerImage string
 
 var vmName = 'vm-cfdagent'
 
-// The idle-shutdown files are embedded in cloud-init as base64 so that they are written
-// byte for byte (LF endings, no YAML indentation issues).
 var dailyTimer = replace(
   loadTextContent('../vm/daily-shutdown.timer'),
   '__ON_CALENDAR__',
   '*-*-* ${substring(shutdownTime, 0, 2)}:${substring(shutdownTime, 2, 2)}:00 ${shutdownTimeZone}'
 )
+// The VM files are embedded in cloud-init as base64 so that they are written
+// byte for byte (LF endings, no YAML indentation issues).
 var cloudInitSteps = [
   { placeholder: '__ADMIN_USER__', value: adminUsername }
   { placeholder: '__CONTAINER_IMAGE__', value: containerImage }
+  { placeholder: '__B64_SSH_EXTRA__', value: base64(replace(loadTextContent('../vm/20-cfdagent-ssh-extra.conf'), '__ADMIN_USER__', adminUsername)) }
+  { placeholder: '__B64_IPTABLES_SCRIPT__', value: base64(loadTextContent('../vm/cfdagent-iptables.sh')) }
+  { placeholder: '__B64_IPTABLES_SERVICE__', value: base64(loadTextContent('../vm/cfdagent-iptables.service')) }
   { placeholder: '__B64_IDLE_SCRIPT__', value: base64(loadTextContent('../vm/idle-shutdown.sh')) }
   { placeholder: '__B64_IDLE_SERVICE__', value: base64(loadTextContent('../vm/idle-shutdown.service')) }
   { placeholder: '__B64_IDLE_TIMER__', value: base64(loadTextContent('../vm/idle-shutdown.timer')) }

@@ -7,86 +7,38 @@ a configurable number of times.
 """
 
 import json
-import shutil
-import stat
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
-
-SCRIPT = Path(__file__).resolve().parents[2] / "infra" / "vm" / "idle-shutdown.sh"
-BASH = shutil.which("bash")
-PYTHON3 = shutil.which("python3")
+from shell_stubs import (
+    BASH,
+    BOOT_AGO,
+    CURL_STUB,
+    NOW,
+    PGREP_STUB,
+    PYTHON3,
+    SCRIPT,
+    stub_executable,
+)
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32" or BASH is None or PYTHON3 is None,
     reason="needs a POSIX bash and python3 (runs in CI and in the Linux image)",
 )
 
-NOW = 1_800_000_000
-BOOT_AGO = 2 * 3600  # the stubbed VM booted two hours ago
-COMPUTE_JSON = '{"subscriptionId":"s","resourceGroupName":"g","name":"v"}'
-TOKEN_JSON = '{"access_token":"secret-token"}'
-
-# Stub for curl: logs its arguments, writes a body to -o, prints the status code for -w and
-# exits 22 on HTTP errors like `curl --fail-with-body`. The URL is the last argument.
-CURL_STUB = r"""
-echo "$*" >> "$STUB_CURL_LOG"
-out=
-prev=
-url=
-for arg in "$@"; do
-  if [ "$prev" = "-o" ]; then out=$arg; fi
-  prev=$arg
-  url=$arg
-done
-code=200
-body='{}'
-case "$url" in
-  *instance/compute*)
-    code=${STUB_META_CODE:-200}; body='__COMPUTE__'
-    if [ -n "$STUB_COMPUTE_FILE" ]; then body=$(cat "$STUB_COMPUTE_FILE"); fi ;;
-  *oauth2/token*) code=${STUB_TOKEN_CODE:-200}; body='__TOKEN__' ;;
-  */deallocate*)
-    n=$(cat "$STUB_COUNTER" 2>/dev/null || echo 0)
-    echo $((n + 1)) > "$STUB_COUNTER"
-    if [ "$n" -lt "${STUB_ARM_FAILS:-0}" ]; then
-      code=500; body='{"error":"boom"}'
-    else
-      code=202; body=''
-    fi ;;
-  *virtualMachines/v\?*) code=${STUB_GET_CODE:-200}; body='{"name":"v"}' ;;
-esac
-if [ -n "$out" ]; then printf '%s' "$body" > "$out"; fi
-printf '%s' "$code"
-if [ "$code" -ge 400 ]; then exit 22; fi
-""".replace("__COMPUTE__", COMPUTE_JSON).replace("__TOKEN__", TOKEN_JSON)
-
-PGREP_STUB = r"""
-case "$*" in
-  *-x*) exit "${STUB_PGREP_X_RC:-1}" ;;
-  *) exit "${STUB_PGREP_F_RC:-1}" ;;
-esac
-"""
-
-
-def _stub(directory: Path, name: str, body: str) -> None:
-    path = directory / name
-    path.write_text("#!/bin/sh\n" + body)
-    path.chmod(path.stat().st_mode | stat.S_IEXEC)
-
 
 @pytest.fixture
 def env(tmp_path: Path) -> dict[str, str]:
     stubs = tmp_path / "stubs"
     stubs.mkdir()
-    _stub(stubs, "who", 'printf "%s" "$STUB_WHO"\n')
-    _stub(stubs, "ss", 'printf "%s" "$STUB_SS"\n')
-    _stub(stubs, "pgrep", PGREP_STUB)
-    _stub(stubs, "docker", 'printf "%s" "$STUB_DOCKER_PS"\n')
-    _stub(stubs, "wall", "exit 0\n")
-    _stub(stubs, "curl", CURL_STUB)
+    stub_executable(stubs, "who", 'printf "%s" "$STUB_WHO"\n')
+    stub_executable(stubs, "ss", 'printf "%s" "$STUB_SS"\n')
+    stub_executable(stubs, "pgrep", PGREP_STUB)
+    stub_executable(stubs, "docker", 'printf "%s" "$STUB_DOCKER_PS"\n')
+    stub_executable(stubs, "wall", "exit 0\n")
+    stub_executable(stubs, "curl", CURL_STUB)
     return {
         "PATH": f"{stubs}:{Path(PYTHON3 or '').parent}:/usr/local/bin:/usr/bin:/bin",
         "CFDAGENT_STATE_DIR": str(tmp_path / "state"),
