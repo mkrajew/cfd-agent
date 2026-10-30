@@ -1,7 +1,12 @@
 """Shared helpers for the tests that run the VM shell scripts with stub commands."""
 
+import shutil
 import stat
 from pathlib import Path
+
+BASH = shutil.which("bash")
+PYTHON3 = shutil.which("python3")
+SCRIPT = Path(__file__).resolve().parents[2] / "infra" / "vm" / "idle-shutdown.sh"
 
 NOW = 1_800_000_000
 BOOT_AGO = 2 * 3600  # the stubbed VM booted two hours ago

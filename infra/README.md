@@ -142,8 +142,9 @@ From the owner's machine: `az vm get-instance-view` shows the VM running,
 - **`customData` is create-time.** cloud-init runs once and Azure does not allow changing `customData` on an existing
   VM. A redeploy that changes `idle-shutdown.sh`, the units, `shutdownTime` or `shutdownTimeZone` therefore fails
   or has no effect on the running VM. Either copy the new files over SSH (`scp`, then `sudo systemctl
-  daemon-reload && sudo systemctl restart cfdagent-*.timer`; `scripts/vm-host-setup.sh` does this for every file in
-  `infra/vm`, see `docs/runbooks/vm-host.md`) or recreate the VM (delete it and its OS disk, then
+  daemon-reload && sudo systemctl restart cfdagent-*.timer`; `scripts/vm-host-setup.sh` installs the idle-shutdown
+  script and units, the daily-shutdown service and timer, the metadata firewall script and unit and the sshd
+  drop-in from `infra/vm`, see `docs/runbooks/vm-host.md`) or recreate the VM (delete it and its OS disk, then
   deploy again; the static IP keeps its address if the IP resource is kept).
 - **`main.bicep` and the existing VM.** The VM module builds `customData` from the files in `infra/vm`. Since the
   metadata firewall, the SSH drop-in and the multi-entry daily timer were added, `customData` no longer matches the

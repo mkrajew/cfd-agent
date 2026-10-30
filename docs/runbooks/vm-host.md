@@ -66,12 +66,15 @@ ssh cfdagent sudo bash /tmp/vm-host-setup.sh <repo-ref> \
 
 `az vm run-command invoke --scripts @file` takes one script body and runs it as root. The tiny wrapper below
 embeds the arguments as variables and downloads the setup script from the public repository at the same ref.
-Keep the wrapper outside the repository (it holds endpoint names, not secrets, but they are deployment-specific):
+`REF` must be the full 40-character commit id: the raw URL does not resolve short ids. The wrapper uses
+`set -eu` without `pipefail`, because RunShellScript may run the body with `sh` (dash rejects `pipefail`);
+nothing in it needs it. Keep the wrapper outside the repository (it holds endpoint names, not secrets, but
+they are deployment-specific):
 
 ```bash
 #!/bin/bash
-set -euo pipefail
-REF='<repo-ref>'                       # a commit id
+set -eu
+REF='<full-40-character-commit-id>'
 LLM_ENDPOINT='<llm-endpoint>'
 STORAGE_URL='<storage-url>'
 curl -fsSL "https://raw.githubusercontent.com/mkrajew/cfd-agent/${REF}/scripts/vm-host-setup.sh" \

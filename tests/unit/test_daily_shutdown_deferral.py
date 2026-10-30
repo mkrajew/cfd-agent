@@ -12,8 +12,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from shell_stubs import BOOT_AGO, CURL_STUB, NOW, stub_executable
-from test_idle_shutdown import BASH, PYTHON3, SCRIPT
+from shell_stubs import BASH, BOOT_AGO, CURL_STUB, NOW, PYTHON3, SCRIPT, stub_executable
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32" or BASH is None or PYTHON3 is None,

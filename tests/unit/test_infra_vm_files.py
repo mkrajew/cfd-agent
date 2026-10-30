@@ -69,3 +69,12 @@ def test_vm_identity_writes_blobs_only_in_the_runs_container():
     assert "name: 'runs'" in ROLES_BICEP
     # The owner keeps read access to the whole account.
     assert "scope: storage" in ROLES_BICEP[ROLES_BICEP.index("resource ownerBlobReader") :]
+
+
+def test_runbook_run_command_wrapper_is_posix_sh_safe():
+    runbook = (INFRA.parent / "docs" / "runbooks" / "vm-host.md").read_text(encoding="utf-8")
+    start = runbook.index("#!/bin/bash")
+    wrapper = runbook[start : runbook.index("```", start)]
+    assert "set -eu\n" in wrapper
+    assert "pipefail" not in wrapper, "RunShellScript may run the body with dash"
+    assert "40-character commit id" in runbook

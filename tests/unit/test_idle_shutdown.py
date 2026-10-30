@@ -7,17 +7,21 @@ a configurable number of times.
 """
 
 import json
-import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
-from shell_stubs import BOOT_AGO, CURL_STUB, NOW, PGREP_STUB, stub_executable
-
-SCRIPT = Path(__file__).resolve().parents[2] / "infra" / "vm" / "idle-shutdown.sh"
-BASH = shutil.which("bash")
-PYTHON3 = shutil.which("python3")
+from shell_stubs import (
+    BASH,
+    BOOT_AGO,
+    CURL_STUB,
+    NOW,
+    PGREP_STUB,
+    PYTHON3,
+    SCRIPT,
+    stub_executable,
+)
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32" or BASH is None or PYTHON3 is None,
