@@ -1,30 +1,32 @@
 # Keep the build context small and free of local state.
-.git
-.github
-.venv
-.superpowers
-.claude
-.pytest_cache
-.ruff_cache
-.mypy_cache
-__pycache__
-*.py[cod]
-*.egg-info
-dist
-build
-.env
-.env.*
+# Patterns are anchored at the context root (a leading "/") so that, for example, "/tests" does not
+# also drop a "tests" directory inside src/. "**/" matches at any depth.
+/.git
+/.github
+/.venv
+/.superpowers
+/.claude
+/.pytest_cache
+/.ruff_cache
+/.mypy_cache
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+/dist
+/build
+/.env
+/.env.*
 
 # Simulation outputs never go into an image or into git.
-runs
-*.msh
-postProcessing
-processor*
+/runs
+**/*.msh
+**/postProcessing
+**/processor*
 
 # Docs and infra are not needed to build the image.
-docs
-infra
-tests
+/docs
+/infra
+/tests
 
 # Benchmark references and criteria must never reach an image (blind evaluation).
-benchmarks
+/benchmarks

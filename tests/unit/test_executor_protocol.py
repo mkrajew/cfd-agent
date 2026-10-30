@@ -476,3 +476,62 @@ def test_stdout_is_redirected_to_stderr_while_ops_run():
     assert done.returncode == 0, done.stderr
     assert done.stdout == ""
     assert "python-level" in done.stderr and "fd-level" in done.stderr
+
+
+_REFUSAL = (
+    "--> FOAM FATAL IO ERROR: (openfoam-2512)\n"
+    "Loading shared libraries using case-supplied code may have been disabled\n"
+    "by default for security reasons.\n"
+)
+
+
+def test_code_refusal_hint_is_general_and_only_added_for_the_refusal():
+    assert process.code_refusal_hint("nothing special") is None
+    hint = process.code_refusal_hint(_REFUSAL)
+    assert hint is not None
+    assert "#eval" in hint and "plain numbers" in hint
+    # The generality rule: the hint names no benchmark case.
+    for word in ("cavity", "pipe", "cylinder"):
+        assert word not in hint.lower()
+    assert "allowSystemOperations" in process.code_refusal_hint("allowSystemOperations 1;")
+
+
+def test_refused_case_code_gets_the_hint_once(run, monkeypatch):
+    def refuse(*_a, **_k):
+        raise AgentInputError(f"cannot read 'startTime':\n{_REFUSAL}")
+
+    monkeypatch.setattr(foam, "trial_run", refuse)
+    _, answer = _call(run, "trial_run", {"case_dir": ".", "solver": "icoFoam"})
+    assert answer.ok is False and answer.internal is False
+    assert "case-supplied code" in answer.error
+    assert answer.error.count(process.CODE_REFUSAL_HINT) == 1
+    # An error that has nothing to do with it gets no hint.
+    monkeypatch.setattr(
+        foam,
+        "trial_run",
+        lambda *a, **k: (_ for _ in ()).throw(AgentInputError("deltaT must be positive")),
+    )
+    _, other = _call(run, "trial_run", {"case_dir": ".", "solver": "icoFoam"}, name="c2")
+    assert other.error == "deltaT must be positive"
+
+
+def test_check_dictionaries_reads_files_against_the_case_from_a_scratch_directory(run, monkeypatch):
+    for name in ("0/U", "constant/transportProperties", "system/controlDict"):
+        run.write_text(f"case/{name}", "FoamFile { version 2.0; }\n")
+    calls = []
+
+    def fake_run_tool(argv, cwd, log_path, timeout_s=600.0):
+        calls.append((list(argv), Path(cwd)))
+        log_path.write_text("", encoding="utf-8")
+        return process.ToolResult(True, 0, False, log_path, "")
+
+    monkeypatch.setattr(ops, "run_tool", fake_run_tool)
+    _, answer = _call(run, "check_dictionaries", {"case_dir": "case"})
+    assert answer.ok, answer
+    case = (run.root / "case").resolve()
+    assert len(calls) == 3
+    for argv, cwd in calls:
+        assert argv[:3] == ["foamDictionary", "-case", str(case)]
+        assert Path(argv[3]).is_absolute() and Path(argv[3]).parent.parent == case
+        assert len(argv) == 4
+        assert case not in cwd.parents and cwd != case  # the scratch directory, not the case

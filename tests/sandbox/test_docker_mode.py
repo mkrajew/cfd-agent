@@ -6,9 +6,12 @@ the image. The tests also record what was verified live (network cut, no credent
 root, privilege flags, limits, MPI under ``--cap-drop ALL``).
 """
 
+import importlib.util
 import json
+import os
 import re
 import shutil
+import subprocess
 import textwrap
 from pathlib import Path
 
@@ -307,43 +310,169 @@ def test_a_symlink_left_by_a_script_is_refused_on_the_next_call(sandbox):
         sandbox.run_dir.read_text("case/hostname")
 
 
-CODESTREAM = """\
-FoamFile { version 2.0; format ascii; class dictionary; object controlDict; }
-application icoFoam;
-trap #codeStream
-{
-    codeInclude
-    #{
-        #include <fstream>
-    #};
-    code
-    #{
-        std::ofstream marker("/job/EXECUTED_MARKER");
-        marker << "the code ran" << std::endl;
-        os << 1;
-    #};
-};
-"""
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="Task 8 sets allowSystemOperations 0 in the image; until then #codeStream is compiled",
+MARKER = "EXECUTED_MARKER"
+CODE_STREAM = (
+    "trap #codeStream\n{\n    codeInclude #{ #include <fstream> #};\n"
+    f'    code #{{ std::ofstream("/job/{MARKER}") << "ran"; os << 1; #}};\n}};\n'
 )
-def test_codestream_dictionary_is_refused(sandbox):
-    sandbox.run_dir.write_text("case/system/controlDict", CODESTREAM)
-    sandbox.run_dir.write_text("case/system/fvSchemes", "FoamFile { version 2.0; }\n")
-    sandbox.run_dir.write_text("case/system/fvSolution", "FoamFile { version 2.0; }\n")
-    (sandbox.run_dir.root / "case" / "0").mkdir()
-    (sandbox.run_dir.root / "case" / "constant").mkdir()
-    response = sandbox.client.call("check_dictionaries", {"case_dir": "case"}, timeout_s=300)
+FOAM_CASES = ROOT / "tests" / "integration" / "foam_cases.py"
+
+# name: (file to extend, text appended to it, ops that must refuse it)
+HOSTILE_CASES = {
+    "codestream in controlDict": (
+        "system/controlDict",
+        CODE_STREAM,
+        ("check_dictionaries", "trial_run", "run_solver"),
+    ),
+    "calc in a 0/ file": (
+        "0/p",
+        f'trap #calc "system(\\"touch /job/{MARKER}\\")";\n',
+        ("check_dictionaries", "trial_run", "run_solver"),
+    ),
+    "coded patch type": (
+        "0/p",
+        "boundaryField { movingWall { type codedFixedValue; name probe; "
+        f'code #{{ std::ofstream("/job/{MARKER}") << "ran"; #}}; }} }}\n',
+        ("trial_run", "run_solver"),
+    ),
+}
+HOSTILE_PARAMS = [
+    pytest.param(name, op, id=f"{name}-{op}")
+    for name, (_, _, ops) in HOSTILE_CASES.items()
+    for op in ops
+]
+
+
+def _meshed_case(sandbox) -> None:
+    """A small meshed case: fixture dictionaries, and a mesh that blockMesh makes in a container."""
+    spec = importlib.util.spec_from_file_location("foam_cases", FOAM_CASES)
+    foam_cases = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(foam_cases)
+    case = sandbox.run_dir.root / "case"
+    for sub in ("0", "constant", "system"):
+        shutil.copytree(foam_cases.FIXTURE_CASE / sub, case / sub)
+    (case / "system" / "blockMeshDict").write_text(foam_cases.BLOCK_MESH_DICT, encoding="utf-8")
+    control = foam_cases.CONTROL_DICT.format(end_time=0.05)
+    (case / "system" / "controlDict").write_text(control, encoding="utf-8")
+    sandbox.script(
+        "mesh_case.py",
+        "import subprocess\nsubprocess.run(['blockMesh'], cwd='/job/case', check=True)\n",
+    )
+    made = sandbox.run_script("mesh_case.py", timeout_s=120)
+    assert made.ok, made
+    assert (case / "constant" / "polyMesh" / "points").is_file()
+
+
+@pytest.mark.parametrize(("name", "op"), HOSTILE_PARAMS)
+def test_case_supplied_code_is_refused(sandbox, name, op):
+    """allowSystemOperations is off site-wide: code in a case file is never compiled or run."""
+    _meshed_case(sandbox)
+    target, text, _ = HOSTILE_CASES[name]
+    path = f"case/{target}"
+    sandbox.run_dir.write_text(path, sandbox.run_dir.read_text(path) + text)
+    args = {"case_dir": "case"}
+    if op != "check_dictionaries":
+        args["solver"] = "icoFoam"
+    response = sandbox.client.call(op, args, timeout_s=300)
     assert response.ok is False, response
-    assert not (sandbox.run_dir.root / "EXECUTED_MARKER").exists()
-    # The refusal is OpenFOAM's own, and says why.
-    assert "allowSystemOperations" in response.error or "#codeStream" in response.error
-    # Refused up front: today OpenFOAM still compiles the block (wmake) and only the noexec
-    # /tmp keeps the library from loading; with allowSystemOperations off nothing is compiled.
+    assert response.internal is False, response
+    root = sandbox.run_dir.root
+    assert not list(root.rglob(MARKER)), "the code in the case ran"
+    assert not list(root.rglob("dynamicCode")), "OpenFOAM prepared the code for compiling"
+    assert not list(root.rglob("*.so")), "a library was compiled"
+    # The refusal is OpenFOAM's own and the agent is told what to do instead.
+    assert "case-supplied code" in response.error, response.error
+    assert "plain numbers" in response.error and "#eval" in response.error, response.error
     assert "wmake" not in response.error, response.error
+
+
+def test_openfoam_home_is_not_in_the_run_directory(sandbox):
+    """A ~/.OpenFOAM/controlDict would override the site switch: HOME must not be agent-writable."""
+    result = probe(
+        sandbox,
+        """
+        import json, os
+        home = os.environ["HOME"]
+        print("RESULT=" + json.dumps({"home": home, "listed": sorted(os.listdir("/job"))}))
+        """,
+    )
+    assert not (result["home"] + "/").startswith("/job/"), result
+    assert result["home"] != "/job", result
+    assert ".OpenFOAM" not in result["listed"], result
+
+
+RUNTIME_IMAGE = os.environ.get("CFDAGENT_RUNTIME_IMAGE", "cfdagent:runtime")
+
+RUNTIME_PROBE = textwrap.dedent(
+    """
+    import importlib.util, json, shutil, subprocess
+    found = subprocess.run(
+        ["find", "/", "-xdev", "(", "-path", "/proc", "-o", "-path", "/sys", ")", "-prune",
+         "-o", "-type", "f", "-perm", "/6000", "-print"],
+        capture_output=True, text=True,
+    )
+    switches = subprocess.run(
+        ["icoFoam", "-listSwitches"], capture_output=True, text=True
+    ).stdout
+    imports = {}
+    for name in ("cfdagent.executor", "cadquery", "gmsh", "pyvista", "matplotlib"):
+        try:
+            __import__(name)
+            imports[name] = "ok"
+        except Exception as exc:
+            imports[name] = repr(exc)
+    print("RESULT=" + json.dumps({
+        "setuid": found.stdout.split(),
+        "tools": {n: shutil.which(n) for n in
+                  ("uv", "uvx", "pytest", "pre-commit", "gcc", "g++", "cc", "make")},
+        "modules": {m: importlib.util.find_spec(m) is not None
+                    for m in ("pytest", "pre_commit", "uv", "ruff")},
+        "imports": imports,
+        "switch": [x for x in switches.splitlines() if "allowSystemOperations" in x],
+    }))
+    """
+)
+
+
+def test_runtime_image_has_no_uv_pytest_or_setuid_helpers():
+    """The published ``runtime`` target: no dev tooling, no compilers, no setuid binaries."""
+    inspected = subprocess.run(
+        ["docker", "image", "inspect", RUNTIME_IMAGE], capture_output=True, text=True, timeout=60
+    )
+    if inspected.returncode != 0:
+        pytest.skip(f"the runtime image {RUNTIME_IMAGE} is not available")
+    done = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--cap-drop",
+            "ALL",
+            "--read-only",
+            "--tmpfs",
+            "/tmp",
+            "--pull",
+            "never",
+            RUNTIME_IMAGE,
+            "python",
+            "-c",
+            RUNTIME_PROBE,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert done.returncode == 0, done.stderr[-2000:]
+    matches = re.findall(r"^RESULT=(.*)$", done.stdout, flags=re.MULTILINE)
+    assert matches, done.stdout[-2000:] + done.stderr[-2000:]
+    result = json.loads(matches[-1])
+    assert result["setuid"] == [], result
+    assert not any(result["tools"].values()), result
+    assert not any(result["modules"].values()), result
+    assert all(state == "ok" for state in result["imports"].values()), result
+    assert any("Disallowing user-supplied system call operations" in x for x in result["switch"])
 
 
 def test_full_pipeline_with_four_mpi_ranks_in_the_sandbox(sandbox):

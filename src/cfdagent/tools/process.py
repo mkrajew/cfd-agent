@@ -41,6 +41,23 @@ ALLOWED_EXECUTABLES: frozenset[str] = frozenset(
 TAIL_LINES = 50
 TAIL_MAX_BYTES = 8000
 
+# The image switches ``allowSystemOperations`` off, so OpenFOAM refuses dictionaries that carry
+# their own code (``#codeStream``, ``#calc``, coded patch types and function objects). Its message
+# suggests switching the option on, which an agent must not try: this hint says what to do instead.
+CODE_REFUSAL_HINT = (
+    "OpenFOAM refused case-supplied code: coded dictionaries are disabled in this environment "
+    "(#codeStream, #calc, coded patch types and coded function objects cannot be used, and "
+    "allowSystemOperations cannot be switched on). Use plain numbers, #eval, or built-in patch "
+    "types and function objects."
+)
+_CODE_REFUSAL_MARKERS = ("case-supplied code", "allowSystemOperations")
+
+
+def code_refusal_hint(text: str) -> str | None:
+    """``CODE_REFUSAL_HINT`` if ``text`` shows that OpenFOAM refused case-supplied code."""
+    return CODE_REFUSAL_HINT if any(marker in text for marker in _CODE_REFUSAL_MARKERS) else None
+
+
 # Environment passed to the child. Everything else (cloud credentials, API keys, ...) is dropped.
 # SYSTEMROOT, PATHEXT, TEMP, TMP and COMSPEC are needed to start a process on Windows.
 # ``sandbox.client`` (host side, must not import this module) keeps a copy of both lists for its

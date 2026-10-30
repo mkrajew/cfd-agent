@@ -32,6 +32,7 @@ from cfdagent.errors import AgentInputError, ToolFailure
 from cfdagent.tools.process import (
     ToolNotAllowed,
     ToolResult,
+    code_refusal_hint,
     fail_after_run,
     run_tool,
 )
@@ -433,6 +434,7 @@ def _read_control_number(
         if default is not None and "Cannot find entry" in result.tail:
             return default, None
         detail = lines[-1] if lines else f"foamDictionary exited with code {result.returncode}"
+        detail = code_refusal_hint(result.tail) or detail
         return None, f"cannot read '{entry}' from {_CONTROL_DICT} ({detail})"
     value = _parse_float(lines[-1]) if lines else None
     if value is None or not math.isfinite(value):
