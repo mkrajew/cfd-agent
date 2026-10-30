@@ -11,41 +11,69 @@ import re
 import shutil
 from pathlib import Path
 
+import pytest
+
 from cfdagent.bench.registry import load_registry
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC = REPO_ROOT / "src" / "cfdagent"
 BENCHMARKS = REPO_ROOT / "benchmarks"
 
-# Whole words only: "pipeline" is a legitimate general word and does not match "pipe".
-BANNED = re.compile(r"\b(?:cavity|cavities|pipes?|cylinders?|ghia)\b", re.IGNORECASE)
+# Letter boundaries, not word boundaries: snake_case and digit-suffixed identifiers
+# (cavity_re100, cylinder2d, Ghia1982, PIPE_SIZE) are caught, while "pipeline" is not ("pipe" is
+# followed by a letter there).
+BANNED = re.compile(r"(?<![A-Za-z])(?:cavity|cavities|pipes?|cylinders?|ghia)(?![A-Za-z])", re.I)
+# CamelCase identifiers (PipeFlow, LidDrivenCavity): a capitalised name that is not preceded by a
+# capital letter and not followed by a lower-case letter (so "Pipeline" is not matched).
+BANNED_CAMEL = re.compile(r"(?<![A-Z])(?:Cavity|Pipes?|Cylinders?|Ghia)(?![a-z])")
 # Exact strings that are legitimate general words and are removed before scanning. Empty at the
 # start; every addition needs a cfd-reviewer verdict.
 ALLOWED_PHRASES: tuple[str, ...] = ()
-# Python constants such as subprocess.PIPE are not case names (exact case, Python files only).
-PYTHON_CONSTANT = re.compile(r"\bPIPE\b")
+# Legitimate Python uses of the word "pipe" (Python files only, exact case): the subprocess.PIPE
+# constant (also bare PIPE when the file imports it from subprocess) and the os.pipe() call.
+SUBPROCESS_PIPE = re.compile(r"\bsubprocess\.PIPE\b")
+SUBPROCESS_PIPE_IMPORT = re.compile(r"^\s*from subprocess import[^\n]*\bPIPE\b", re.MULTILINE)
+BARE_PIPE = re.compile(r"\bPIPE\b")
+OS_PIPE_CALL = re.compile(r"\bos\.pipe2?\(")
 SCANNED_DIRS = ("prompts", "knowledge")
 
 
-def scan_tree(root: Path) -> tuple[list[str], int]:
-    """Return (violations, number of files scanned) for every text file under ``root``."""
+def strip_python_exemptions(text: str) -> str:
+    text = SUBPROCESS_PIPE.sub("", text)
+    text = OS_PIPE_CALL.sub("", text)
+    if SUBPROCESS_PIPE_IMPORT.search(text):
+        text = BARE_PIPE.sub("", text)
+    return text
+
+
+def scan_text(text: str, suffix: str, allowed: tuple[str, ...] = ALLOWED_PHRASES) -> list[str]:
+    """Return 'line: match' strings for every banned name in ``text``."""
+    for phrase in allowed:
+        text = text.replace(phrase, "")
+    if suffix == ".py":
+        text = strip_python_exemptions(text)
+    found: list[str] = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        spans = {m.span() for pattern in (BANNED, BANNED_CAMEL) for m in pattern.finditer(line)}
+        found.extend(f"{number}: {line[a:b]!r}" for a, b in sorted(spans))
+    return found
+
+
+def scan_tree(root: Path, allowed: tuple[str, ...] = ALLOWED_PHRASES) -> tuple[list[str], int]:
+    """Return (violations, number of files scanned) for every file under ``root``."""
     violations: list[str] = []
     scanned = 0
     for path in sorted(root.rglob("*")):
         if not path.is_file() or "__pycache__" in path.parts or path.suffix == ".pyc":
             continue
+        scanned += 1
+        name = path.relative_to(root)
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
+            violations.append(f"{name}: not valid UTF-8, the lint cannot read it")
             continue
-        scanned += 1
-        for phrase in ALLOWED_PHRASES:
-            text = text.replace(phrase, "")
-        if path.suffix == ".py":
-            text = PYTHON_CONSTANT.sub("", text)
-        for number, line in enumerate(text.splitlines(), start=1):
-            for match in BANNED.finditer(line):
-                violations.append(f"{path.relative_to(root)}:{number}: {match.group(0)!r}")
+        violations.extend(f"{name}:{hit}" for hit in scan_text(text, path.suffix, allowed))
     return violations, scanned
 
 
@@ -94,24 +122,71 @@ def test_lint_can_fail(tmp_path):
     clean, _ = scan_tree(copy)
     assert clean == []
     (copy / "planted.py").write_text("# the lid-driven Cavity case\n", encoding="utf-8")
-    (copy / "planted.md").write_text(
-        "Flow in a pipe.\nCylinders shed vortices.\n", encoding="utf-8"
-    )
+    note = "Flow in a pipe.\nCylinders shed vortices.\n"
+    (copy / "planted.md").write_text(note, encoding="utf-8")
     violations, _ = scan_tree(copy)
     assert len(violations) == 3
     assert any("planted.py:1" in v and "Cavity" in v for v in violations)
 
 
-def test_lint_ignores_pipeline_and_subprocess_pipe(tmp_path):
-    (tmp_path / "ok.py").write_text(
-        "import subprocess\nproc = subprocess.Popen([], stdout=subprocess.PIPE)\n"
-        "# the pipeline runs stages; mesh pipelines too\n",
-        encoding="utf-8",
-    )
-    assert scan_tree(tmp_path)[0] == []
-    # Outside Python files the constant exemption does not apply.
-    (tmp_path / "note.md").write_text("Use a PIPE here.\n", encoding="utf-8")
+@pytest.mark.parametrize(
+    "text",
+    [
+        "cavity_re100",
+        "pipe_flow",
+        "cylinder_channel",
+        "PipeFlow",
+        "LidDrivenCavity",
+        "Ghia1982",
+        "cylinder2d",
+        "PIPE_SIZE",
+        "case = 'Cavity'",
+        "the cavities",
+        "two pipes",
+        "ghia_et_al",
+    ],
+)
+def test_lint_catches_identifier_forms(text):
+    assert scan_text(text + "\n", ".py"), f"{text!r} should be flagged"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "the pipeline runs the stages",
+        "PIPELINE_STAGES = 6",
+        "pipelines",
+        "PipelineStage",
+        "proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)",
+        "read_fd, write_fd = os.pipe()",
+        "from subprocess import PIPE, Popen\nproc = Popen(cmd, stdout=PIPE)",
+    ],
+)
+def test_lint_ignores_general_uses(text):
+    assert scan_text(text + "\n", ".py") == []
+
+
+def test_lint_exemptions_are_narrow():
+    # A bare PIPE without the subprocess import, and the exemptions outside Python files, flag.
+    assert scan_text("proc = Popen(cmd, stdout=PIPE)\n", ".py")
+    assert scan_text("import subprocess\nx = PIPE\n", ".py")
+    assert scan_text("Use subprocess.PIPE here.\n", ".md")
+    assert scan_text("Use os.pipe() here.\n", ".md")
+
+
+def test_allowed_phrases_are_removed_before_scanning(tmp_path):
+    (tmp_path / "note.md").write_text("An organ pipe is not a case.\n", encoding="utf-8")
     assert len(scan_tree(tmp_path)[0]) == 1
+    assert scan_tree(tmp_path, allowed=("organ pipe",))[0] == []
+    assert ALLOWED_PHRASES == (), "additions to the allowlist need a cfd-reviewer verdict"
+
+
+def test_lint_fails_on_files_that_are_not_utf8(tmp_path):
+    (tmp_path / "bad.md").write_bytes(b"caf\xe9 cavity\n")
+    violations, scanned = scan_tree(tmp_path)
+    assert scanned == 1
+    assert len(violations) == 1
+    assert "not valid UTF-8" in violations[0]
 
 
 def test_knowledge_and_prompts_dirs_do_not_leak_benchmarks(tmp_path):

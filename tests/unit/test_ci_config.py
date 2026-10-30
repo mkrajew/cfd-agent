@@ -11,6 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 CI = WORKFLOWS / "ci.yml"
 PINNED = re.compile(r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$")
+VERSION_COMMENT = re.compile(r"^#\s*v\d+(?:\.\d+\.\d+)?$")  # "# v4" or "# v4.4.0"
 
 
 def load_yaml(path: Path) -> dict:
@@ -20,6 +21,8 @@ def load_yaml(path: Path) -> dict:
 def uses_references(workflow: dict) -> list[str]:
     refs: list[str] = []
     for job in workflow["jobs"].values():
+        if "uses" in job:  # a reusable workflow called at job level
+            refs.append(job["uses"])
         refs.extend(step["uses"] for step in job.get("steps", []) if "uses" in step)
     return refs
 
@@ -43,13 +46,22 @@ def test_every_pinned_action_names_its_tag_in_a_comment():
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             match = pattern.match(line)
             if match and not match.group(1).startswith("./"):
-                assert match.group(2), f"{path.name}:{number}: add the tag as a comment"
+                comment = match.group(2)
+                assert comment and VERSION_COMMENT.match(comment), (
+                    f"{path.name}:{number}: add the tag as a comment (# vX or # vX.Y.Z)"
+                )
 
 
 def test_pin_check_can_fail():
     assert unpinned(["actions/checkout@v4"]) == ["actions/checkout@v4"]
     assert unpinned(["actions/checkout@" + "a" * 39]) != []
     assert unpinned(["actions/checkout@" + "a" * 40, "./local-action"]) == []
+    # Job-level 'uses' (reusable workflows) are collected too.
+    workflow = {"jobs": {"call": {"uses": "org/repo/.github/workflows/w.yml@main"}}}
+    assert uses_references(workflow) == ["org/repo/.github/workflows/w.yml@main"]
+    assert unpinned(uses_references(workflow)) != []
+    assert not VERSION_COMMENT.match("# main")
+    assert VERSION_COMMENT.match("# v4") and VERSION_COMMENT.match("# v4.4.0")
 
 
 def test_lint_job_runs_pre_commit_without_the_shellcheck_download():

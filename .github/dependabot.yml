@@ -13,6 +13,7 @@ updates:
     schedule:
       interval: weekly
     ignore:
-      # The OpenFOAM engine version is part of experiment reproducibility; it changes only by
-      # a deliberate decision (the base image is also pinned by digest in the Dockerfile).
+      # Blanket ignore (tag AND digest bumps): the OpenFOAM engine version and the exact image
+      # digest are both part of experiment reproducibility. The base image changes only by a
+      # deliberate decision of the owner, never by an automatic pull request.
       - dependency-name: opencfd/openfoam-default
