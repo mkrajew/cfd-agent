@@ -12,14 +12,14 @@ import re
 from datetime import datetime
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cfdagent.llm.config import LLMSettings, ModelConfig
 from cfdagent.sandbox.config import SandboxConfig
 
 AGENT_NAMES = ("planner", "geometry", "mesh", "case_setup", "solver_runner", "analyst")
 DEFAULT_DEPLOYMENT = "gpt-oss-120b"
-DEFAULT_IMAGE = "cfdagent:dev"
+DEFAULT_IMAGE = "cfdagent:runtime"  # the shipped image (target `runtime`), not the test image
 MAX_SLUG_CHARS = 40
 MAX_RANKS_LIMIT = 4  # pipeline invariant: never more than four MPI ranks
 
@@ -60,6 +60,12 @@ class RunConfig(BaseModel):
     task_set: Literal["development", "generality", "ad hoc"] = "ad hoc"
     # Token limit of the Planner's structured (JSON) call; the other calls use ModelConfig.
     planner_structured_max_tokens: int = Field(default=4096, ge=1)
+
+    @model_validator(mode="after")
+    def _models_cover_exactly_the_agents(self) -> Self:
+        if set(self.models) != set(AGENT_NAMES):
+            raise ValueError(f"models must be configured for exactly these agents: {AGENT_NAMES}")
+        return self
 
     @classmethod
     def default(cls, image: str = DEFAULT_IMAGE) -> Self:

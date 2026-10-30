@@ -16,7 +16,17 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parents[2] / "src" / "cfdagent"
 
 # Top-level names (package directory or module file) under ``cfdagent``.
-HOST_SIDE = ("agents", "orchestrator", "sandbox", "storage", "cli", "rundir", "llm")
+HOST_SIDE = (
+    "agents",
+    "orchestrator",
+    "sandbox",
+    "storage",
+    "cli",
+    "rundir",
+    "llm",
+    "config",
+    "record",
+)
 CONTAINER_SIDE = ("tools", "executor")
 
 HOST_FORBIDDEN = ("cfdagent.tools", "cadquery", "gmsh", "pyvista")

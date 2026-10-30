@@ -51,6 +51,8 @@ def run(tmp_path):
 
 def test_record_roundtrip_and_atomic_write(run, monkeypatch):
     record = make_record(
+        status="completed",
+        finished_at=NOW,
         stages=[
             StageRecord(
                 name="geometry",
@@ -69,7 +71,7 @@ def test_record_roundtrip_and_atomic_write(run, monkeypatch):
     )
     write_record(run, record)
     assert read_record(run) == record
-    assert json.loads((run.root / "run_record.json").read_text())["status"] == "running"
+    assert json.loads((run.root / "run_record.json").read_text())["status"] == "completed"
 
     # An update that dies half way must leave the previous complete file in place.
     previous = (run.root / "run_record.json").read_bytes()
@@ -79,7 +81,7 @@ def test_record_roundtrip_and_atomic_write(run, monkeypatch):
 
     monkeypatch.setattr(os, "replace", broken_replace)
     with pytest.raises(OSError):
-        write_record(run, make_record(status="completed", finished_at=NOW))
+        write_record(run, make_record(status="failed", finished_at=NOW))
     monkeypatch.undo()
     assert (run.root / "run_record.json").read_bytes() == previous
     assert [p.name for p in run.root.iterdir()] == ["run_record.json"]  # no temp file left
@@ -182,3 +184,112 @@ def test_summary_of_failed_benchmark_run_without_comparison_does_not_claim_no_re
     assert "not scored" in text
     assert "mesh gate failed three times" in text
     assert "failed" in text and "mesh" in text
+
+
+# --------------------------------------------------------------------------- fix round 1
+
+
+def on_disk(run) -> dict:
+    return json.loads((run.root / "run_record.json").read_text(encoding="utf-8"))
+
+
+def test_mutated_free_text_is_cleaned_on_write(run):
+    record = make_record(
+        status="failed",
+        stages=[
+            StageRecord(name="mesh", attempts=[AttemptRecord(n=1, ok=False, seconds=1)], ok=False)
+        ],
+    )
+    record.failure_reason = f"call to https://host.invalid/x failed for me{AT}mail.invalid {IP1}"
+    record.stages[0].attempts[0].errors.append(f"see http://{IP2}:80/")  # in-place mutation
+    write_record(run, record)
+    text = (run.root / "run_record.json").read_text(encoding="utf-8")
+    for leaked in ("host.invalid", "mail.invalid", IP1, IP2):
+        assert leaked not in text
+
+
+def test_invalid_mutation_is_rejected(run):
+    record = make_record()
+    with pytest.raises(ValidationError):
+        record.status = "bogus"
+    broken = make_record().model_copy(update={"status": "bogus"})  # copy does not validate
+    write_record(run, make_record(status="failed", finished_at=NOW))
+    before = (run.root / "run_record.json").read_bytes()
+    with pytest.raises(ValidationError):
+        write_record(run, broken)
+    with pytest.raises(ValidationError):
+        write_summary(run, broken, None)
+    assert (run.root / "run_record.json").read_bytes() == before
+
+
+def test_redaction_covers_hostnames_tokens_and_guids():
+    guid = "-".join(["12345678", "1234", "1234", "1234", "123456789abc"])
+    record = make_record(
+        status="failed",
+        failure_reason=f"acct.blob.core.windows.net said Bearer abcdefghijklmnop for {guid} "
+        "via login.microsoftonline.com",
+    )
+    for leaked in ("windows.net", "abcdefghijklmnop", guid, "microsoftonline"):
+        assert leaked not in record.failure_reason
+
+
+def test_redaction_survives_lone_surrogates(run):
+    record = make_record(status="failed", failure_reason="bad \ud800 text")
+    assert "\ud800" not in record.failure_reason
+    write_record(run, record)  # utf-8 encoding must not fail
+    assert on_disk(run)["failure_reason"].startswith("bad")
+
+
+def test_errors_per_attempt_are_capped_with_a_marker(run):
+    errors = [f"error {i}" for i in range(120)]
+    attempt = AttemptRecord(n=1, ok=False, errors=errors, seconds=1)
+    assert len(attempt.errors) == 51
+    assert attempt.errors[-1] == "[truncated: 70 more]"
+    again = AttemptRecord.model_validate(attempt.model_dump())  # idempotent
+    assert again.errors == attempt.errors
+
+
+def test_record_with_huge_error_text_stays_under_the_write_limit(run):
+    attempt = AttemptRecord(n=1, ok=False, errors=["x" * 10_000] * 100, seconds=1)
+    stages = [StageRecord(name=f"s{i}", attempts=[attempt] * 10, ok=False) for i in range(20)]
+    record = make_record(status="failed", finished_at=NOW, stages=stages)
+    write_record(run, record)
+    assert (run.root / "run_record.json").stat().st_size < 1_500_000
+
+
+def test_running_record_hides_task_set_and_benchmark_on_disk(run):
+    record = make_record(task_set="development", benchmark_id="synthetic", status="running")
+    write_record(run, record)
+    data = on_disk(run)
+    assert data["benchmark_id"] is None and data["task_set"] is None
+    assert "synthetic" not in (run.root / "run_record.json").read_text()
+    assert read_record(run).status == "running"  # a running file is still a valid record
+    assert record.benchmark_id == "synthetic"  # the in-memory record is untouched
+    for status in ("completed", "failed", "interrupted"):
+        write_record(run, record.model_copy(update={"status": status}))
+        data = on_disk(run)
+        assert data["benchmark_id"] == "synthetic" and data["task_set"] == "development"
+
+
+def test_task_set_and_benchmark_must_agree():
+    with pytest.raises(ValidationError):
+        make_record(task_set="development", benchmark_id=None)
+    with pytest.raises(ValidationError):
+        make_record(task_set="ad hoc", benchmark_id="synthetic")
+    with pytest.raises(ValidationError):
+        make_record(task_set=None, status="completed")
+    make_record(task_set=None, status="running")  # only the on-disk form of a running record
+
+
+def test_summary_escapes_markdown_in_identifiers(run):
+    record = make_record(
+        task_set="development",
+        benchmark_id="[x](http://link.invalid) *bold*",
+        status="failed",
+        failed_stage="mesh_stage",
+        failure_reason="a\nb",
+    )
+    write_summary(run, record, None)
+    text = run.read_text("summary.md")
+    assert "[x]" not in text and "*bold*" not in text
+    assert "mesh\\_stage" in text

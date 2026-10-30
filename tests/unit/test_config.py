@@ -81,3 +81,16 @@ def test_llm_settings_from_env_use_a_single_retry(monkeypatch):
 
 def test_config_dump_holds_no_endpoint():
     assert "endpoint" not in RunConfig.default().model_dump_json().lower()
+
+
+def test_default_image_is_the_shipped_runtime_image():
+    assert RunConfig.default().sandbox.image == "cfdagent:runtime"
+
+
+def test_models_must_cover_exactly_the_six_agents():
+    data = RunConfig.default().model_dump()
+    missing = {k: v for k, v in data["models"].items() if k != "analyst"}
+    with pytest.raises(ValidationError):
+        RunConfig(**{**data, "models": missing})
+    with pytest.raises(ValidationError):
+        RunConfig(**{**data, "models": {**data["models"], "critic": data["models"]["mesh"]}})
