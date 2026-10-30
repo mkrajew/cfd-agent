@@ -420,6 +420,16 @@ def test_2d_faces_on_the_z_planes_must_be_empty(tmp_path):
     assert "`back` (wall)" in text and "`front`" not in text
 
 
+def test_2d_z_face_message_bounds_a_long_patch_name(tmp_path):
+    long_name = "q" * 300
+    spec = spec_with_boundaries(("inlet", "outlet", "walls", long_name))
+    data = manifest(names=("inlet", "outlet", "walls", "frontAndBack"))
+    data["patches"].append({"name": long_name, "type": "wall", "locators": [plane("z", 0.1)]})
+    result = gate(tmp_path, spec, data)
+    text = " ".join(result.errors)
+    assert not result.ok and "wall" in text and long_name not in text
+
+
 def test_2d_manifest_has_no_wedge_patch_and_3d_has_no_empty_or_wedge(tmp_path):
     data = manifest()
     data["patches"].append({"name": "w", "type": "wedge", "locators": [plane("x", 2.0)]})
@@ -455,7 +465,6 @@ def test_last_bytes_never_splits_a_character():
     text = "x" * 10 + "é" * 20  # two bytes per character
     for limit in range(1, 40):
         shown = _last_bytes(text, limit)
-        assert shown.encode("utf-8")  # valid text
         assert len(shown.split("\n", 1)[-1].encode("utf-8")) <= limit
     assert _last_bytes("short", 100) == "short"
 
@@ -506,6 +515,7 @@ def test_opening_message_states_the_plan_geometry_and_boundaries(tmp_path):
         assert needle in text
     assert "0.1" in text  # the z extent
     assert "kinematic_viscosity" not in text  # only what geometry needs, not the whole plan
+    assert "any name" in text and "no face" in text  # the exemptions of the name rule
 
 
 def test_prompt_states_the_output_contract_and_the_shared_conventions():

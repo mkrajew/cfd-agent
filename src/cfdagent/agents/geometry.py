@@ -111,7 +111,7 @@ def _z_face_problems(spec: CaseSpec, manifest: BoundaryManifest) -> list[str]:
             for loc in patch.locators
         )
         if on_z_face and patch.type != "empty":
-            wrong.append(f"`{patch.name}` ({patch.type})")
+            wrong.append(f"{_names([patch.name])} ({patch.type})")
     if not wrong:
         return []
     return [
@@ -215,8 +215,10 @@ class GeometryStage(Stage):
             "Build the fluid domain of this plan as a CadQuery model.\n\n"
             f"{json.dumps(plan, indent=2)}\n\n"
             f"Write {SCRIPT_NAME} so that the solid has exactly this bounding box and volume, and "
-            f"{MANIFEST_FILE_NAME} names every boundary face with exactly the boundary names "
-            "above. Units are metres."
+            f"{MANIFEST_FILE_NAME} names every boundary face with the boundary names above. "
+            "Exceptions: the `empty` patches of a 2D case and the `wedge` patches of an "
+            "axisymmetric case may have any name, and a boundary of the plan that has no face "
+            "(such as an axis) gets no patch. Units are metres."
         )
 
     def execute_and_gate(self, ctx: StageContext, attempt_dir: Path) -> GateResult:
