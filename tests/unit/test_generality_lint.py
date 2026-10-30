@@ -203,3 +203,23 @@ def test_knowledge_and_prompts_dirs_do_not_leak_benchmarks(tmp_path):
     leaks = find_leaks(tmp_path, markers)
     assert len(leaks) == len(SCANNED_DIRS)
     assert all("cavity-re100" in leak for leak in leaks)
+
+
+def test_generality_lint_scans_prompts(tmp_path):
+    # The prompt loader is real code under src/ and the prompts directory is part of the scanned
+    # tree: a case name or a benchmark marker in a prompt file must be reported.
+    assert (SRC / "prompts" / "__init__.py").is_file()
+    copy = tmp_path / "cfdagent"
+    shutil.copytree(SRC, copy, ignore=shutil.ignore_patterns("__pycache__"))
+    assert scan_tree(copy)[0] == []
+    (copy / "prompts" / "planner.md").write_text(
+        "Mesh the lid-driven Cavity with 129 cells.\n", encoding="utf-8"
+    )
+    violations = [v.replace("\\", "/") for v in scan_tree(copy)[0]]
+    assert any(v.startswith("prompts/planner.md:1:") and "Cavity" in v for v in violations)
+
+    (copy / "prompts" / "planner.md").write_text(
+        "Compare with the profile in cavity-re100.\n", encoding="utf-8"
+    )
+    leaks = [leak.replace("\\", "/") for leak in find_leaks(copy, benchmark_markers())]
+    assert any(leak.startswith("prompts/planner.md") for leak in leaks)

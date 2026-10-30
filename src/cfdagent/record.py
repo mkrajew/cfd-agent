@@ -107,6 +107,13 @@ def _cap_errors(items: list[str], max_items: int, max_chars: int) -> list[str]:
 
 
 class AttemptRecord(BaseModel):
+    """One gate run of a stage.
+
+    ``seconds`` is the wall time from the moment the attempt's directory was prepared until its
+    gate finished. It therefore includes the agent's model calls and tool use during that
+    attempt, not only the gate's own run time.
+    """
+
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     n: int = Field(ge=1)
