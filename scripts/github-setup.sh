@@ -60,14 +60,14 @@ ensure_milestone "M4 Report" \
   "Report process in design spec section 11. Done when the PDF is approved by the owner."
 
 # --- Branch protection on main --------------------------------------------------------------
-# PR required with 0 approvals, required checks lint, unit, image and integration, no force push,
-# no deletion.
+# PR required with 0 approvals, required checks lint, infra-lint, unit, image, integration and
+# sandbox (the job names in .github/workflows/ci.yml), no force push, no deletion.
 # Run this after the last bootstrap push: afterwards main only changes via PRs, admins included.
 gh api --method PUT "repos/${REPO}/branches/main/protection" --input - --silent <<'JSON'
 {
   "required_status_checks": {
     "strict": false,
-    "contexts": ["lint", "unit", "image", "integration"]
+    "contexts": ["lint", "infra-lint", "unit", "image", "integration", "sandbox"]
   },
   "enforce_admins": true,
   "required_pull_request_reviews": {

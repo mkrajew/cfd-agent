@@ -18,6 +18,7 @@ repos:
         args: [--fix=lf]
         exclude: \.ps1$ # PowerShell scripts keep CRLF (.gitattributes)
       - id: end-of-file-fixer
+        exclude: ^tests/fixtures/logs/ # captured solver logs are kept byte for byte
       - id: check-yaml
       - id: check-toml
   - repo: https://github.com/shellcheck-py/shellcheck-py

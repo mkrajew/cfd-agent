@@ -12,3 +12,7 @@ updates:
     directory: /docker
     schedule:
       interval: weekly
+    ignore:
+      # The OpenFOAM engine version is part of experiment reproducibility; it changes only by
+      # a deliberate decision (the base image is also pinned by digest in the Dockerfile).
+      - dependency-name: opencfd/openfoam-default

@@ -247,6 +247,7 @@ toolchain = [
 dev = [
     { name = "pre-commit" },
     { name = "pytest" },
+    { name = "pyyaml" },
     { name = "ruff" },
 ]
 
@@ -270,6 +271,7 @@ provides-extras = ["toolchain"]
 dev = [
     { name = "pre-commit" },
     { name = "pytest" },
+    { name = "pyyaml" },
     { name = "ruff" },
 ]
 
