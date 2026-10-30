@@ -5,16 +5,23 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx2
+import openai
 import pytest
 from azure.core.credentials import AccessToken
 from pydantic import BaseModel
 
 from cfdagent.llm.client import (
     UNPARSED_KEY,
+    ChatResult,
+    EmptyChoicesError,
     LLMClient,
+    LLMError,
+    SchemaError,
     StructuredOutputError,
     ToolCall,
+    TruncatedOutputError,
     Usage,
+    assistant_message,
     strict_schema,
 )
 from cfdagent.llm.config import LLMSettings, ModelConfig
@@ -242,3 +249,275 @@ def test_strict_schema_does_not_mutate_input():
     snapshot = json.dumps(original, sort_keys=True)
     strict_schema(original)
     assert json.dumps(original, sort_keys=True) == snapshot
+
+
+# --- strict schema: maps are rejected, Optional stays nullable ---
+
+
+class Leaf(BaseModel):
+    note: str | None = None
+    value: float
+
+
+class Wrapper(BaseModel):
+    leaves: list[Leaf]
+    first: Leaf | None = None
+
+
+def test_optional_stays_nullable():
+    schema = strict_schema(Wrapper.model_json_schema())
+    leaf = schema["$defs"]["Leaf"]
+    assert {"type": "null"} in leaf["properties"]["note"]["anyOf"]
+    assert {"type": "null"} in schema["properties"]["first"]["anyOf"]
+    assert leaf["required"] == ["note", "value"]
+    assert schema["properties"]["leaves"]["items"] == {"$ref": "#/$defs/Leaf"}
+
+
+class WithMap(BaseModel):
+    name: str
+    extras: dict[str, str]
+
+
+class MapInside(BaseModel):
+    items: list[WithMap]
+
+
+class OptionalMap(BaseModel):
+    extras: dict[str, float] | None = None
+
+
+class FreeForm(BaseModel):
+    blob: dict
+
+
+@pytest.mark.parametrize("model", [WithMap, MapInside, OptionalMap, FreeForm])
+def test_map_in_llm_schema_is_rejected(model):
+    with pytest.raises(SchemaError) as info:
+        strict_schema(model.model_json_schema())
+    assert isinstance(info.value, LLMError)
+    assert "list of" in str(info.value)
+
+
+def test_map_error_names_the_field_and_chat_raises_before_sending():
+    client, requests = make_client("chat_plain.json")
+    with pytest.raises(SchemaError, match="extras"):
+        client.chat(MESSAGES, ModelConfig(deployment="d"), response_schema=WithMap)
+    assert requests == []
+
+
+class Empty(BaseModel):
+    pass
+
+
+def test_model_without_fields_is_still_accepted():
+    schema = strict_schema(Empty.model_json_schema())
+    assert schema["additionalProperties"] is False
+
+
+# --- response handling ---
+
+
+def body_from(fixture: str, mutate) -> dict:
+    body = json.loads((FIXTURES / fixture).read_text(encoding="utf-8"))
+    mutate(body)
+    return body
+
+
+def client_for(body: dict) -> LLMClient:
+    transport = httpx2.MockTransport(lambda request: httpx2.Response(200, json=body))
+    return LLMClient(
+        LLMSettings(endpoint=ENDPOINT),
+        credential=FakeCredential(),
+        http_client=httpx2.Client(transport=transport),
+    )
+
+
+def test_finish_reason_is_exposed():
+    client, _ = make_client("chat_plain.json")
+    assert client.chat(MESSAGES, ModelConfig(deployment="d")).finish_reason == "stop"
+    client, _ = make_client("chat_tool_call.json")
+    assert client.chat(MESSAGES, ModelConfig(deployment="d")).finish_reason == "tool_calls"
+
+
+def test_finish_reason_length_is_typed():
+    def cut(body):
+        choice = body["choices"][0]
+        choice["finish_reason"] = "length"
+        choice["message"]["content"] = '{"solver": "icoFoam", "stea'
+
+    client = client_for(body_from("chat_structured.json", cut))
+    with pytest.raises(TruncatedOutputError) as info:
+        client.chat(MESSAGES, ModelConfig(deployment="d"), response_schema=Verdict)
+    assert isinstance(info.value, LLMError)
+    assert info.value.finish_reason == "length"
+    assert info.value.raw_text.startswith('{"solver"')
+    assert info.value.usage == Usage(prompt_tokens=30, completion_tokens=18, reasoning_tokens=None)
+
+
+def test_truncated_without_schema_is_not_an_error():
+    def cut(body):
+        body["choices"][0]["finish_reason"] = "length"
+
+    result = client_for(body_from("chat_plain.json", cut)).chat(
+        MESSAGES, ModelConfig(deployment="d")
+    )
+    assert result.finish_reason == "length"
+
+
+def test_empty_content_with_length_is_truncated():
+    def cut(body):
+        choice = body["choices"][0]
+        choice["finish_reason"] = "length"
+        choice["message"]["content"] = None
+
+    client = client_for(body_from("chat_structured.json", cut))
+    with pytest.raises(TruncatedOutputError) as info:
+        client.chat(MESSAGES, ModelConfig(deployment="d"), response_schema=Verdict)
+    assert info.value.raw_text == ""
+
+
+def test_structured_output_error_stays_compatible_and_carries_usage():
+    client, _ = make_client("chat_structured_invalid.json")
+    with pytest.raises(StructuredOutputError) as info:
+        client.chat(MESSAGES, ModelConfig(deployment="d"), response_schema=Verdict)
+    assert isinstance(info.value, LLMError)
+    assert info.value.usage == Usage(prompt_tokens=30, completion_tokens=14, reasoning_tokens=None)
+    assert StructuredOutputError("m", "raw").raw_text == "raw"
+
+
+def test_empty_choices_is_typed():
+    client = client_for(body_from("chat_plain.json", lambda body: body.update(choices=[])))
+    with pytest.raises(EmptyChoicesError) as info:
+        client.chat(MESSAGES, ModelConfig(deployment="d"))
+    assert isinstance(info.value, LLMError)
+    assert info.value.usage == Usage(prompt_tokens=11, completion_tokens=42, reasoning_tokens=30)
+
+
+def test_missing_usage_is_unknown_not_zero():
+    client = client_for(body_from("chat_plain.json", lambda body: body.pop("usage")))
+    result = client.chat(MESSAGES, ModelConfig(deployment="d"))
+    assert result.usage is None
+    assert result.content == "Hello."
+
+
+def test_assistant_message_echoes_tool_calls():
+    client, _ = make_client("chat_tool_call.json")
+    result = client.chat(MESSAGES, ModelConfig(deployment="d"))
+    assert assistant_message(result) == {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call_fixture_1",
+                "type": "function",
+                "function": {"name": "calculator", "arguments": '{"expression": "1*1/100"}'},
+            }
+        ],
+    }
+
+
+def test_assistant_message_echoes_unparsed_arguments_verbatim():
+    result = make_tool_client("{not json").chat(MESSAGES, ModelConfig(deployment="d"))
+    (call,) = assistant_message(result)["tool_calls"]
+    assert call["function"]["arguments"] == "{not json"
+
+
+def test_assistant_message_plain_reply_has_no_tool_calls_key():
+    result = ChatResult(content="Hello.", tool_calls=[], usage=None, parsed=None, raw={})
+    assert assistant_message(result) == {"role": "assistant", "content": "Hello."}
+    empty = ChatResult(content=None, tool_calls=[], usage=None, parsed=None, raw={})
+    assert assistant_message(empty) == {"role": "assistant", "content": ""}
+
+
+# --- transport errors, auth modes ---
+
+
+def status_client(status: int, attempts: list, max_retries: int = 2) -> LLMClient:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        attempts.append(request)
+        return httpx2.Response(
+            status, json={"error": {"message": "nope"}}, headers={"retry-after-ms": "1"}
+        )
+
+    return LLMClient(
+        LLMSettings(endpoint=ENDPOINT, max_retries=max_retries),
+        credential=FakeCredential(),
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+    )
+
+
+def test_status_error_429_retries_then_raises():
+    attempts: list = []
+    with pytest.raises(openai.RateLimitError) as info:
+        status_client(429, attempts).chat(MESSAGES, ModelConfig(deployment="d"))
+    assert info.value.status_code == 429
+    assert len(attempts) == 3  # first try plus two retries
+
+
+def test_status_error_400_is_not_retried():
+    attempts: list = []
+    with pytest.raises(openai.BadRequestError):
+        status_client(400, attempts).chat(MESSAGES, ModelConfig(deployment="d"))
+    assert len(attempts) == 1
+
+
+def test_api_key_mode_reads_env(monkeypatch):
+    monkeypatch.setenv("CFDAGENT_TEST_KEY", "secret-from-env")
+    body = (FIXTURES / "chat_plain.json").read_text(encoding="utf-8")
+    seen: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request)
+        return httpx2.Response(200, content=body, headers={"content-type": "application/json"})
+
+    client = LLMClient(
+        LLMSettings(endpoint=ENDPOINT, auth="api_key", api_key_env="CFDAGENT_TEST_KEY"),
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+    )
+    client.chat(MESSAGES, ModelConfig(deployment="d"))
+    assert seen[0].headers["Authorization"] == "Bearer secret-from-env"
+    assert client.credential is None
+
+
+def test_api_key_mode_requires_env(monkeypatch):
+    monkeypatch.delenv("CFDAGENT_TEST_KEY", raising=False)
+    with pytest.raises(ValueError, match="CFDAGENT_TEST_KEY"):
+        LLMClient(LLMSettings(endpoint=ENDPOINT, auth="api_key", api_key_env="CFDAGENT_TEST_KEY"))
+
+
+class ExpiringCredential:
+    """The first token is about to expire, the second is fresh."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def get_token(self, *scopes, **kwargs) -> AccessToken:
+        self.calls += 1
+        now = int(datetime.now(UTC).timestamp())
+        if self.calls == 1:
+            return AccessToken("token-1", now + 10)
+        return AccessToken("token-2", now + 3600)
+
+
+def test_token_provider_refreshes():
+    body = (FIXTURES / "chat_plain.json").read_text(encoding="utf-8")
+    seen: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request)
+        return httpx2.Response(200, content=body, headers={"content-type": "application/json"})
+
+    credential = ExpiringCredential()
+    client = LLMClient(
+        LLMSettings(endpoint=ENDPOINT),
+        credential=credential,
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+    )
+    for _ in range(3):
+        client.chat(MESSAGES, ModelConfig(deployment="d"))
+    assert [r.headers["Authorization"] for r in seen] == [
+        "Bearer token-1",
+        "Bearer token-2",
+        "Bearer token-2",
+    ]
+    assert credential.calls == 2
