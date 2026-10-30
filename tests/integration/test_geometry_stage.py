@@ -144,7 +144,8 @@ def test_geometry_stage_recovers_after_wrong_size(tmp_path):
     assert outcome.attempts == 2
     attempts = ctx.record.stages[0].attempts
     assert [(a.n, a.ok) for a in attempts] == [(1, False), (2, True)]
-    assert "x" in attempts[0].errors[0] and "bounding box" in attempts[0].errors[0].lower()
+    assert "bounding box mismatch" in attempts[0].errors[0]
+    assert "(0, 0, 0, 1.2, 1, 0.1)" in attempts[0].errors[0]  # what the script built
     # The model was told what was wrong, in the tool result of its first check.
     feedback = [m for m in backend.calls[2].messages if m["role"] == "tool"][-1]["content"]
     assert "checks failed" in feedback and "attempt 2" in feedback
@@ -161,3 +162,16 @@ def test_geometry_stage_reports_a_script_that_crashes(tmp_path):
     assert outcome.ok and outcome.attempts == 2
     first_errors = "\n".join(ctx.record.stages[0].attempts[0].errors)
     assert "ValueError: side length not set" in first_errors
+
+
+def test_geometry_stage_reports_a_script_that_writes_no_outputs(tmp_path):
+    silent = "print('nothing exported')\n"  # exits 0 but writes neither file
+    backend = ScriptedBackend(
+        [write_script(1, silent), check(1), write_script(2, CAVITY_SCRIPT), check(2)]
+    )
+    ctx = make_ctx(tmp_path, backend)
+    outcome = run_stage(GeometryStage(), ctx)
+    assert outcome.ok and outcome.attempts == 2
+    first_errors = "\n".join(ctx.record.stages[0].attempts[0].errors)
+    assert "did not write geometry.step, boundary_manifest.json" in first_errors
+    assert "nothing exported" in first_errors

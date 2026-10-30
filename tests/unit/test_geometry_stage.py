@@ -14,6 +14,7 @@ from cfdagent.agents.geometry import (
     MANIFEST_MAX_BYTES,
     SCRIPT_TIMEOUT_S,
     GeometryStage,
+    _last_bytes,
 )
 from cfdagent.agents.loop import run_stage
 from cfdagent.agents.stage import StageContext
@@ -307,15 +308,12 @@ def test_manifest_and_sandbox_problems_are_reported_together(tmp_path):
     assert len(result.errors) == 2 and result.errors[-1] == "volume mismatch"
 
 
-def axisymmetric_spec():
+def axisymmetric_spec(names=("inlet", "outlet", "side", "wedgeFront", "wedgeBack")):
     spec = make_spec().model_dump()
     spec["dimensionality"] = "axisymmetric"
     spec["geometry"]["thickness_m"] = None
     spec["geometry"]["wedge_angle_deg"] = 5.0
-    spec["boundaries"] = [
-        {"name": n, "role": "wall", "description": "x"}
-        for n in ("inlet", "outlet", "side", "wedgeFront", "wedgeBack")
-    ]
+    spec["boundaries"] = [{"name": n, "role": "wall", "description": "x"} for n in names]
     return make_spec(**{k: spec[k] for k in ("dimensionality", "geometry", "boundaries")})
 
 
@@ -341,28 +339,125 @@ def wedge_manifest(front="wedge", back="wedge", extra=()):
     }
 
 
+def gate(tmp_path, spec, data, number=1):
+    """The stage's verdict on a manifest, with a sandbox that accepts script and geometry."""
+    sandbox = FakeSandbox({"run_script": RUN_OK, "check_geometry": GATE_OK})
+    ctx = make_ctx(tmp_path, sandbox, spec=spec)
+    return GeometryStage().execute_and_gate(ctx, attempt(ctx, number, manifest_data=data))
+
+
+def spec_with_boundaries(names, **changes):
+    boundaries = [{"name": n, "role": "x", "description": "x"} for n in names]
+    return make_spec(boundaries=boundaries, **changes)
+
+
 def test_axisymmetric_manifest_needs_two_separate_wedge_patches(tmp_path):
     spec = axisymmetric_spec()
-    sandbox = FakeSandbox({"run_script": RUN_OK, "check_geometry": GATE_OK})
-    ctx = make_ctx(tmp_path, sandbox, spec=spec)
-    good = GeometryStage().execute_and_gate(ctx, attempt(ctx, manifest_data=wedge_manifest()))
-    assert good.ok, good.errors
-    bad = GeometryStage().execute_and_gate(
-        ctx, attempt(ctx, 2, manifest_data=wedge_manifest(back="wall"))
-    )
-    assert not bad.ok and "wedge" in "\n".join(bad.errors)
+    assert gate(tmp_path, spec, wedge_manifest()).ok
+    for bad in (wedge_manifest(back="wall"), wedge_manifest(front="empty", back="empty")):
+        result = gate(tmp_path, spec, bad)
+        assert not result.ok and "two patches of type `wedge`" in "\n".join(result.errors)
 
 
-def test_2d_manifest_needs_exactly_one_empty_patch(tmp_path):
-    sandbox = FakeSandbox({"run_script": RUN_OK, "check_geometry": GATE_OK})
-    names = ("inlet", "outlet", "walls", "front", "back")
-    spec = make_spec(boundaries=[{"name": n, "role": "x", "description": "x"} for n in names])
-    ctx = make_ctx(tmp_path, sandbox, spec=spec)
+def test_axisymmetric_manifest_rejects_three_wedges_and_wedge_plus_empty(tmp_path):
+    spec = axisymmetric_spec()
+    third = {"name": "extra", "type": "wedge", "locators": [plane("x", 2.0)]}
+    result = gate(tmp_path, spec, wedge_manifest(extra=[third]))
+    assert not result.ok and "has 3 `wedge`" in "\n".join(result.errors)
+    plus_empty = {"name": "lid2", "type": "empty", "locators": [plane("z", 0.0)]}
+    result = gate(tmp_path, spec, wedge_manifest(extra=[plus_empty]))
+    assert not result.ok and "1 `empty`" in "\n".join(result.errors)
+
+
+def test_axisymmetric_plan_that_lists_an_axis_boundary_is_satisfiable(tmp_path):
+    """Regression (scenario B): the axis of a wedge has no face, so no patch can carry its name."""
+    spec = axisymmetric_spec(("inlet", "outlet", "side", "axis", "wedgeFront", "wedgeBack"))
+    assert gate(tmp_path, spec, wedge_manifest()).ok
+
+
+def test_wedge_patches_of_an_axisymmetric_case_may_have_any_name(tmp_path):
+    spec = axisymmetric_spec(("inlet", "outlet", "side"))  # the plan lists no wedge boundary
+    assert gate(tmp_path, spec, wedge_manifest()).ok
+
+
+def test_a_non_structural_patch_name_the_plan_does_not_list_is_rejected_with_a_hint(tmp_path):
+    spec = axisymmetric_spec()
+    data = wedge_manifest()
+    data["patches"][2]["name"] = "shell"  # the plan lists `side`
+    result = gate(tmp_path, spec, data)
+    assert not result.ok
+    text = "\n".join(result.errors)
+    assert "`shell`" in text and "`side`" in text  # the unknown name and the unmatched plan name
+    assert "wedge" in text  # the wedge patches may have any name
+
+
+def test_2d_plan_without_an_empty_boundary_is_satisfiable(tmp_path):
+    """Regression (scenario A): the plan lists no front/back boundary; the manifest needs an
+    `empty` patch anyway and it may have any name."""
+    spec = spec_with_boundaries(("inlet", "outlet", "walls"))
+    assert gate(tmp_path, spec, manifest()).ok
+    other = manifest(names=("inlet", "outlet", "walls", "sides"))
+    assert gate(tmp_path, spec, other, number=2).ok
+
+
+def test_2d_manifest_accepts_two_separate_empty_patches(tmp_path):
+    spec = spec_with_boundaries(("inlet", "outlet", "walls", "front", "back"))
     data = manifest()
     data["patches"][3] = {"name": "front", "type": "empty", "locators": [plane("z", 0.0)]}
     data["patches"].append({"name": "back", "type": "empty", "locators": [plane("z", 0.1)]})
-    result = GeometryStage().execute_and_gate(ctx, attempt(ctx, manifest_data=data))
-    assert not result.ok and "empty" in "\n".join(result.errors)
+    result = gate(tmp_path, spec, data)
+    assert result.ok, result.errors
+
+
+def test_2d_faces_on_the_z_planes_must_be_empty(tmp_path):
+    spec = spec_with_boundaries(("inlet", "outlet", "walls", "front", "back"))
+    data = manifest()
+    data["patches"][3] = {"name": "front", "type": "empty", "locators": [plane("z", 0.0)]}
+    data["patches"].append({"name": "back", "type": "wall", "locators": [plane("z", 0.1)]})
+    result = gate(tmp_path, spec, data)
+    assert not result.ok
+    text = "\n".join(result.errors)
+    assert "`back` (wall)" in text and "`front`" not in text
+
+
+def test_2d_manifest_has_no_wedge_patch_and_3d_has_no_empty_or_wedge(tmp_path):
+    data = manifest()
+    data["patches"].append({"name": "w", "type": "wedge", "locators": [plane("x", 2.0)]})
+    result = gate(tmp_path, spec_with_boundaries(("inlet", "outlet", "walls", "w")), data)
+    assert not result.ok and "no `wedge` patch" in "\n".join(result.errors)
+    spec3 = plan(dimensionality="3D")
+    data = manifest(dimensionality="3D")  # still holds the `empty` patch
+    result = gate(tmp_path, spec3, data, number=2)
+    assert not result.ok and "3D case has no `empty`" in "\n".join(result.errors)
+    data["patches"] = [p for p in data["patches"] if p["type"] != "empty"]
+    assert gate(tmp_path, spec3, data, number=3).ok
+
+
+def test_very_long_plan_names_are_shortened_in_messages(tmp_path):
+    long_name = "n" * 500
+    spec = spec_with_boundaries(("inlet", "outlet", "walls", long_name))
+    result = gate(tmp_path, spec, manifest(names=("inlet", "exit", "walls", "frontAndBack")))
+    assert not result.ok
+    assert long_name not in "\n".join(result.errors)
+    assert len("\n".join(result.errors)) < 1000
+
+
+def test_a_missing_manifest_is_left_to_the_sandbox_gate(tmp_path):
+    sandbox = FakeSandbox(
+        {"run_script": RUN_OK, "check_geometry": gate_failed("boundary_manifest.json is missing")}
+    )
+    ctx = make_ctx(tmp_path, sandbox)
+    result = GeometryStage().execute_and_gate(ctx, attempt(ctx))
+    assert result.errors == ["boundary_manifest.json is missing"]
+
+
+def test_last_bytes_never_splits_a_character():
+    text = "x" * 10 + "é" * 20  # two bytes per character
+    for limit in range(1, 40):
+        shown = _last_bytes(text, limit)
+        assert shown.encode("utf-8")  # valid text
+        assert len(shown.split("\n", 1)[-1].encode("utf-8")) <= limit
+    assert _last_bytes("short", 100) == "short"
 
 
 # ------------------------------------------------------------------ promotion, scope, prompt
@@ -427,6 +522,10 @@ def test_prompt_states_the_output_contract_and_the_shared_conventions():
         "metre",
         "one solid",
         "CadQuery",
+        "centered=False",
+        "not 360",
+        "across z = 0",
+        "no other face does",
     ):
         assert needle in text, needle
     # The conventions of the Planner prompt, stated the same way.
