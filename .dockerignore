@@ -1,9 +1,11 @@
 # Keep the build context small and free of local state.
-# Patterns are anchored at the context root (a leading "/") so that, for example, "/tests" does not
-# also drop a "tests" directory inside src/. "**/" matches at any depth.
+# .dockerignore is not .gitignore: a pattern is matched against paths from the context root, so
+# "/tests" and "tests" both mean only the top-level directory; a pattern at any depth needs "**/".
+# The patterns are anchored (leading "/") to say so.
 /.git
 /.github
 /.venv
+/.worktrees
 /.superpowers
 /.claude
 /.pytest_cache
@@ -19,9 +21,9 @@
 
 # Simulation outputs never go into an image or into git.
 /runs
-**/*.msh
-**/postProcessing
-**/processor*
+/*.msh
+/postProcessing
+/processor*
 
 # Docs and infra are not needed to build the image.
 /docs

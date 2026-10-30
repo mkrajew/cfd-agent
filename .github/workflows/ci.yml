@@ -113,6 +113,7 @@ jobs:
           compression-level: 1
           retention-days: 1
           if-no-files-found: error
+          overwrite: true
       - name: Upload runtime image
         uses: actions/upload-artifact@v4
         with:
@@ -121,6 +122,7 @@ jobs:
           compression-level: 1
           retention-days: 1
           if-no-files-found: error
+          overwrite: true
 
   integration:
     name: integration
@@ -152,7 +154,7 @@ jobs:
           --pids-limit 512
           --memory 8g
           -v "$PWD:/work:ro" -w /work
-          cfdagent:dev pytest -m integration tests/integration
+          cfdagent:dev pytest -m integration tests/integration -rs
 
   sandbox:
     name: sandbox
@@ -165,26 +167,24 @@ jobs:
         with:
           python-version: "3.12"
           enable-cache: true
-      - name: Download images
+      - name: Download runtime image
         uses: actions/download-artifact@v4
         with:
-          pattern: cfdagent-image-*
-          merge-multiple: true
+          name: cfdagent-image-runtime
           path: ${{ runner.temp }}
-      - name: Load images
+      - name: Load runtime image
         run: |
           set -euo pipefail
-          docker load --input "${RUNNER_TEMP}/cfdagent-test-image.tar"
           docker load --input "${RUNNER_TEMP}/cfdagent-runtime-image.tar"
-          # The sandbox tests skip when an image is missing; here a missing image must fail.
-          docker image inspect cfdagent:dev cfdagent:runtime > /dev/null
+          # The sandbox tests skip when the image is missing; here a missing image must fail.
+          docker image inspect cfdagent:runtime > /dev/null
       - name: Install dependencies
         run: uv sync --locked
       - name: Sandbox tests
-        # The tests start hardened executor containers with `docker run` from the test image (the
-        # executor needs only the runtime parts of it) and inspect the runtime image.
+        # The executor containers run the shipped image (the runtime target: no pytest, no uv, no
+        # compilers); pytest itself runs on the runner host.
         env:
-          CFDAGENT_SANDBOX_IMAGE: cfdagent:dev
+          CFDAGENT_SANDBOX_IMAGE: cfdagent:runtime
           CFDAGENT_RUNTIME_IMAGE: cfdagent:runtime
         run: uv run pytest -m sandbox tests/sandbox -rs
 

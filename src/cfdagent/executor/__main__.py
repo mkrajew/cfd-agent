@@ -3,7 +3,8 @@
 Reads ``<job>/.sandbox/<id>.request.json``, runs the op, writes ``<id>.response.json`` atomically.
 The job directory is the current directory (``/job`` in the container). Exit code 0 means a
 response was written (whether the op succeeded or not), 2 a bad command line (no response is
-possible), 1 that the response could not be written. Diagnostics go to stderr.
+possible; also 2 when HOME is unset or inside the job directory, see ``home_problem``), 1 that
+the response could not be written. Diagnostics go to stderr.
 
 While ops run, file descriptor 1 is pointed at stderr: OpenCASCADE and OpenFOAM libraries print
 to stdout, and nothing on stdout is ever parsed.
@@ -19,6 +20,23 @@ from pydantic import ValidationError
 
 from cfdagent.executor import ops, protocol
 from cfdagent.rundir import RunDir, RunDirError
+
+
+def home_problem(home: str | None, job_root: Path) -> str | None:
+    """Why ``home`` cannot be this process's HOME; None if it is fine.
+
+    OpenFOAM reads ``$HOME/.OpenFOAM/controlDict`` and that file overrides the site-wide
+    ``allowSystemOperations 0``. The job directory is hostile (agent code writes into it), so HOME
+    must be set (OpenFOAM falls back to the working directory otherwise) and must not be the job
+    directory or lie under it.
+    """
+    if not home:
+        return "HOME is not set; OpenFOAM would look for its user files in the job directory"
+    job = job_root.resolve()
+    resolved = Path(home).resolve()
+    if resolved == job or job in resolved.parents:
+        return f"HOME ({home}) is inside the job directory, which agent code can write to"
+    return None
 
 
 def _respond(op: str, request_rel: str, jail: RunDir) -> protocol.OpResponse:
@@ -80,5 +98,9 @@ def _stdout_to_stderr() -> None:
 
 
 if __name__ == "__main__":
+    _problem = home_problem(os.environ.get("HOME"), Path.cwd())
+    if _problem is not None:
+        print(f"the executor does not start: {_problem}", file=sys.stderr)
+        sys.exit(2)
     _stdout_to_stderr()
     sys.exit(main(sys.argv[1:]))

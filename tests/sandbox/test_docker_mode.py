@@ -310,44 +310,25 @@ def test_a_symlink_left_by_a_script_is_refused_on_the_next_call(sandbox):
         sandbox.run_dir.read_text("case/hostname")
 
 
-MARKER = "EXECUTED_MARKER"
-CODE_STREAM = (
-    "trap #codeStream\n{\n    codeInclude #{ #include <fstream> #};\n"
-    f'    code #{{ std::ofstream("/job/{MARKER}") << "ran"; os << 1; #}};\n}};\n'
-)
-FOAM_CASES = ROOT / "tests" / "integration" / "foam_cases.py"
+INTEGRATION = ROOT / "tests" / "integration"
 
-# name: (file to extend, text appended to it, ops that must refuse it)
-HOSTILE_CASES = {
-    "codestream in controlDict": (
-        "system/controlDict",
-        CODE_STREAM,
-        ("check_dictionaries", "trial_run", "run_solver"),
-    ),
-    "calc in a 0/ file": (
-        "0/p",
-        f'trap #calc "system(\\"touch /job/{MARKER}\\")";\n',
-        ("check_dictionaries", "trial_run", "run_solver"),
-    ),
-    "coded patch type": (
-        "0/p",
-        "boundaryField { movingWall { type codedFixedValue; name probe; "
-        f'code #{{ std::ofstream("/job/{MARKER}") << "ran"; #}}; }} }}\n',
-        ("trial_run", "run_solver"),
-    ),
-}
-HOSTILE_PARAMS = [
-    pytest.param(name, op, id=f"{name}-{op}")
-    for name, (_, _, ops) in HOSTILE_CASES.items()
-    for op in ops
-]
+
+def _load(name: str):
+    """Load a helper module of tests/integration (it is not on the import path of this folder)."""
+    spec = importlib.util.spec_from_file_location(name, INTEGRATION / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+hostile = _load("hostile_cases")
+MARKER = hostile.MARKER
+HOSTILE_CASES = hostile.hostile_cases("/job")
 
 
 def _meshed_case(sandbox) -> None:
     """A small meshed case: fixture dictionaries, and a mesh that blockMesh makes in a container."""
-    spec = importlib.util.spec_from_file_location("foam_cases", FOAM_CASES)
-    foam_cases = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(foam_cases)
+    foam_cases = _load("foam_cases")
     case = sandbox.run_dir.root / "case"
     for sub in ("0", "constant", "system"):
         shutil.copytree(foam_cases.FIXTURE_CASE / sub, case / sub)
@@ -363,13 +344,14 @@ def _meshed_case(sandbox) -> None:
     assert (case / "constant" / "polyMesh" / "points").is_file()
 
 
-@pytest.mark.parametrize(("name", "op"), HOSTILE_PARAMS)
+@pytest.mark.parametrize(("name", "op"), hostile.hostile_params("/job"))
 def test_case_supplied_code_is_refused(sandbox, name, op):
     """allowSystemOperations is off site-wide: code in a case file is never compiled or run."""
     _meshed_case(sandbox)
-    target, text, _ = HOSTILE_CASES[name]
-    path = f"case/{target}"
-    sandbox.run_dir.write_text(path, sandbox.run_dir.read_text(path) + text)
+    edits, _ = HOSTILE_CASES[name]
+    for target, text in edits:
+        path = f"case/{target}"
+        sandbox.run_dir.write_text(path, sandbox.run_dir.read_text(path) + text)
     args = {"case_dir": "case"}
     if op != "check_dictionaries":
         args["solver"] = "icoFoam"
@@ -401,11 +383,61 @@ def test_openfoam_home_is_not_in_the_run_directory(sandbox):
     assert ".OpenFOAM" not in result["listed"], result
 
 
+@pytest.mark.parametrize("op", ["trial_run", "run_solver"])
+def test_an_ordinary_failure_carries_no_refusal_hint(sandbox, op):
+    """Negative control: every solver log prints the allowSystemOperations banner line."""
+    _meshed_case(sandbox)
+    (sandbox.run_dir.root / "case" / "0" / "p").unlink()
+    response = sandbox.client.call(op, {"case_dir": "case", "solver": "icoFoam"}, timeout_s=300)
+    assert response.ok is False and response.internal is False, response
+    assert "case-supplied code" not in response.error, response.error
+    assert "plain numbers" not in response.error, response.error
+
+
+def test_a_user_level_controldict_written_by_one_call_does_not_reach_the_next(sandbox):
+    """Call 1 plants ~/.OpenFOAM/controlDict and /job/.OpenFOAM/controlDict; call 2 ignores both."""
+    planted = probe(
+        sandbox,
+        name="plant.py",
+        source="""
+        import json, os, pathlib, subprocess
+        text = "InfoSwitches { allowSystemOperations 1; }\\n"
+        for base in (pathlib.Path(os.environ["HOME"]), pathlib.Path("/job")):
+            (base / ".OpenFOAM").mkdir(parents=True, exist_ok=True)
+            (base / ".OpenFOAM" / "controlDict").write_text(text)
+        listed = subprocess.run(["icoFoam", "-listSwitches"], capture_output=True, text=True)
+        line = [x for x in listed.stdout.splitlines() if "allowSystemOperations" in x]
+        print("RESULT=" + json.dumps({"home": os.environ["HOME"], "switch": line}))
+        """,
+    )
+    # Within the call that planted it the user-level file may well take effect (not asserted).
+    assert planted["home"].startswith("/tmp/"), planted
+    assert (sandbox.run_dir.root / ".OpenFOAM" / "controlDict").is_file()  # it persisted
+    later = probe(
+        sandbox,
+        name="check.py",
+        source="""
+        import json, os, subprocess
+        listed = subprocess.run(["icoFoam", "-listSwitches"], capture_output=True, text=True)
+        line = [x for x in listed.stdout.splitlines() if "allowSystemOperations" in x]
+        home = os.environ["HOME"]
+        print("RESULT=" + json.dumps({
+            "home": home,
+            "home_has_openfoam_dir": os.path.exists(os.path.join(home, ".OpenFOAM")),
+            "switch": line,
+        }))
+        """,
+    )
+    assert later["home"].startswith("/tmp/home-"), later
+    assert later["home_has_openfoam_dir"] is False, later
+    assert any("Disallowing user-supplied system call operations" in x for x in later["switch"])
+
+
 RUNTIME_IMAGE = os.environ.get("CFDAGENT_RUNTIME_IMAGE", "cfdagent:runtime")
 
 RUNTIME_PROBE = textwrap.dedent(
     """
-    import importlib.util, json, shutil, subprocess
+    import importlib.util, json, os, pathlib, shutil, subprocess
     found = subprocess.run(
         ["find", "/", "-xdev", "(", "-path", "/proc", "-o", "-path", "/sys", ")", "-prune",
          "-o", "-type", "f", "-perm", "/6000", "-print"],
@@ -414,6 +446,7 @@ RUNTIME_PROBE = textwrap.dedent(
     switches = subprocess.run(
         ["icoFoam", "-listSwitches"], capture_output=True, text=True
     ).stdout
+    tutorials = os.environ.get("FOAM_TUTORIALS", "")
     imports = {}
     for name in ("cfdagent.executor", "cadquery", "gmsh", "pyvista", "matplotlib"):
         try:
@@ -424,11 +457,17 @@ RUNTIME_PROBE = textwrap.dedent(
     print("RESULT=" + json.dumps({
         "setuid": found.stdout.split(),
         "tools": {n: shutil.which(n) for n in
-                  ("uv", "uvx", "pytest", "pre-commit", "gcc", "g++", "cc", "make")},
+                  ("uv", "uvx", "pytest", "pre-commit", "sudo", "gcc", "g++", "cc", "c++", "cpp",
+                   "gfortran", "make", "wmake", "ld", "as")},
         "modules": {m: importlib.util.find_spec(m) is not None
                     for m in ("pytest", "pre_commit", "uv", "ruff")},
         "imports": imports,
         "switch": [x for x in switches.splitlines() if "allowSystemOperations" in x],
+        "tutorials": [
+            tutorials,
+            os.path.isdir(os.path.join(tutorials, "incompressible")),
+            sum(1 for _ in pathlib.Path(tutorials).rglob("controlDict")),
+        ],
     }))
     """
 )
@@ -473,6 +512,9 @@ def test_runtime_image_has_no_uv_pytest_or_setuid_helpers():
     assert not any(result["modules"].values()), result
     assert all(state == "ok" for state in result["imports"].values()), result
     assert any("Disallowing user-supplied system call operations" in x for x in result["switch"])
+    # The tutorials are kept on purpose: curated knowledge and the tutorial search read them.
+    path, has_incompressible, controldicts = result["tutorials"]
+    assert path and has_incompressible and controldicts > 100, result
 
 
 def test_full_pipeline_with_four_mpi_ranks_in_the_sandbox(sandbox):

@@ -34,20 +34,23 @@ ENV UV_PYTHON=3.12 \
     UV_COMPILE_BYTECODE=1 \
     UV_NO_CACHE=1
 WORKDIR /opt/build
+
+# The runtime environment: the locked dependencies without the dev group (layer 1, changes
+# rarely), then the package itself, non-editable (layer 2, changes with every commit).
+FROM python-base AS venv-runtime
 COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --extra toolchain --no-dev --no-install-project
 COPY README.md LICENSE ./
 COPY src ./src
-
-# The runtime environment: the locked dependencies without the dev group, and the package itself
-# (non-editable).
-FROM python-base AS venv-runtime
-RUN uv sync --locked --extra toolchain --no-dev --no-install-project \
-    && uv sync --locked --extra toolchain --no-dev --no-editable
+RUN uv sync --locked --extra toolchain --no-dev --no-editable
 
 # The test environment: the same plus the dev group (pytest, ruff, pre-commit).
 FROM python-base AS venv-test
-RUN uv sync --locked --extra toolchain --group dev --no-install-project \
-    && uv sync --locked --extra toolchain --group dev --no-editable
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --extra toolchain --group dev --no-install-project
+COPY README.md LICENSE ./
+COPY src ./src
+RUN uv sync --locked --extra toolchain --group dev --no-editable
 
 # --------------------------------------------------------------------------------------------
 # The hardened base: OpenFOAM and the system libraries, without a Python environment.
@@ -81,19 +84,28 @@ RUN apt-get update \
         libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
-# No compilers. Case-supplied C++ (#codeStream, coded patch types) is refused below, and nothing
-# in the pipeline compiles OpenFOAM code, so compilers would only help an attacker. Purging the
-# development metapackages of OpenFOAM and the compilers leaves the `openfoam2512` runtime package
-# (applications, libraries, etc, tutorials) and its runtime dependencies untouched. Checked by the
-# integration suite and by the library check below. (`sudo` cannot be purged: its pre-removal
-# script fails in a container; its setuid bit is stripped below.)
-RUN apt-get purge -y gcc g++ gfortran cpp make \
-        openfoam2512-default openfoam2512-dev openfoam2512-tools \
+# No compilers. Case-supplied C++ (#codeStream, #calc, coded patch types) is refused below, and
+# nothing in the pipeline compiles OpenFOAM code, so compilers would only help an attacker.
+# Purging the development metapackages of OpenFOAM and the compilers, then autoremoving what
+# only they needed, would also take away packages that the metapackage `openfoam2512-default`
+# alone kept installed: the runtime package `openfoam2512` and `openfoam2512-common` (stay, they
+# are marked manual) and `openfoam2512-tutorials` (stays on purpose: the tutorial search and the
+# curated knowledge read $FOAM_TUTORIALS, also in the runtime image). `openfoam2512-source` is
+# purged on purpose: the C++ sources and headers are not needed at run time. The integration
+# suite, the tutorials assertion and the library check below prove that nothing else was lost.
+# (`sudo` cannot be purged: its pre-removal script fails in a container; it is deleted below.)
+RUN apt-mark manual openfoam2512 openfoam2512-common openfoam2512-tutorials \
+    && apt-get purge -y gcc g++ gfortran cpp make \
+        openfoam2512-default openfoam2512-dev openfoam2512-tools openfoam2512-source \
     && apt-get autoremove -y --purge \
     && rm -rf /var/lib/apt/lists/* \
-    && for tool in gcc g++ cc c++ gfortran make cpp; do \
+    && for tool in gcc g++ cc c++ gfortran make cpp ld as; do \
         if command -v "${tool}" >/dev/null; then echo "${tool} is still installed" >&2; exit 1; fi; \
-    done
+    done \
+    && bash -c '. /etc/profile.d/openfoam-99run.sh \
+        && if command -v wmake >/dev/null; then echo "wmake is still installed" >&2; exit 1; fi \
+        && test -d "${FOAM_TUTORIALS}/incompressible" \
+        && [ "$(find "${FOAM_TUTORIALS}" -name controlDict | wc -l)" -gt 100 ]'
 
 # The base image has a user `ubuntu` with uid 1000. Replace it by `cfd` (uid 1000).
 RUN userdel -r ubuntu \
@@ -107,12 +119,22 @@ RUN userdel -r ubuntu \
 COPY --chmod=0755 docker/openfoam-env.sh /etc/cfd/openfoam-env.sh
 COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/cfd-entrypoint
 
-# Case-supplied code is never allowed: allowSystemOperations 0 in the OpenFOAM project controlDict
-# (OpenFOAM reads ~/.OpenFOAM/<version>/controlDict, ~/.OpenFOAM/controlDict and this file; there
-# is no separate site-level file). With it off, OpenFOAM refuses #codeStream, #calc, coded patch
-# types and coded function objects before anything is generated or compiled. The assertions fail
-# the build when the line is missing or not 0 (for example after a base image bump), and when the
-# running OpenFOAM does not report the switch as off.
+# Case-supplied code is never allowed: allowSystemOperations 0 in the OpenFOAM project controlDict.
+# OpenFOAM also reads group-level site files (${WM_PROJECT_SITE}/etc, ${WM_PROJECT_DIR}/site/etc)
+# and user-level files (~/.OpenFOAM/<version>/controlDict, ~/.OpenFOAM/controlDict) and honours
+# FOAM_CONTROLDICT; those override the project file, and none of them exists in this image, so
+# editing the project file is effective. HOME must therefore never be a place an agent can write
+# (the executor refuses to start with such a HOME). With the switch off, OpenFOAM refuses
+# #codeStream, #calc, coded patch types and coded function objects before anything is generated
+# or compiled. The assertions fail the build when the line is missing or not 0 (for example after
+# a base image bump), and when the running OpenFOAM does not report the switch as off, so a layout
+# change fails closed.
+#
+# What this does NOT close: a plain `libs ("x.so")` entry (dlopen of a library an agent made
+# earlier, on a mount that is not noexec), the `-libs` option and the `systemCall` function object
+# are not governed by the switch. They are acceptable only because the container (no network, no
+# capabilities, read-only root file system, resource limits) is the confinement. The missing
+# compilers close the #calc/#codeStream/coded-type paths even if the switch were turned on again.
 ARG OPENFOAM_CONTROL_DICT=/usr/lib/openfoam/openfoam2512/etc/controlDict
 RUN sed -i 's/^\([[:space:]]*allowSystemOperations[[:space:]]\{1,\}\)1[[:space:]]*;/\10;/' \
         "${OPENFOAM_CONTROL_DICT}" \
@@ -127,10 +149,11 @@ RUN bash -c '. /etc/cfd/openfoam-env.sh \
         && missing="$(ldd "${FOAM_APPBIN}"/* "${FOAM_LIBBIN}"/*.so 2>/dev/null | grep "not found" | sort -u)" \
         && if [ -n "${missing}" ]; then echo "${missing}" >&2; exit 1; fi'
 
-# No setuid or setgid binaries (su, sudo, mount, passwd, ...): they are no use to the unprivileged
-# user and a risk if anything ever runs with more privileges. The last step before the
-# assertion, so nothing above can bring them back.
-RUN find / -xdev -type f -perm /6000 -exec chmod ug-s {} + \
+# No sudo, and no setuid or setgid binaries (su, mount, passwd, ...): they are no use to the
+# unprivileged user and a risk if anything ever runs with more privileges. The last step before
+# the assertion, so nothing above can bring them back.
+RUN rm -f /usr/bin/sudo \
+    && find / -xdev -type f -perm /6000 -exec chmod ug-s {} + \
     && [ -z "$(find / -xdev -type f -perm /6000)" ]
 
 ENV BASH_ENV=/etc/cfd/openfoam-env.sh \

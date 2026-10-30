@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -145,7 +146,12 @@ def test_eval_still_works_with_system_operations_off(tmp_path):
 def test_user_level_controldict_could_reenable_the_switch_but_nothing_can_compile(tmp_path):
     """HOME must stay out of agent-writable places (a ~/.OpenFOAM/controlDict beats the site file).
 
-    Second line of defence: the image has no compiler, so even an enabled switch cannot run code.
+    Second line of defence: the image has no compiler, so even an enabled switch cannot run
+    #calc, #codeStream or coded patch types and function objects. That is ALL it closes: a plain
+    ``libs ("x.so")`` entry (dlopen of a library an agent made earlier, on a mount that is not
+    noexec), the ``-libs`` option and the ``systemCall`` function object are not governed by the
+    switch. They are acceptable only because the container itself is the confinement (no
+    network, no capabilities, read-only root, resource limits).
     """
     home = tmp_path / "home"
     (home / ".OpenFOAM").mkdir(parents=True)
@@ -176,3 +182,16 @@ def test_user_level_controldict_could_reenable_the_switch_but_nothing_can_compil
     )
     assert done.returncode != 0
     assert not (tmp_path / "EXECUTED").exists()
+
+
+def test_tutorials_are_in_the_image():
+    """Curated knowledge and the tutorial search read $FOAM_TUTORIALS; it must survive the purge."""
+    tutorials = Path(os.environ["FOAM_TUTORIALS"])
+    assert tutorials.is_dir(), tutorials
+    assert (tutorials / "incompressible").is_dir()
+    assert sum(1 for _ in tutorials.rglob("controlDict")) > 100
+
+
+def test_no_build_tools_in_the_image():
+    for tool in ("gcc", "g++", "cc", "c++", "cpp", "gfortran", "make", "wmake", "ld", "as"):
+        assert shutil.which(tool) is None, tool
