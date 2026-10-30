@@ -1,0 +1,14 @@
+[Unit]
+Description=cfdagent: block the Azure metadata endpoints for Docker containers
+Documentation=https://github.com/mkrajew/cfd-agent/blob/main/docs/runbooks/vm-host.md
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/cfdagent-iptables start
+ExecStop=/usr/local/sbin/cfdagent-iptables stop
+
+[Install]
+WantedBy=multi-user.target

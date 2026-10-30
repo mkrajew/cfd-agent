@@ -2,7 +2,11 @@
 Description=Daily shutdown of the VM
 
 [Timer]
-# Substituted by infra/modules/vm.bicep from the shutdownTime and shutdownTimeZone parameters.
+# The OnCalendar placeholder below is replaced by infra/modules/vm.bicep (new VMs) or by
+# scripts/vm-host-setup.sh (running VM) with one value per attempt: the shutdown time from the
+# shutdownTime and shutdownTimeZone parameters, then every 10 minutes for 4 hours after it (23:00
+# to 03:00 by default). Every attempt runs cfdagent-idle-shutdown --daily, which defers while a run
+# is active.
 OnCalendar=__ON_CALENDAR__
 Persistent=false
 

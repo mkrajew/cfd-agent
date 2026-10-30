@@ -23,7 +23,9 @@ Inside an owner-approved spending envelope, starting, stopping or deallocating t
 - **Daily auto-shutdown** of the VM (time as a parameter, Europe/Warsaw). `Microsoft.DevTestLab/schedules` is not offered in any allowed region, so it is a systemd timer on the VM.
 - **Idle shutdown:** on-VM timer deallocates the VM after 30 minutes with no SSH session and no running `cfdagent`; its identity may deallocate only that VM.
 - **Budget:** subscription budget of $100 with alerts at 25, 50, 75 and 90 percent; the notification address is a parameter, never a literal in the repository.
-- SSH (22) is open to the Internet (owner decision 2026-10-29, the owner changes networks and uses a VPN); compensated by key-only authentication (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PermitRootLogin no`) and `fail2ban` on the VM. No other inbound port is opened.
+- SSH (22) is open to the Internet (owner decision 2026-10-29, the owner changes networks and uses a VPN); compensated by key-only authentication (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PermitRootLogin no`), `MaxAuthTries 3`, `AllowUsers <admin user>` and `fail2ban` on the VM. No other inbound port is opened.
+- Docker containers cannot reach the Azure metadata endpoints (IMDS, WireServer) over a bridge network: `cfdagent-iptables.service` (DOCKER-USER chain); executors also run with `--network none`.
+- The VM identity writes blobs only in the `runs` container (role assigned at container scope).
 - Keyless access: system-assigned managed identity to Foundry and Blob (Entra ID). A key in Key Vault only if a model rejects Entra. Least privilege on every role assignment.
 - No secrets, keys, IP addresses, subscription IDs or e-mail addresses in files; use parameters or environment variables.
 

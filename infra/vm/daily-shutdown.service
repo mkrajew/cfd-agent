@@ -1,8 +1,10 @@
 [Unit]
-Description=Deallocate this VM at the daily shutdown time
+Description=Deallocate this VM at the daily shutdown time (deferred while a run is active)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/cfdagent-idle-shutdown --force
+# --daily exits 0 without deallocating while /var/lib/cfdagent/active-run is younger than 4 hours;
+# the timer fires again every 10 minutes, so the shutdown happens soon after the run has ended.
+ExecStart=/usr/local/sbin/cfdagent-idle-shutdown --daily

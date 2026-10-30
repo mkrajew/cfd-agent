@@ -28,6 +28,23 @@ write_files:
       maxretry = 5
       findtime = 10m
       bantime = 1h
+  # MaxAuthTries 3 and AllowUsers for the administrator; 20- sorts after the hardening file above.
+  # The same file is applied to a running VM by scripts/vm-host-setup.sh.
+  - path: /etc/ssh/sshd_config.d/20-cfdagent-ssh-extra.conf
+    permissions: "0644"
+    owner: root:root
+    encoding: b64
+    content: __B64_SSH_EXTRA__
+  - path: /usr/local/sbin/cfdagent-iptables
+    permissions: "0755"
+    owner: root:root
+    encoding: b64
+    content: __B64_IPTABLES_SCRIPT__
+  - path: /etc/systemd/system/cfdagent-iptables.service
+    permissions: "0644"
+    owner: root:root
+    encoding: b64
+    content: __B64_IPTABLES_SERVICE__
   - path: /usr/local/sbin/cfdagent-idle-shutdown
     permissions: "0755"
     owner: root:root
@@ -55,12 +72,15 @@ write_files:
     content: __B64_DAILY_TIMER__
 
 runcmd:
-  - [mkdir, -p, /var/lib/cfdagent]
+  # State and runs directories belong to the administrator (the idle-shutdown script runs as root).
+  - [sh, -c, "install -d -o __ADMIN_USER__ -g __ADMIN_USER__ /var/lib/cfdagent /home/__ADMIN_USER__/runs"]
   - [systemctl, enable, --now, docker]
   - [sh, -c, "mkdir -p /run/sshd && sshd -t && (systemctl reload ssh || true)"]
   - [systemctl, enable, --now, fail2ban]
   - [usermod, -aG, docker, "__ADMIN_USER__"]
   - [systemctl, daemon-reload]
+  # Block the metadata endpoints for Docker containers (needs docker.service, enabled above).
+  - [systemctl, enable, --now, cfdagent-iptables.service]
   - [systemctl, enable, --now, cfdagent-idle-shutdown.timer]
   - [systemctl, enable, --now, cfdagent-daily-shutdown.timer]
   # The pull is best effort: it fails until the image is published and public.

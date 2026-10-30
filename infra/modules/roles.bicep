@@ -1,5 +1,6 @@
-// Role assignments (least privilege). The VM identity gets data access to Blob and Foundry plus a
-// custom role that can only deallocate its own VM; the owner gets read-only browsing roles.
+// Role assignments (least privilege). The VM identity gets data access to the `runs` blob container
+// (not the storage account) and to Foundry, plus a custom role that can only deallocate its own VM;
+// the owner gets read-only browsing roles.
 param vmName string
 param vmPrincipalId string
 param storageAccountName string
@@ -19,6 +20,17 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-07-01' existing = {
 
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' existing = {
   name: storageAccountName
+}
+
+resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' existing = {
+  parent: storage
+  name: 'default'
+}
+
+// Created by storage.bicep. The VM identity may write only here.
+resource runsContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' existing = {
+  parent: blobService
+  name: 'runs'
 }
 
 resource ai 'Microsoft.CognitiveServices/accounts@2025-06-01' existing = {
@@ -59,8 +71,8 @@ resource vmDeallocate 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 }
 
 resource vmBlob 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  scope: storage
-  name: guid(storage.id, vmName, storageBlobDataContributor)
+  scope: runsContainer
+  name: guid(runsContainer.id, vmName, storageBlobDataContributor)
   properties: {
     roleDefinitionId: subscriptionResourceId(
       'Microsoft.Authorization/roleDefinitions',
