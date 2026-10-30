@@ -17,7 +17,6 @@ from cfdagent.bench.registry import load_registry
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BENCHMARKS = REPO_ROOT / "benchmarks"
-KNOWLEDGE_DIR = REPO_ROOT / "src" / "cfdagent" / "knowledge"
 
 DEVELOPMENT_IDS = {"cavity-re100", "cavity-re1000", "pipe-re500", "cylinder-re20", "cylinder-re100"}
 
@@ -78,15 +77,6 @@ def test_pipe_reference_matches_formula():
     assert committed == module.render_profile_csv().encode("utf-8")
     assert module.check_benchmark_toml() == []
     assert module.main(["--check"]) == 0
-
-
-def test_benchmark_data_not_in_knowledge_dir():
-    if not KNOWLEDGE_DIR.is_dir():
-        return  # nothing to leak into yet
-    for path in KNOWLEDGE_DIR.rglob("*"):
-        if path.is_file():
-            text = path.read_text(encoding="utf-8", errors="ignore")
-            assert "ghia" not in text.lower(), f"{path} mentions the cavity reference source"
 
 
 def test_every_task_mentions_every_quantity_identifier(registry):

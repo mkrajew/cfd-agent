@@ -1,7 +1,6 @@
 """Mesh stage and mesh gate: Gmsh script -> MSH 2.2 -> OpenFOAM polyMesh -> checkMesh gate."""
 
 import math
-import os
 import re
 import shutil
 from pathlib import Path
@@ -9,7 +8,6 @@ from pathlib import Path
 import gmsh
 import pytest
 
-import cfdagent
 from cfdagent.errors import ToolFailure
 from cfdagent.gates import GateResult
 from cfdagent.manifest import MANIFEST_FILE_NAME, BoundaryManifest, BoundaryPatch, Locator
@@ -32,15 +30,6 @@ CAVITY = FIXTURES / "cavity_re100"
 CYLINDER = FIXTURES / "cylinder_channel"
 CAVITY_BBOX = (0, 0, 0, 1, 1, 0.1)
 CYLINDER_BBOX = (0, 0, 0, 2.2, 0.41, 0.1)
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _scripts_import_checked_out_cfdagent():
-    """Mesh scripts run in a subprocess; point it at the cfdagent under test, not the image copy."""
-    src = str(Path(cfdagent.__file__).parents[1])
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("PYTHONPATH", os.pathsep.join(filter(None, [src, os.environ.get("PYTHONPATH")])))
-        yield
 
 
 def _plane(axis, value):

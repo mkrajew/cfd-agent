@@ -5,6 +5,8 @@
       "Bash(docker build *)",
       "Bash(docker run --rm * cfdagent:dev *)",
       "Bash(docker run --rm cfdagent:dev *)",
+      "Bash(docker run --rm * cfdagent:runtime *)",
+      "Bash(docker run --rm cfdagent:runtime *)",
       "Bash(docker run --rm * ghcr.io/mkrajew/cfd-agent*)",
       "Bash(git status*)",
       "Bash(git diff*)",
@@ -24,6 +26,8 @@
       "PowerShell(docker build *)",
       "PowerShell(docker run --rm * cfdagent:dev *)",
       "PowerShell(docker run --rm cfdagent:dev *)",
+      "PowerShell(docker run --rm * cfdagent:runtime *)",
+      "PowerShell(docker run --rm cfdagent:runtime *)",
       "PowerShell(docker run --rm * ghcr.io/mkrajew/cfd-agent*)",
       "PowerShell(git status*)",
       "PowerShell(git diff*)",
@@ -59,7 +63,8 @@
       "Bash(docker *docker.sock*)",
       "Bash(docker *--network host*)",
       "Bash(docker *--network=host*)",
-      "Bash(docker *--pid*)",
+      "Bash(docker *--pid=*)",
+      "Bash(docker *--pid *)",
       "Bash(docker build *--push*)",
       "PowerShell(git reset --hard*)",
       "PowerShell(git clean*)",
@@ -69,7 +74,8 @@
       "PowerShell(docker *docker.sock*)",
       "PowerShell(docker *--network host*)",
       "PowerShell(docker *--network=host*)",
-      "PowerShell(docker *--pid*)",
+      "PowerShell(docker *--pid=*)",
+      "PowerShell(docker *--pid *)",
       "PowerShell(docker build *--push*)"
     ]
   }

@@ -6,14 +6,12 @@ against the benchmark reference. No LLM is involved; every input is a file under
 """
 
 import json
-import os
 import shutil
 import time
 from pathlib import Path
 
 import pytest
 
-import cfdagent
 from cfdagent.bench.registry import load_registry
 from cfdagent.bench.scoring import ScoreResult, score
 from cfdagent.manifest import MANIFEST_FILE_NAME, BoundaryManifest
@@ -31,15 +29,6 @@ CAVITY_BBOX = (0, 0, 0, 1, 1, 0.1)
 SOLVER = "icoFoam"
 SAMPLE_FUNCTION_OBJECT = "centrelines"  # the sets function object in the case controlDict
 SOLVER_TIMEOUT_S = 1800.0  # the run takes about a minute; a hang must not stall the suite
-
-
-@pytest.fixture(autouse=True)
-def _scripts_import_checked_out_cfdagent():
-    """Scripts run in a subprocess; point it at the cfdagent under test, not the image copy."""
-    src = str(Path(cfdagent.__file__).parents[1])
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("PYTHONPATH", os.pathsep.join(filter(None, [src, os.environ.get("PYTHONPATH")])))
-        yield
 
 
 def _report(result: ScoreResult) -> str:

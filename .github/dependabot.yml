@@ -12,3 +12,8 @@ updates:
     directory: /docker
     schedule:
       interval: weekly
+    ignore:
+      # Blanket ignore (tag AND digest bumps): the OpenFOAM engine version and the exact image
+      # digest are both part of experiment reproducibility. The base image changes only by a
+      # deliberate decision of the owner, never by an automatic pull request.
+      - dependency-name: opencfd/openfoam-default
