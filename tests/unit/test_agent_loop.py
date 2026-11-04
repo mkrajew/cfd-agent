@@ -818,3 +818,54 @@ def test_the_attempt_note_and_directory_listing_agree_on_trailing_slashes(tmp_pa
     assert "attempts/toy-1/" in backend.calls[0].messages[1]["content"]
     listing = [m for m in backend.calls[2].messages if m.get("tool_call_id") == "l1"]
     assert listing[0]["content"] == "a.txt"
+
+
+# ------------------------------------------------------------------ the prepare_attempt hook
+
+
+def test_prepare_attempt_runs_for_every_fresh_attempt_directory(tmp_path):
+    class Preparing(ToyStage):
+        def __init__(self, gates):
+            super().__init__(gates)
+            self.prepared: list[tuple[Path, list[str]]] = []
+
+        def prepare_attempt(self, ctx, attempt_dir):
+            self.prepared.append((attempt_dir, sorted(p.name for p in attempt_dir.iterdir())))
+            (attempt_dir / "input.txt").write_text("seeded", encoding="utf-8")
+
+    steps = [reply(None, check("k1")), reply(None, check("k2"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    stage = Preparing([GateResult(False, ["no"]), GateResult(True, [])])
+    assert run_stage(stage, ctx).ok
+    assert [d.name for d, _ in stage.prepared] == ["toy-1", "toy-2"]
+    assert all(
+        listing == [] for _, listing in stage.prepared
+    )  # called on the fresh, empty directory
+    assert (ctx.run.root / "attempts" / "toy-2" / "input.txt").read_text() == "seeded"
+    assert stage.prepared[0][0] == stage.gate_dirs[0]
+
+
+def test_prepare_attempt_defaults_to_doing_nothing(tmp_path):
+    ctx, _ = make_ctx(tmp_path, [reply(None, check())])
+    stage = ToyStage([GateResult(True, [])])
+    assert stage.prepare_attempt(ctx, ctx.run.attempt_dir("toy", 1)) is None
+    assert list((ctx.run.root / "attempts" / "toy-1").iterdir()) == []
+
+
+def test_prepare_attempt_errors_propagate_as_tool_failure(tmp_path):
+    class BrokenInputs(ToyStage):
+        def prepare_attempt(self, ctx, attempt_dir):
+            raise ToolFailure("the pipeline order is broken")
+
+    ctx, _ = make_ctx(tmp_path, [reply(None, check())])
+    with pytest.raises(ToolFailure, match="pipeline order"):
+        run_stage(BrokenInputs([GateResult(True, [])]), ctx)
+
+    class BadFiles(ToyStage):
+        def prepare_attempt(self, ctx, attempt_dir):
+            raise AgentInputError("cannot copy the inputs")
+
+    (tmp_path / "second").mkdir()
+    ctx, _ = make_ctx(tmp_path / "second", [reply(None, check())])
+    with pytest.raises(ToolFailure, match="cannot copy the inputs"):
+        run_stage(BadFiles([GateResult(True, [])]), ctx)

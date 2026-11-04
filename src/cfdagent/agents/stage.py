@@ -88,6 +88,13 @@ class Stage(ABC):
     def opening_message(self, ctx: StageContext) -> str:
         """The first user message: the task for this stage."""
 
+    def prepare_attempt(self, ctx: StageContext, attempt_dir: Path) -> None:
+        """Put the stage's inputs into the fresh, empty attempt directory (``attempt_dir`` is
+        absolute). Called by the loop for every attempt, right after the directory is created.
+        A missing input means the pipeline order is broken: raise ``ToolFailure``, it is not the
+        agent's fault. The default does nothing."""
+        return None
+
     def extra_tools(self, ctx: StageContext, attempt_dir: Path) -> list[Tool]:
         """Stage-specific tools, built afresh for every attempt (``attempt_dir`` is absolute)."""
         return []

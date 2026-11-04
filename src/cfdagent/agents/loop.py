@@ -317,6 +317,7 @@ class _StageRun(ModelConversation):
         number = self.attempts + 1
         with internal("preparing the attempt directory"):
             self.attempt_dir = self.ctx.run.attempt_dir(self.stage.name, number)
+            self.stage.prepare_attempt(self.ctx, self.attempt_dir)
         self.attempt_started = self.ctx.clock()
         self.turns = 0
         registry = ToolRegistry()
