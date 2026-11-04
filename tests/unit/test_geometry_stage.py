@@ -9,13 +9,8 @@ from pathlib import Path
 import pytest
 from test_casespec import make_spec
 
-from cfdagent.agents.geometry import (
-    GATE_TIMEOUT_S,
-    MANIFEST_MAX_BYTES,
-    SCRIPT_TIMEOUT_S,
-    GeometryStage,
-    _last_bytes,
-)
+from cfdagent.agents.gatehelp import MANIFEST_MAX_BYTES, last_bytes
+from cfdagent.agents.geometry import GATE_TIMEOUT_S, SCRIPT_TIMEOUT_S, GeometryStage
 from cfdagent.agents.loop import run_stage
 from cfdagent.agents.stage import StageContext
 from cfdagent.agents.transcript import TranscriptWriter
@@ -464,9 +459,9 @@ def test_a_missing_manifest_is_left_to_the_sandbox_gate(tmp_path):
 def test_last_bytes_never_splits_a_character():
     text = "x" * 10 + "é" * 20  # two bytes per character
     for limit in range(1, 40):
-        shown = _last_bytes(text, limit)
+        shown = last_bytes(text, limit)
         assert len(shown.split("\n", 1)[-1].encode("utf-8")) <= limit
-    assert _last_bytes("short", 100) == "short"
+    assert last_bytes("short", 100) == "short"
 
 
 # ------------------------------------------------------------------ promotion, scope, prompt

@@ -326,3 +326,45 @@ def test_the_unscaled_plan_box_would_have_failed_the_thin_wedge(tmp_path):
     )
     assert not response.ok
     assert "bounding box" in response.error
+
+
+# ------------------------------------------------------------------ the prompt's grading helper
+
+
+def test_the_prompts_grading_helper_clusters_cells_at_the_wall_on_opposite_edges():
+    """Opposite edges of a block run in opposite directions; the helper must not care."""
+    import gmsh
+
+    from cfdagent.prompts import load_prompt
+
+    block = re.search(r"```python\n(def graded.*?)```", load_prompt("mesh").text, re.S)
+    assert block is not None
+    namespace = {"gmsh": gmsh}
+    exec(block.group(1), namespace)  # noqa: S102 - the repository's own prompt text
+
+    gmsh.initialize()
+    try:
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.model.add("block")
+        gmsh.model.occ.addRectangle(0, 0, 0, 1, 1)
+        gmsh.model.occ.synchronize()
+        n_cells, ratio, wall = 10, 1.2, (0.5, 0.0, 0.0)  # the wall is the edge y = 0
+        for _, curve in gmsh.model.getEntities(1):
+            box = gmsh.model.getBoundingBox(1, curve)
+            if box[3] - box[0] < 1e-6:  # a vertical edge: grade it towards y = 0
+                namespace["graded"](curve, n_cells, ratio, wall)
+            else:
+                gmsh.model.mesh.setTransfiniteCurve(curve, n_cells + 1)
+        gmsh.model.mesh.setTransfiniteSurface(1)
+        gmsh.model.mesh.generate(2)
+        for _, curve in gmsh.model.getEntities(1):
+            box = gmsh.model.getBoundingBox(1, curve)
+            if box[3] - box[0] >= 1e-6:
+                continue
+            _, coords, _ = gmsh.model.mesh.getNodes(1, curve, includeBoundary=True)
+            ys = sorted(coords[1::3])
+            assert len(ys) == n_cells + 1
+            first, last = ys[1] - ys[0], ys[-1] - ys[-2]
+            assert last / first == pytest.approx(ratio ** (n_cells - 1), rel=1e-6)
+    finally:
+        gmsh.finalize()

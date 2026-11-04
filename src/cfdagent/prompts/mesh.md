@@ -54,22 +54,39 @@ The plan's `dimensionality` decides the topology, with the conventions of the pl
 
 ## Resolution: choose it from the physics
 
-`mesh.target_cells` in the plan is a budget, not a justification. Work out what the flow needs, with the `calculator`, and say in your printout and in the notes how you got there.
+`mesh.target_cells` in the plan is a budget, not a justification. Work out what the flow needs, with the `calculator`, and say in your printout and in the notes how you got there. The order of priority: first resolve the shear layers and boundary layers and the features that `requested_outputs` asks about, then stay inside the cell budget below, and only then use the cell Reynolds number as a guide.
 
-- Compute the cell Reynolds number, velocity times cell size over the kinematic viscosity, from the plan's velocity and viscosity. Where convection matters, keep it at or below about 2 (the cell Peclet limit of central differencing); where it is larger, refine or accept that the numerical scheme will have to be dissipative.
-- Resolve every thin region the physics creates. Estimate the boundary layer thickness from the Reynolds number of the plan (a laminar layer on a plate of length L is about 5 L / sqrt(Re_L) thick) and put at least 10 to 20 cells across it, with the first cell much thinner than the layer. For a turbulent case in the plan, state whether you resolve the viscous sublayer (first cell at y+ of about 1) or use wall functions (first cell at y+ of 30 to 300), and size the first cell with the friction velocity estimated from a skin-friction correlation; use the calculator.
-- Refine where the gradients are: near walls, in shear layers, around corners and edges, behind bluff bodies, in regions of separation and recirculation, and at inlets and outlets where the profile changes. Coarsen towards uniform far-field regions. Use a smooth size change: a ratio of at most about 1.2 between neighbouring cells. In structured blocks use `setTransfiniteCurve(curve, n_points, "Progression", ratio)` (the ratio runs along the curve's direction: print the first cell sizes to check that the small cells are at the wall, and use the inverse ratio if they are not); in unstructured regions use `gmsh.model.mesh.setSize` on points or a Distance and Threshold field.
-- **A coarse mesh must still resolve the quantities the task asks for.** Read `requested_outputs`: a profile needs enough cells along its line to show its shape (at least about 20 points, more where it bends), a force or wall shear stress needs wall-adjacent cells that resolve the boundary layer, and a feature the task asks about (a vortex, a wake, a recirculation length) needs several cells across it. A mesh that cannot show the requested quantity is wrong even if every check passes.
-- Keep the total near `mesh.target_cells` and never above `resource_estimate_cells` of the user message: the run time was planned for that size. If the physics needs more cells than the budget allows, spend the cells where the gradients are, and say so in a note.
+- The cell Reynolds number is the local velocity times the local cell size over the kinematic viscosity. Use the local velocity (cells at a wall see far less than the reference velocity), not only the reference one. Where convection matters, a value at or below about 2 (the cell Peclet limit of central differencing) is the guide; it alone would demand impractical cell counts for most flows, so do not trade the resolution of the layers for it. Where you cannot stay below 2, write that in a note (a `notes.md` file in the attempt directory, with the regions and the values) so that the case set-up can choose a bounded, upwind-biased scheme there.
+- Resolve every thin region the physics creates. For an external flow along a wall, estimate the boundary layer thickness from the Reynolds number of the plan (a laminar layer on a plate of length L is about 5 L / sqrt(Re_L) thick); for an internal flow the layer is bounded by the half-width of the channel and the whole cross-section must be resolved (at least about 20 cells across a laminar shear profile). Put at least 10 to 20 cells across a boundary layer, with the first cell much thinner than the layer. For a turbulent case in the plan, state whether you resolve the viscous sublayer (cell-centre y+ of about 1) or use wall functions (cell-centre y+ of 30 to 300); y+ is measured at the centre of the first cell, so the first cell height is 2 y, with y from the friction velocity estimated from a skin-friction correlation (use the calculator).
+- Refine where the gradients are: near walls, in shear layers, around corners and edges, behind bluff bodies, in regions of separation and recirculation, and at inlets and outlets where the profile changes. Coarsen towards uniform far-field regions. Use a smooth size change: a ratio of at most about 1.2 between neighbouring cells.
+- In structured blocks grade each curve on its own, because opposite edges of a block run in opposite directions, so the same progression on all four curves clusters the cells towards the wall on one edge and away from it on the other. A ratio above 1 grows the cells along the curve's direction. This helper puts the small cells at the end of a curve that is nearer to a given wall point, whatever the curve's direction:
+
+```python
+def graded(curve, n_cells, ratio, wall_point):
+    """Transfinite curve with cells growing by `ratio` away from the end nearer to wall_point."""
+    lo, hi = gmsh.model.getParametrizationBounds(1, curve)
+    start = gmsh.model.getValue(1, curve, lo)
+    end = gmsh.model.getValue(1, curve, hi)
+    near_start = sum((p - q) ** 2 for p, q in zip(start, wall_point)) < sum(
+        (p - q) ** 2 for p, q in zip(end, wall_point)
+    )
+    gmsh.model.mesh.setTransfiniteCurve(
+        curve, n_cells + 1, "Progression", ratio if near_start else 1 / ratio
+    )
+```
+
+- In unstructured regions use `gmsh.model.mesh.setSize` on points, or a Distance and Threshold field. For a layer of cells along a wall, the `BoundaryLayer` field (`gmsh.model.mesh.field.add("BoundaryLayer")`, with `CurvesList`, `Size`, `Ratio`, `Quads` set to 1 and `Thickness`, then `gmsh.model.mesh.field.setAsBoundaryLayer(field)`) gives structured quadrilateral layers at the wall. A recombined surface (`Mesh.Algorithm` 8, the frontal quad algorithm, or the default with `setRecombine`) extruded with `numElements=[1]` gives an all-hexahedral one-cell layer.
+- **A coarse mesh must still resolve the quantities the task asks for.** Read `requested_outputs`: a profile needs enough cells along its line to show its shape (at least about 20 points, more where it bends), a force or wall shear stress needs wall-adjacent cells that resolve the boundary layer, and a feature the task asks about (a vortex, a wake, a recirculation length) needs several cells across it. A mesh that cannot show the requested quantity is wrong even if every check passes: the checks verify topology, names, size and cell quality, not whether the resolution is adequate.
+- Cell budget: aim for the plan's resource estimate of cells (the user message states it; the run time was planned for that size). The hard limit of the run is also in the user message, and a mesh above it fails the check ("exceeds resources"); never exceed it. If the physics needs more cells than the estimate, spend them where the gradients are, stay below the hard limit, and say so in a note.
 
 ## Quality limits of the check
 
-The check runs `checkMesh` and fails the mesh when any of these is exceeded: maximum non-orthogonality 70 degrees, maximum skewness 4, maximum aspect ratio 1000. Aim well inside them: non-orthogonality below about 40 degrees, aspect ratio of a few tens at most except in a boundary layer on a wall aligned with the flow, and smooth growth of the cell sizes. A mesh at the limit passes the check but is a poor basis for a simulation.
+The check runs `checkMesh` and fails the mesh when any of these is exceeded: maximum non-orthogonality 70 degrees, maximum skewness 4, maximum aspect ratio 1000. A mesh at a limit passes the check but is a poor basis for a simulation: design for cells that are close to rectangular in the flow region, with smooth growth of the cell sizes, and keep high aspect ratios to boundary layers on walls aligned with the flow. You see the measured values only when a check fails, so a margin has to come from the design, not from a measurement.
 
-The check also fails the mesh when: a patch name differs from the manifest, a patch has no faces or a face lies on the wrong patch, the bounding box differs from the plan (more than 1 %), a 2D or axisymmetric mesh is not exactly one cell thick, or a boundary of the plan has no faces in the mesh.
+The check also fails the mesh when: a patch name differs from the manifest, a patch has no faces or a face lies on the wrong patch, the bounding box differs from the plan (more than 1 %), a 2D or axisymmetric mesh is not exactly one cell thick, a boundary of the plan has no faces in the mesh, or the mesh has more cells than the hard limit.
 
 ## Order of work
 
-1. Read the plan, the manifest and `geometry.step`'s size from the bounding box. Note the velocity, viscosity, boundary conditions and `requested_outputs`.
+1. Read the plan, the manifest and the plan's bounding box. Note the velocity, viscosity, boundary conditions and `requested_outputs`.
 2. Estimate with the `calculator` the cell size in the bulk, the first cell height at walls, the boundary layer thickness, the number of cells and the cell Reynolds number.
 3. Write `mesh.py` in one go (model, sizes, physical groups, MSH 2.2, prints) and call `check_stage`.

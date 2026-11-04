@@ -32,18 +32,13 @@ import math
 import os
 import re
 import shutil
+import stat
 from pathlib import Path
 
 from cfdagent.agents.casespec import BoundarySpec, CaseSpec
-from cfdagent.agents.geometry import (
-    PROMOTED_DIR as GEOMETRY_DIR,
-)
-from cfdagent.agents.geometry import (
-    STEP_NAME,
-    _last_bytes,
-    _names,
-    _read_manifest,
-)
+from cfdagent.agents.gatehelp import last_bytes, names, read_manifest
+from cfdagent.agents.geometry import PROMOTED_DIR as GEOMETRY_DIR
+from cfdagent.agents.geometry import STEP_NAME
 from cfdagent.agents.stage import Stage, StageContext
 from cfdagent.agents.tools import FileScope
 from cfdagent.errors import ToolFailure
@@ -66,13 +61,10 @@ GATE_TIMEOUT_S = 300.0
 SCRIPT_TAIL_BYTES = 3000  # the loop shows the model at most 4096 bytes of all errors together
 BOUNDARY_MAX_BYTES = 1_000_000  # constant/polyMesh/boundary: a few lines per patch
 _STRUCTURAL_TYPES = frozenset({"empty", "wedge"})
-# Role words that mark a boundary without a patch of its own name. The plan lists the front and
-# back faces of a 2D case and the wedge faces and axis of an axisymmetric case in free text.
-_STRUCTURAL_ROLE_WORDS = {
-    "2D": frozenset({"empty", "front", "back"}),
-    "axisymmetric": frozenset({"empty", "wedge", "front", "back", "axis"}),
-    "3D": frozenset(),
-}
+# An axis of revolution has no face, so a plan boundary that names it needs no patch. Words are
+# found in the name and the role after splitting camelCase, underscores, digits and spaces.
+_AXIS_WORDS = frozenset({"axis", "centreline", "centerline", "revolution"})
+_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+")
 _CONVERSION_HINT = (
     "gmshToFoam names the patches after the physical groups of mesh.msh and puts every boundary "
     "face that is in no 2D physical group into a patch called `defaultFaces`. Create one "
@@ -96,7 +88,7 @@ def _tool_failure(response: OpResponse, what: str, tail_label: str) -> str:
         tail = rest
     message = f"{what}: {headline}"
     if tail.strip():
-        message += f"\n{tail_label}:\n{_last_bytes(tail, SCRIPT_TAIL_BYTES)}"
+        message += f"\n{tail_label}:\n{last_bytes(tail, SCRIPT_TAIL_BYTES)}"
     return message
 
 
@@ -134,57 +126,122 @@ def _boundary_face_counts(text: str) -> dict[str, int]:
     return counts
 
 
-def _is_structural(spec: CaseSpec, boundary: BoundarySpec, manifest: BoundaryManifest) -> bool:
-    """A boundary of the plan that needs no patch of its own name."""
-    if any(p.name == boundary.name and p.type in _STRUCTURAL_TYPES for p in manifest.patches):
-        return True
-    words = set(re.findall(r"[a-z]+", boundary.role.lower()))
-    return bool(words & _STRUCTURAL_ROLE_WORDS[spec.dimensionality])
+def _is_axis(spec: CaseSpec, boundary: BoundarySpec) -> bool:
+    """An axisymmetric plan's boundary that names the axis of revolution (it has no face)."""
+    if spec.dimensionality != "axisymmetric":
+        return False
+    words = {w.lower() for w in _WORD.findall(f"{boundary.name} {boundary.role}")}
+    return bool(words & _AXIS_WORDS)
 
 
-def _plan_boundary_problems(
+def _free_structural_patches(spec: CaseSpec, manifest: BoundaryManifest) -> int:
+    """How many ``empty`` and ``wedge`` patches carry a name the plan does not list.
+
+    The Geometry gate lets those patches have any name, so each of them can stand for one plan
+    boundary that has no patch of its own name (a plan name absorbed by a patch is used up).
+    """
+    planned = {b.name for b in spec.boundaries}
+    return sum(1 for p in manifest.patches if p.type in _STRUCTURAL_TYPES and p.name not in planned)
+
+
+def _unlisted_problems(spec: CaseSpec, manifest: BoundaryManifest) -> list[str]:
+    """Plan boundaries that have no patch in the manifest and cannot be a structural patch.
+
+    Decided from the plan and the manifest alone, so before any script is run: the Mesh agent
+    cannot repair it. Not counted: the axis of an axisymmetric plan, and as many names as there
+    are ``empty`` or ``wedge`` patches with names of their own (each patch absorbs one name).
+    """
+    in_manifest = {p.name for p in manifest.patches}
+    unmatched = [
+        b.name for b in spec.boundaries if b.name not in in_manifest and not _is_axis(spec, b)
+    ]
+    free = _free_structural_patches(spec, manifest)
+    if len(unmatched) <= free:
+        return []
+    spare = (
+        f" (at most {free} of them can be `empty` or `wedge` patches that the manifest names "
+        "differently)"
+        if free
+        else ""
+    )
+    return [
+        f"these boundaries of the plan have no patch in {MANIFEST_FILE_NAME}: "
+        f"{names(unmatched)}{spare}. The Geometry stage lumped or dropped them. "
+        f"{MANIFEST_FILE_NAME} is an input of this stage and is not editable, so the mesh cannot "
+        "name them. Write what you found in notes.md in the attempt directory so that it is "
+        "recorded; the stage cannot pass until the Geometry stage names them"
+    ]
+
+
+def _meshless_problems(
     spec: CaseSpec, manifest: BoundaryManifest, counts: dict[str, int]
 ) -> list[str]:
-    """Every boundary of the plan that is not structural needs faces in the converted mesh."""
+    """Plan boundaries with a patch in the manifest that has no faces in the converted mesh."""
+    structural = {p.name for p in manifest.patches if p.type in _STRUCTURAL_TYPES}
     in_manifest = {p.name for p in manifest.patches}
     with_faces = {name for name, n in counts.items() if n > 0}
-    unmeshed = [
+    meshless = [
         b.name
         for b in spec.boundaries
-        if b.name not in with_faces and not _is_structural(spec, b, manifest)
+        if b.name in in_manifest and b.name not in structural and b.name not in with_faces
     ]
-    problems = []
-    meshless = [n for n in unmeshed if n in in_manifest]
-    if meshless:
-        problems.append(
-            f"these boundaries of the plan have no faces in the converted mesh "
-            f"(constant/polyMesh/boundary): {_names(meshless)}. Their physical groups are missing "
-            f"or empty in {MESH_NAME}. Create one physical group per patch of "
-            "boundary_manifest.json with assign_physical_groups(manifest) and do not drop or "
-            "merge boundary surfaces"
-        )
-    unnamed = [n for n in unmeshed if n not in in_manifest]
-    # The structural patches may carry names the plan does not list; a plan boundary with no
-    # patch of its name can be one of them, so up to that many missing names are not an error.
-    planned = {b.name for b in spec.boundaries}
-    free = sum(1 for p in manifest.patches if p.type in _STRUCTURAL_TYPES and p.name not in planned)
-    if unnamed and len(unnamed) <= free:
-        unnamed = []
-    if unnamed:
-        spare = (
-            f" (at most {free} of them can be `empty` or `wedge` patches that the manifest "
-            "names differently)"
-            if free
-            else ""
-        )
-        problems.append(
-            f"these boundaries of the plan have no patch in {MANIFEST_FILE_NAME} and no faces in "
-            f"the mesh: {_names(unnamed)}{spare}. The Geometry stage lumped or dropped them. "
-            f"{MANIFEST_FILE_NAME} is an input of this stage and is not editable, so the mesh "
-            "cannot name them. Write what you found in notes.md in the attempt directory so that "
-            "it is recorded; the stage cannot pass until the Geometry stage names them"
-        )
-    return problems
+    if not meshless:
+        return []
+    return [
+        "these boundaries of the plan have no faces in the converted mesh "
+        f"(constant/polyMesh/boundary): {names(meshless)}. Their physical groups are missing or "
+        f"empty in {MESH_NAME}. Create one physical group per patch of boundary_manifest.json "
+        "with assign_physical_groups(manifest) and do not drop or merge boundary surfaces"
+    ]
+
+
+# ------------------------------------------------------------------ files the script could touch
+
+
+class _RestoreError(Exception):
+    """A file could not be put back."""
+
+
+def _remove(path: Path) -> None:
+    """Remove whatever is at ``path`` (file, link, FIFO, directory tree)."""
+    if os.path.lexists(path):
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+
+def _write_clean(root: Path, rel: str, data: bytes) -> None:
+    """Write ``root/rel`` as a regular file whatever stands in its way, links in the directory
+    path included. Raises ``_RestoreError`` instead of an ``OSError``."""
+    try:
+        current = root
+        parts = rel.split("/")
+        for part in parts[:-1]:
+            current = current / part
+            if os.path.islink(current) or (os.path.lexists(current) and not current.is_dir()):
+                current.unlink()
+            current.mkdir(exist_ok=True)
+        target = current / parts[-1]
+        _remove(target)
+        target.write_bytes(data)
+    except OSError as exc:
+        raise _RestoreError(f"{rel}: {type(exc).__name__}") from exc
+
+
+def _holds(root: Path, rel: str, data: bytes) -> bool:
+    """``root/rel`` is a regular file, reached over no link, with exactly these bytes."""
+    current = root
+    for part in rel.split("/"):
+        current = current / part
+        if os.path.islink(current):
+            return False
+    try:
+        if not stat.S_ISREG(os.lstat(current).st_mode):
+            return False  # a directory or a FIFO: do not open it
+        return current.read_bytes() == data
+    except OSError:
+        return False
 
 
 def _mesh_expected_bbox(spec: CaseSpec) -> list[float]:
@@ -226,7 +283,6 @@ class MeshStage(Stage):
             "mesh": spec.mesh.model_dump(),
             "solver": spec.solver.model_dump(),
             "requested_outputs": [o.model_dump() for o in spec.requested_outputs],
-            "resource_estimate_cells": spec.resource_estimate.cells,
         }
         extra = ""
         if spec.dimensionality == "axisymmetric":
@@ -242,17 +298,31 @@ class MeshStage(Stage):
             f"change them). Write {SCRIPT_NAME} so that it reads them and writes {MESH_NAME} "
             "(MSH 2.2 ASCII) with one physical group per patch of the manifest. Choose the "
             "resolution from the physics of the plan, not only from mesh.target_cells: the mesh "
-            "must resolve what requested_outputs asks for, with a total near mesh.target_cells "
-            "and not above resource_estimate_cells. Units are metres, as in the geometry."
+            "must resolve what requested_outputs asks for. Aim for about "
+            f"{spec.resource_estimate.cells} cells (the plan's resource estimate, which the run "
+            f"time was planned for); the hard limit of this run is {ctx.config.limits.max_cells} "
+            'cells, and a mesh above it fails the check ("exceeds resources"). Units are metres, '
+            "as in the geometry."
             f"{extra}"
         )
 
     def prepare_attempt(self, ctx: StageContext, attempt_dir: Path) -> None:
-        self._copy_inputs(ctx, attempt_dir)
+        rel = ctx.run.relative(attempt_dir)
+        try:
+            for name, data in self._read_inputs(ctx).items():
+                _write_clean(ctx.run.root, f"{rel}/{name}", data)
+        except _RestoreError as exc:
+            raise ToolFailure(f"could not copy the geometry into {rel}/: {exc}") from exc
 
     def execute_and_gate(self, ctx: StageContext, attempt_dir: Path) -> GateResult:
         spec = self._spec(ctx)
+        expected_bbox = _mesh_expected_bbox(spec)  # a plan without its wedge angle: ToolFailure
         rel = ctx.run.relative(attempt_dir)
+        manifest, _ = read_manifest(ctx, f"{rel}/{MANIFEST_FILE_NAME}")
+        if manifest is not None:
+            unlisted = _unlisted_problems(spec, manifest)
+            if unlisted:
+                return GateResult(False, unlisted)
         script = f"{rel}/{SCRIPT_NAME}"
         if not ctx.run.path(script).is_file():
             return GateResult(
@@ -263,7 +333,11 @@ class MeshStage(Stage):
                 ],
             )
         case_rel = f"{rel}/{CASE_NAME}"
-        self._remove_case(ctx, case_rel)
+        try:
+            _remove(ctx.run.root / case_rel)  # a note may have been written into it
+        except OSError as exc:
+            raise ToolFailure(f"could not clear {case_rel}: {type(exc).__name__}") from exc
+        inputs = self._read_inputs(ctx)  # what the script is allowed to read, and nothing else
 
         script_s = ctx.inner_timeout(SCRIPT_TIMEOUT_S)
         run = ctx.sandbox.call(
@@ -273,31 +347,19 @@ class MeshStage(Stage):
         )
         if run.internal:
             raise _internal(run, "running the mesh script")
+        # The script ran with write access to the run directory: its inputs must be as they were.
+        errors = self._restore_inputs(ctx, rel, inputs)
         if not run.ok:
-            return GateResult(
-                False,
-                [
-                    _tool_failure(
-                        run,
-                        f"{SCRIPT_NAME} did not run successfully",
-                        "End of the script's output (including your prints)",
-                    )
-                ],
+            errors.append(
+                _tool_failure(
+                    run,
+                    f"{SCRIPT_NAME} did not run successfully",
+                    "End of the script's output (including your prints)",
+                )
             )
-
-        # The script ran with write access to its directory: restore the inputs the gate relies on.
-        try:
-            self._copy_inputs(ctx, attempt_dir)
-        except RunDirError as exc:
-            return GateResult(
-                False,
-                [
-                    f"an input file in {rel}/ was replaced by something that is not a regular "
-                    f"file ({exc}); {SCRIPT_NAME} must only read {STEP_NAME} and "
-                    f"{MANIFEST_FILE_NAME}"
-                ],
-            )
-        if self._case_exists(ctx, case_rel):
+        if errors:
+            return GateResult(False, errors)
+        if os.path.lexists(ctx.run.root / case_rel):
             return GateResult(
                 False,
                 [
@@ -321,38 +383,41 @@ class MeshStage(Stage):
             )
             return GateResult(False, [f"{message}\n{_CONVERSION_HINT}"])
 
-        errors = self._plan_problems(ctx, spec, rel, case_rel)
+        errors = self._meshless(ctx, spec, manifest, case_rel)
         check = ctx.sandbox.call(
             "check_mesh",
-            CheckMeshArgs(case_dir=case_rel, expected_bbox=_mesh_expected_bbox(spec)),
+            CheckMeshArgs(case_dir=case_rel, expected_bbox=expected_bbox),
             outer_timeout(ctx.inner_timeout(GATE_TIMEOUT_S)),
         )
         if check.internal:
             raise _internal(check, "checking the mesh")
         if not check.ok:
             errors += _gate_errors(check)
+        elif not errors:
+            errors += self._cell_limit(ctx, spec, check)
         return GateResult(not errors, errors)
 
     def promote(self, ctx: StageContext, attempt_dir: Path) -> None:
         """``mesh/``: the attempt (script, mesh, logs); ``case/``: ``constant/polyMesh`` only.
 
         The polyMesh is not kept twice: ``mesh/case/`` keeps the gate's logs but not the mesh. The
-        manifest is copied to the run directory beside ``case/``, where the case-level ops look
-        for it by default.
+        manifest is copied from ``geometry/`` to the run directory beside ``case/``, where the
+        case-level ops look for it by default. Anything an earlier promotion or a script left at
+        these places is replaced.
         """
         rel = ctx.run.relative(attempt_dir)
         polymesh_rel = f"{rel}/{CASE_NAME}/constant/polyMesh"
         if not ctx.run.path(polymesh_rel).is_dir():
             raise ToolFailure(f"{polymesh_rel} does not exist; the gate has not converted a mesh")
-        manifest = self._input(ctx, MANIFEST_FILE_NAME)
-
-        ctx.run.promote(attempt_dir, PROMOTED_DIR)
-        shutil.rmtree(ctx.run.path(f"{PROMOTED_DIR}/{CASE_NAME}/constant"), ignore_errors=True)
-        case = ctx.run.path(PROMOTED_CASE_DIR)
-        if os.path.lexists(case):
-            shutil.rmtree(case)
-        ctx.run.promote(ctx.run.path(polymesh_rel), f"{PROMOTED_CASE_DIR}/constant/polyMesh")
-        shutil.copyfile(manifest, ctx.run.path(MANIFEST_FILE_NAME))
+        manifest = self._read_inputs(ctx)[MANIFEST_FILE_NAME]
+        try:
+            ctx.run.promote(attempt_dir, PROMOTED_DIR)
+            _remove(ctx.run.root / PROMOTED_DIR / CASE_NAME / "constant")
+            _remove(ctx.run.root / PROMOTED_CASE_DIR)
+            ctx.run.promote(ctx.run.path(polymesh_rel), f"{PROMOTED_CASE_DIR}/constant/polyMesh")
+            _write_clean(ctx.run.root, MANIFEST_FILE_NAME, manifest)
+        except (OSError, _RestoreError) as exc:
+            raise ToolFailure(f"promoting the mesh failed: {type(exc).__name__}: {exc}") from exc
 
     # ------------------------------------------------------------------ helpers
 
@@ -363,46 +428,46 @@ class MeshStage(Stage):
         return ctx.casespec
 
     @staticmethod
-    def _input(ctx: StageContext, name: str) -> Path:
-        source = ctx.run.path(f"{GEOMETRY_DIR}/{name}")
-        if not source.is_file():
-            raise ToolFailure(
-                f"{GEOMETRY_DIR}/{name} does not exist: the geometry stage has not produced it, "
-                "so the pipeline order is broken"
-            )
-        return source
-
-    def _copy_inputs(self, ctx: StageContext, attempt_dir: Path) -> None:
-        rel = ctx.run.relative(attempt_dir)
+    def _read_inputs(ctx: StageContext) -> dict[str, bytes]:
+        """The bytes of the promoted geometry files; a missing one is a broken pipeline order."""
+        data = {}
         for name in INPUT_FILES:
-            source = self._input(ctx, name)
-            shutil.copyfile(source, ctx.run.path(f"{rel}/{name}"))
+            try:
+                path = ctx.run.path(f"{GEOMETRY_DIR}/{name}")
+                if not path.is_file():
+                    raise ToolFailure(
+                        f"{GEOMETRY_DIR}/{name} does not exist: the geometry stage has not "
+                        "produced it, so the pipeline order is broken"
+                    )
+                data[name] = path.read_bytes()
+            except RunDirError as exc:
+                raise ToolFailure(f"cannot read {GEOMETRY_DIR}/{name}: {exc}") from exc
+        return data
 
     @staticmethod
-    def _case_exists(ctx: StageContext, case_rel: str) -> bool:
-        try:
-            return os.path.lexists(ctx.run.path(case_rel))
-        except RunDirError:
-            return True  # a link in the way counts as something the script left behind
-
-    def _remove_case(self, ctx: StageContext, case_rel: str) -> None:
-        """Start from no ``case/``: a file tool may have written a note into it."""
-        if not self._case_exists(ctx, case_rel):
-            return
-        path = ctx.run.path(case_rel)  # refuses a link: nothing outside the run is deleted
-        if path.is_dir():
-            shutil.rmtree(path)
-        else:
-            path.unlink()
+    def _restore_inputs(ctx: StageContext, rel: str, inputs: dict[str, bytes]) -> list[str]:
+        """Compare the inputs, in the attempt directory and in ``geometry/``, with what they were
+        before the script ran; put back what changed and say which files the script modified."""
+        root = ctx.run.root
+        errors = []
+        for name, data in inputs.items():
+            for path in (f"{rel}/{name}", f"{GEOMETRY_DIR}/{name}"):
+                if _holds(root, path, data):
+                    continue
+                label = name if path.startswith(rel) else path
+                errors.append(f"{SCRIPT_NAME} modified {label}; it must only read it")
+                try:
+                    _write_clean(root, path, data)
+                except _RestoreError as exc:
+                    errors.append(f"{label} could not be put back ({exc})")
+        return errors
 
     @staticmethod
-    def _plan_problems(ctx: StageContext, spec: CaseSpec, rel: str, case_rel: str) -> list[str]:
-        """What the plan says about the boundaries that the converted mesh does not satisfy.
-
-        A manifest or boundary file that cannot be read is left to the sandbox gate, which
-        reports the details.
-        """
-        manifest, _ = _read_manifest(ctx, f"{rel}/{MANIFEST_FILE_NAME}")
+    def _meshless(
+        ctx: StageContext, spec: CaseSpec, manifest: BoundaryManifest | None, case_rel: str
+    ) -> list[str]:
+        """Plan boundaries without faces in the converted mesh. A manifest or boundary file that
+        cannot be read is left to the sandbox gate, which reports the details."""
         if manifest is None:
             return []
         try:
@@ -410,6 +475,19 @@ class MeshStage(Stage):
         except (RunDirError, OSError, UnicodeDecodeError):
             return []
         counts = _boundary_face_counts(text)
-        if not counts:
-            return []
-        return _plan_boundary_problems(spec, manifest, counts)
+        return _meshless_problems(spec, manifest, counts) if counts else []
+
+    @staticmethod
+    def _cell_limit(ctx: StageContext, spec: CaseSpec, check: OpResponse) -> list[str]:
+        """The run's own limit on cells (the planner checks the plan against it, too)."""
+        report = (check.data or {}).get("report")
+        cells = report.get("n_cells") if isinstance(report, dict) else None
+        limit = ctx.config.limits.max_cells
+        if isinstance(cells, int) and not isinstance(cells, bool) and cells > limit:
+            return [
+                f"exceeds resources: the mesh has {cells} cells but this run allows at most "
+                f"{limit}. Coarsen the mesh where the physics allows it (the plan's estimate is "
+                f"{spec.resource_estimate.cells} cells) and keep the resolution at walls and in "
+                "shear layers"
+            ]
+        return []

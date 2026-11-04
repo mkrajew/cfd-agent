@@ -2,6 +2,7 @@
 
 import json
 import math
+import os
 import re
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from test_geometry_stage import (
     make_ctx,
     manifest,
     plan,
+    plane,
     wedge_manifest,
 )
 
@@ -102,8 +104,11 @@ def stage_ctx(tmp_path, spec=None, geometry_manifest=None, **kwargs):
     data = manifest() if geometry_manifest is None else geometry_manifest
     promoted = ctx.run.root / "geometry"
     promoted.mkdir()
-    (promoted / "geometry.step").write_text(STEP_TEXT, encoding="utf-8")
-    (promoted / "boundary_manifest.json").write_text(json.dumps(data), encoding="utf-8")
+    (promoted / "geometry.step").write_bytes(STEP_TEXT.encode("utf-8"))
+    (promoted / "boundary_manifest.json").write_bytes(json.dumps(data).encode("utf-8"))
+    ctx.originals = {  # what the promoted geometry held before any script ran
+        name: (promoted / name).read_bytes() for name in ("geometry.step", "boundary_manifest.json")
+    }
     return ctx
 
 
@@ -286,38 +291,139 @@ def test_a_script_that_creates_the_case_directory_is_rejected(tmp_path):
     assert [c[0] for c in ctx.sandbox.calls] == ["run_script"]
 
 
-def test_the_script_cannot_change_the_inputs_the_gate_uses(tmp_path):
+def original_manifest_bytes(ctx):
+    return ctx.originals["boundary_manifest.json"]
+
+
+def tampering(ctx_holder, action):
+    """A fake ``run_script`` that runs ``action(attempt_dir, root)`` in the attempt directory."""
+
     def run_script(args):
-        cwd = ctx.run.path(args.cwd)
-        (cwd / "boundary_manifest.json").write_text('{"tampered": true}', encoding="utf-8")
-        (cwd / "geometry.step").write_text("tampered", encoding="utf-8")
+        ctx = ctx_holder[0]
+        action(ctx.run.root / args.cwd, ctx.run.root)
         return RUN_OK
 
-    ctx = stage_ctx(tmp_path, run=run_script)
+    return run_script
+
+
+def tampered_gate(tmp_path, action):
+    holder = []
+    ctx = stage_ctx(tmp_path, run=tampering(holder, action))
+    holder.append(ctx)
     attempt = prepared_attempt(ctx)
-    result = MeshStage().execute_and_gate(ctx, attempt)
-    assert result.ok, result.errors
-    restored = json.loads((attempt / "boundary_manifest.json").read_text(encoding="utf-8"))
-    assert restored == manifest()
-    assert (attempt / "geometry.step").read_text(encoding="utf-8") == STEP_TEXT
+    return ctx, attempt, MeshStage().execute_and_gate(ctx, attempt)
+
+
+def assert_inputs_restored(ctx, attempt):
+    for directory in (attempt, ctx.run.root / "geometry"):
+        step, manifest_file = directory / "geometry.step", directory / "boundary_manifest.json"
+        assert (
+            step.is_file()
+            and not step.is_symlink()
+            and step.read_bytes() == ctx.originals["geometry.step"]
+        )
+        assert manifest_file.is_file() and not manifest_file.is_symlink()
+        assert manifest_file.read_bytes() == original_manifest_bytes(ctx)
+
+
+def test_a_script_that_changes_an_input_fails_the_gate_and_the_inputs_are_restored(tmp_path):
+    def action(attempt, root):
+        (attempt / "boundary_manifest.json").write_text('{"tampered": true}', encoding="utf-8")
+        (attempt / "geometry.step").write_text("tampered", encoding="utf-8")
+
+    ctx, attempt, result = tampered_gate(tmp_path, action)
+    assert not result.ok
+    text = " ".join(result.errors)
+    assert "mesh.py modified" in text and "it must only read it" in text
+    assert "geometry.step" in text and "boundary_manifest.json" in text
+    assert [c[0] for c in ctx.sandbox.calls] == ["run_script"]  # nothing is converted or checked
+    assert_inputs_restored(ctx, attempt)
+
+
+def test_a_script_that_changes_the_promoted_geometry_fails_the_gate(tmp_path):
+    def action(attempt, root):
+        (root / "geometry" / "boundary_manifest.json").write_text("{}", encoding="utf-8")
+        (root / "geometry" / "geometry.step").unlink()
+
+    ctx, attempt, result = tampered_gate(tmp_path, action)
+    assert not result.ok
+    text = " ".join(result.errors)
+    assert "mesh.py modified" in text and "geometry/boundary_manifest.json" in text
+    assert "geometry/geometry.step" in text
+    assert_inputs_restored(ctx, attempt)
+
+
+def test_a_script_that_deletes_an_input_fails_the_gate(tmp_path):
+    ctx, attempt, result = tampered_gate(
+        tmp_path, lambda attempt, root: (attempt / "geometry.step").unlink()
+    )
+    assert not result.ok and "mesh.py modified geometry.step" in " ".join(result.errors)
+    assert_inputs_restored(ctx, attempt)
+
+
+@pytest.mark.parametrize("kind", ["directory", "fifo"])
+def test_an_input_replaced_by_something_that_is_no_file_is_a_failed_gate_not_a_crash(
+    tmp_path, kind
+):
+    def action(attempt, root):
+        target = attempt / "boundary_manifest.json"
+        target.unlink()
+        if kind == "directory":
+            target.mkdir()
+            (target / "inner.txt").write_text("x", encoding="utf-8")
+        else:
+            if not hasattr(os, "mkfifo"):
+                pytest.skip("no named pipes on this platform")
+            os.mkfifo(target)
+
+    ctx, attempt, result = tampered_gate(tmp_path, action)
+    assert not result.ok and "mesh.py modified boundary_manifest.json" in " ".join(result.errors)
+    assert_inputs_restored(ctx, attempt)
 
 
 def test_a_link_left_by_the_script_is_a_failed_gate_not_a_write_through(tmp_path):
     outside = tmp_path / "outside.json"
     outside.write_text("keep", encoding="utf-8")
 
-    def run_script(args):
-        link = ctx.run.path(args.cwd) / "boundary_manifest.json"
+    def action(attempt, root):
+        link = attempt / "boundary_manifest.json"
         link.unlink()
         try:
             link.symlink_to(outside)
         except OSError:
             pytest.skip("cannot create symbolic links here")
-        return RUN_OK
 
-    ctx = stage_ctx(tmp_path, run=run_script)
-    assert not gate(ctx).ok
+    ctx, attempt, result = tampered_gate(tmp_path, action)
+    assert not result.ok
     assert outside.read_text(encoding="utf-8") == "keep"
+    assert_inputs_restored(ctx, attempt)
+
+
+def test_a_promoted_geometry_directory_swapped_for_a_link_is_put_back(tmp_path):
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+
+    def action(attempt, root):
+        moved = root / "geometry"
+        for item in moved.iterdir():
+            (decoy / item.name).write_bytes(item.read_bytes())
+            item.unlink()
+        moved.rmdir()
+        try:
+            moved.symlink_to(decoy, target_is_directory=True)
+        except OSError:
+            pytest.skip("cannot create symbolic links here")
+
+    ctx, attempt, result = tampered_gate(tmp_path, action)
+    assert not result.ok and "geometry/" in " ".join(result.errors)
+    assert not (ctx.run.root / "geometry").is_symlink()
+    assert_inputs_restored(ctx, attempt)
+
+
+def test_an_unmodified_script_leaves_the_inputs_alone(tmp_path):
+    ctx, attempt, result = tampered_gate(tmp_path, lambda attempt, root: None)
+    assert result.ok, result.errors
+    assert_inputs_restored(ctx, attempt)
 
 
 # ------------------------------------------------------------------ the plan's boundaries (R28)
@@ -341,8 +447,10 @@ def test_a_zero_face_patch_does_not_count_as_a_patch_with_faces(tmp_path):
 def test_a_planned_boundary_missing_from_the_manifest_blames_the_geometry_stage(tmp_path):
     names = ("inlet", "outlet", "walls", "frontAndBack", "baffle")
     spec = make_spec(boundaries=[{"name": n, "role": "wall", "description": "x"} for n in names])
-    result = gate(stage_ctx(tmp_path, spec=spec))
+    ctx = stage_ctx(tmp_path, spec=spec)
+    result = gate(ctx)
     assert not result.ok
+    assert ctx.sandbox.calls == []  # decided from the plan and the manifest, before any work
     text = "\n".join(result.errors)
     assert "`baffle`" in text and "boundary_manifest.json" in text
     assert "lumped or dropped" in text and "Geometry stage" in text
@@ -411,8 +519,107 @@ def test_the_axis_role_is_no_exemption_in_a_3d_plan(tmp_path):
     data["patches"] = [p for p in data["patches"] if p["type"] != "empty"]
     patches = {k: v for k, v in DEFAULT_PATCHES.items() if k != "frontAndBack"}
     spec = make_spec(dimensionality="3D", boundaries=boundaries)
-    result = gate(stage_ctx(tmp_path, spec=spec, geometry_manifest=data, patches=patches))
+    ctx = stage_ctx(tmp_path, spec=spec, geometry_manifest=data, patches=patches)
+    result = gate(ctx)
     assert not result.ok and "`shaft`" in "\n".join(result.errors)
+    assert ctx.sandbox.calls == []
+
+
+def test_a_dropped_wall_cannot_hide_behind_the_empty_patch_that_absorbs_another_name(tmp_path):
+    """Review repro: one free-named `empty` patch stands for one plan name, not for two."""
+    boundaries = [
+        {"name": "inlet", "role": "inlet", "description": "x"},
+        {"name": "outlet", "role": "outlet", "description": "x"},
+        {"name": "frontAndBack", "role": "empty", "description": "x"},
+        {"name": "wall_bottom", "role": "wall", "description": "x"},
+    ]
+    data = manifest(names=("inlet", "outlet", "walls", "sides"))
+    ctx = stage_ctx(tmp_path, spec=make_spec(boundaries=boundaries), geometry_manifest=data)
+    result = gate(ctx)
+    text = " ".join(result.errors)
+    assert not result.ok and "`wall_bottom`" in text and "`frontAndBack`" in text
+    assert "at most 1" in text and ctx.sandbox.calls == []
+
+
+def test_the_role_text_exempts_nothing_in_a_2d_plan(tmp_path):
+    """Count path only: `back` has role `empty` but the manifest has no free `empty` patch."""
+    boundaries = [
+        {"name": "inlet", "role": "inlet", "description": "x"},
+        {"name": "walls", "role": "wall", "description": "x"},
+        {"name": "front", "role": "empty", "description": "x"},
+        {"name": "back", "role": "empty", "description": "x"},
+    ]
+    data = manifest(names=("inlet", "outlet", "walls", "front"))  # `front` is empty, `back` gone
+    ctx = stage_ctx(tmp_path, spec=make_spec(boundaries=boundaries), geometry_manifest=data)
+    result = gate(ctx)
+    assert not result.ok and "`back`" in " ".join(result.errors)
+    assert "`front`" not in " ".join(result.errors)
+
+
+def test_two_unlisted_empty_patches_absorb_two_unmatched_names(tmp_path):
+    names = ("inlet", "outlet", "walls", "a", "b")
+    boundaries = [{"name": n, "role": "x", "description": "x"} for n in names]
+    data = manifest(names=("inlet", "outlet", "walls", "sides"))
+    data["patches"].append({"name": "lid", "type": "empty", "locators": [plane("z", 0.0)]})
+    patches = {**DEFAULT_PATCHES, "sides": ("empty", 10), "lid": ("empty", 10)}
+    del patches["frontAndBack"]
+    spec = make_spec(boundaries=boundaries)
+    assert gate(stage_ctx(tmp_path, spec=spec, geometry_manifest=data, patches=patches)).ok
+
+
+def axisymmetric_plan(extra=(), drop=()):
+    spec = axisymmetric_spec(("inlet", "outlet", "side", "wedgeFront", "wedgeBack")).model_dump()
+    boundaries = [b for b in spec["boundaries"] if b["name"] not in drop]
+    boundaries += [{"name": n, "role": r, "description": "x"} for n, r in extra]
+    return make_spec(
+        dimensionality="axisymmetric", geometry=spec["geometry"], boundaries=boundaries
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "role"),
+    [
+        ("axis", "symmetry"),
+        ("centreline", "symmetry line"),
+        ("line", "centerline of the body"),
+        ("symmetry_axis", "symmetry"),
+        ("axisLine", "x"),
+        ("axis2", "x"),
+        ("x", "axis of revolution"),
+    ],
+)
+def test_the_axis_of_an_axisymmetric_plan_is_found_in_name_or_role(tmp_path, name, role):
+    spec = axisymmetric_plan(extra=[(name, role)])
+    ctx = stage_ctx(tmp_path, spec=spec, geometry_manifest=wedge_manifest(), patches=WEDGE_PATCHES)
+    result = gate(ctx)
+    assert result.ok, result.errors
+
+
+def test_an_axis_boundary_does_not_use_up_a_free_structural_patch(tmp_path):
+    # `wedgeFront` is not in the plan, so the manifest's patch of that name is one free patch.
+    kwargs = {"geometry_manifest": wedge_manifest(), "patches": WEDGE_PATCHES}
+    one = axisymmetric_plan(extra=[("axis", "symmetry"), ("nose", "wall")], drop=("wedgeFront",))
+    assert gate(stage_ctx(tmp_path, spec=one, **kwargs)).ok  # `nose` takes the free patch
+    (tmp_path / "again").mkdir()
+    two = axisymmetric_plan(
+        extra=[("axis", "symmetry"), ("nose", "wall"), ("tail", "wall")], drop=("wedgeFront",)
+    )
+    assert not gate(stage_ctx(tmp_path / "again", spec=two, **kwargs)).ok
+
+
+def test_front_of_the_body_is_no_axis_and_no_structural_face(tmp_path):
+    spec = axisymmetric_plan(extra=[("nose", "wall at the front of the body")])
+    ctx = stage_ctx(tmp_path, spec=spec, geometry_manifest=wedge_manifest(), patches=WEDGE_PATCHES)
+    result = gate(ctx)
+    assert not result.ok and "`nose`" in " ".join(result.errors)
+
+
+def test_axis_words_are_no_exemption_in_a_2d_plan(tmp_path):
+    names = ("inlet", "outlet", "walls", "frontAndBack", "axis")
+    boundaries = [
+        {"name": n, "role": "axis" if n == "axis" else "x", "description": "x"} for n in names
+    ]
+    assert not gate(stage_ctx(tmp_path, spec=make_spec(boundaries=boundaries))).ok
 
 
 def test_many_missing_boundaries_are_listed_with_bounded_names(tmp_path):
@@ -438,6 +645,49 @@ def test_plan_problems_and_sandbox_problems_are_reported_together(tmp_path):
     ctx = stage_ctx(tmp_path, patches=patches, check=gate_failed("max skewness is 5"))
     errors = gate(ctx).errors
     assert len(errors) == 2 and "`outlet`" in errors[0] and errors[-1] == "max skewness is 5"
+
+
+# ------------------------------------------------------------------ the cell limit (R33)
+
+
+def check_with_cells(cells):
+    return OpResponse(
+        ok=True, data={"ok": True, "errors": [], "report": {"n_cells": cells, "patches": {}}}
+    )
+
+
+def limited(tmp_path, cells, max_cells=5000):
+    ctx = stage_ctx(tmp_path, check=check_with_cells(cells))
+    ctx.config = ctx.config.model_copy(
+        update={"limits": ctx.config.limits.model_copy(update={"max_cells": max_cells})}
+    )
+    return ctx
+
+
+def test_a_mesh_above_the_cell_limit_of_the_run_fails_the_gate(tmp_path):
+    result = gate(limited(tmp_path, 6000))
+    assert not result.ok
+    (message,) = result.errors
+    assert message.startswith("exceeds resources:")
+    assert "6000" in message and "5000" in message
+    assert "coarsen" in message.lower()
+
+
+def test_a_mesh_at_the_cell_limit_passes(tmp_path):
+    assert gate(limited(tmp_path, 5000)).ok
+
+
+def test_the_cell_limit_is_not_checked_when_the_report_has_no_count(tmp_path):
+    assert gate(stage_ctx(tmp_path, check=GATE_OK)).ok  # the fake gate has no report
+
+
+def test_a_failed_check_reports_its_own_errors_not_the_cell_limit(tmp_path):
+    check = OpResponse(
+        ok=False,
+        data={"ok": False, "errors": ["max skewness is 5"], "report": {"n_cells": 10**7}},
+        error="max skewness is 5",
+    )
+    assert gate(stage_ctx(tmp_path, check=check)).errors == ["max skewness is 5"]
 
 
 # ------------------------------------------------------------------ the expected box (R29)
@@ -493,6 +743,7 @@ def test_an_axisymmetric_plan_without_an_angle_is_a_pipeline_error(tmp_path):
     ctx = stage_ctx(tmp_path, spec=spec, geometry_manifest=wedge_manifest(), patches=WEDGE_PATCHES)
     with pytest.raises(ToolFailure, match="wedge_angle_deg"):
         gate(ctx)
+    assert ctx.sandbox.calls == []  # found before the script is run
 
 
 # ------------------------------------------------------------------ inputs and promotion
@@ -563,6 +814,42 @@ def test_promote_puts_the_manifest_beside_the_case_directory(tmp_path):
     )
 
 
+def test_promotion_replaces_what_an_earlier_one_or_a_script_left_behind(tmp_path):
+    ctx = stage_ctx(tmp_path)
+    root = ctx.run.root
+    (root / "case" / "0").mkdir(parents=True)
+    (root / "case" / "0" / "U").write_text("old", encoding="utf-8")
+    (root / "case" / "system").mkdir()
+    (root / "case" / "system" / "controlDict").write_text("old", encoding="utf-8")
+    (root / "mesh").mkdir()
+    (root / "mesh" / "stale.txt").write_text("old", encoding="utf-8")
+    (root / "boundary_manifest.json").mkdir()  # something in the way of the manifest
+    (root / "boundary_manifest.json" / "x").write_text("x", encoding="utf-8")
+
+    MeshStage().promote(ctx, converted_attempt(ctx))
+    MeshStage().promote(ctx, ctx.run.root / "attempts" / "mesh-1")  # and once more
+
+    held = sorted(p.relative_to(root / "case").as_posix() for p in (root / "case").rglob("*"))
+    assert held == [
+        "constant",
+        "constant/polyMesh",
+        "constant/polyMesh/boundary",
+        "constant/polyMesh/points",
+    ]
+    assert not (root / "mesh" / "stale.txt").exists()
+    assert (root / "boundary_manifest.json").is_file()
+    assert json.loads((root / "boundary_manifest.json").read_text(encoding="utf-8")) == manifest()
+
+
+def test_promotion_puts_the_geometry_manifest_even_if_the_attempt_copy_was_changed(tmp_path):
+    ctx = stage_ctx(tmp_path)
+    attempt = converted_attempt(ctx)
+    (attempt / "boundary_manifest.json").write_text("{}", encoding="utf-8")
+    MeshStage().promote(ctx, attempt)
+    root_manifest = json.loads((ctx.run.root / "boundary_manifest.json").read_text("utf-8"))
+    assert root_manifest == manifest()
+
+
 def test_promote_without_a_converted_mesh_is_a_pipeline_error(tmp_path):
     ctx = stage_ctx(tmp_path)
     with pytest.raises(ToolFailure, match="polyMesh"):
@@ -617,6 +904,8 @@ def test_opening_message_states_what_the_mesh_must_resolve(tmp_path):
         "mesh.msh",
         "geometry.step",
         "boundary_manifest.json",
+        "2000000",  # the run's hard limit on cells
+        "hard limit",
     ):
         assert needle in text, needle
     assert "Incompressible laminar flow" not in text  # not the whole plan (the summary)
@@ -652,8 +941,21 @@ def test_prompt_states_the_contract_and_the_physics_rules():
         "numElements",
         "target_cells",
         "resolve",
+        "getParametrizationBounds",  # the orientation-independent grading helper
+        "on its own",
+        "setAsBoundaryLayer",
+        "Quads",
+        "cell-centre",
+        "2 y",
+        "Mesh.Algorithm",
+        "notes",  # Re_cell above 2 goes into a note for Case Setup
+        "half-width",
+        "hard limit",
     ):
         assert needle in text, needle
+    assert "40 degrees" not in text  # no self-check the agent cannot make
+    assert "geometry.step's size" not in text
+    assert "never above resource_estimate_cells" not in text
     assert re.search(r"do not set\s+`?Geometry\.OCCTargetUnit", text, re.I)
     assert "```python" in text  # a skeleton of the script
 
