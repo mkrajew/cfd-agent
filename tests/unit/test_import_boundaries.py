@@ -27,9 +27,9 @@ HOST_SIDE = (
     "config",
     "record",
 )
-CONTAINER_SIDE = ("tools", "executor")
+CONTAINER_SIDE = ("tools", "executor", "knowledge")
 
-HOST_FORBIDDEN = ("cfdagent.tools", "cadquery", "gmsh", "pyvista")
+HOST_FORBIDDEN = ("cfdagent.tools", "cfdagent.knowledge", "cadquery", "gmsh", "pyvista")
 CONTAINER_FORBIDDEN = ("cfdagent.bench", "cfdagent.agents", "cfdagent.orchestrator")
 
 
@@ -82,6 +82,8 @@ def test_scanner_detects_forbidden_imports():
     assert {"gmsh", "cfdagent.tools", "cfdagent.agents.bench", "cfdagent.agents.tools.x"} <= names
     assert _is_forbidden("cfdagent.tools.geometry", HOST_FORBIDDEN)
     assert _is_forbidden("cadquery", HOST_FORBIDDEN)
+    assert _is_forbidden("cfdagent.knowledge.search", HOST_FORBIDDEN)
+    assert not _is_forbidden("cfdagent.knowledgebase", HOST_FORBIDDEN)
     assert not _is_forbidden("cfdagent.toolsbox", HOST_FORBIDDEN)
 
 

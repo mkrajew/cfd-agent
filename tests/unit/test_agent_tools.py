@@ -488,3 +488,42 @@ def test_scope_fields_are_tuples_and_reserved_names_include_the_record_files():
         RESERVED_FILES
     )
     assert not FileScope(writable=["*"]).can_write("comparison.json")
+
+
+# ------------------------------------------------------------------ excluded patterns (R35)
+
+
+def test_excluded_patterns_are_never_writable_even_when_a_writable_pattern_matches():
+    scope = FileScope(
+        readable=("case/*",),
+        writable=("case/constant/*", "case/system/*"),
+        excluded=("case/constant/polyMesh", "case/constant/polyMesh/*"),
+    )
+    assert scope.can_write("case/constant/transportProperties")
+    assert scope.can_write("case/system/controlDict")
+    assert not scope.can_write("case/constant/polyMesh/points")
+    assert not scope.can_write("case/constant/polyMesh/sub/dir/file")
+    assert not scope.can_write("case/constant/polyMesh")
+    assert not scope.can_write("case/constant/./polyMesh/boundary")  # normalised first
+    with pytest.raises(Exception, match=r"\.\."):
+        scope.can_write("case/constant/polyMesh/../polyMesh/boundary")  # never reaches a match
+    assert scope.can_read("case/constant/polyMesh/boundary")  # excluded from writing only
+    assert scope.excluded == ("case/constant/polyMesh", "case/constant/polyMesh/*")
+
+
+def test_excluded_defaults_to_nothing_and_is_stored_as_a_tuple():
+    assert FileScope(writable=["a/*"]).excluded == ()
+    assert FileScope(writable=["a/*"], excluded=["a/x"]).excluded == ("a/x",)
+    assert FileScope(writable=["a/*"]).can_write("a/x")
+
+
+def test_the_write_tool_refuses_an_excluded_path(run):
+    scope = FileScope(readable=("*",), writable=("w/*",), excluded=("w/locked/*",))
+    registry = ToolRegistry()
+    for tool in builtin_tools(run, scope):
+        registry.add(tool)
+    ok = registry.dispatch(call("write_file", path="w/free.txt", content="a"))
+    assert ok.startswith("wrote ")
+    denied = registry.dispatch(call("write_file", path="w/locked/x.txt", content="a"))
+    assert denied.startswith("error:") and "not writable" in denied
+    assert not (run.root / "w" / "locked").exists()

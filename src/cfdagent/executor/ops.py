@@ -30,12 +30,14 @@ from typing import Any
 
 import numpy as np
 
-from cfdagent.errors import AgentInputError
+from cfdagent.errors import AgentInputError, ToolFailure
 from cfdagent.executor import protocol
 from cfdagent.executor.protocol import OpRequest, OpResponse
 from cfdagent.gates import GateResult
+from cfdagent.knowledge import search as knowledge_search
 from cfdagent.manifest import MANIFEST_FILE_NAME, BoundaryManifest
 from cfdagent.rundir import RunDir, split_relative
+from cfdagent.tools import case_check
 from cfdagent.tools import foam as foam_tools
 from cfdagent.tools import geometry as geometry_tools
 from cfdagent.tools import mesh as mesh_tools
@@ -395,6 +397,42 @@ def run_utility(args: protocol.RunUtilityArgs, jail: RunDir) -> dict[str, Any]:
     _no_links(jail, args.cwd, (log_name,))
     result = run_tool(list(args.argv), cwd, cwd / log_name, _UTILITY_TIMEOUT_S)
     return _tool(jail, result, name, _UTILITY_TIMEOUT_S)
+
+
+@operation("check_case_consistency")
+def check_case_consistency(args: protocol.CheckCaseConsistencyArgs, jail: RunDir) -> dict[str, Any]:
+    """Patches of the mesh against the field files of ``0/``, and ``controlDict`` against the
+    solver (see ``tools.case_check``). Reads files only; ``check_dictionaries`` judges syntax."""
+    case_dir = _directory(jail, args.case_dir)
+    _check_solver(args.solver)
+    _no_links(
+        jail,
+        args.case_dir,
+        ("0", "constant", "constant/polyMesh", "constant/polyMesh/boundary", "system"),
+    )
+    return _gate(case_check.check_case_consistency(case_dir, args.solver))
+
+
+def _tutorial_root() -> Path:
+    value = os.environ.get("FOAM_TUTORIALS")
+    if not value:
+        raise ToolFailure(
+            "FOAM_TUTORIALS is not set in the executor; the OpenFOAM tutorials belong to the image"
+        )
+    return Path(value)
+
+
+@operation("search_knowledge")
+def search_knowledge(args: protocol.SearchKnowledgeArgs, jail: RunDir) -> dict[str, Any]:
+    """Lexical search over the tutorials in ``$FOAM_TUTORIALS``; nothing of the job directory."""
+    hits = knowledge_search.search_tutorials(args.query, _tutorial_root(), args.max_hits)
+    return {"hits": [hit._asdict() for hit in hits]}
+
+
+@operation("read_knowledge")
+def read_knowledge(args: protocol.ReadKnowledgeArgs, jail: RunDir) -> dict[str, Any]:
+    """One tutorial file (or a directory listing); symbolic links and the outside are refused."""
+    return {"text": knowledge_search.read_tutorial(args.path, _tutorial_root(), args.max_bytes)}
 
 
 # --------------------------------------------------------------------------------------------

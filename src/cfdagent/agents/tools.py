@@ -341,15 +341,19 @@ class FileScope:
     Patterns are ``fnmatch`` globs matched case-sensitively against the normalised POSIX path
     relative to the run directory (``*`` also matches ``/``). Paths with a hidden component (a
     name starting with a dot) are never accessible, and the orchestrator's own files are never
-    writable, whatever the patterns say. A malformed path raises ``UnsafePath``.
+    writable, whatever the patterns say. ``excluded`` patterns are never writable, even when a
+    writable pattern matches (for example a directory the stage must keep as it received it);
+    they do not limit reading. A malformed path raises ``UnsafePath``.
     """
 
     readable: tuple[str, ...] = ()
     writable: tuple[str, ...] = ()
+    excluded: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "readable", tuple(self.readable))
         object.__setattr__(self, "writable", tuple(self.writable))
+        object.__setattr__(self, "excluded", tuple(self.excluded))
 
     @staticmethod
     def normalise(path: str) -> str:
@@ -391,6 +395,7 @@ class FileScope:
             and not self._hidden(norm)
             and norm not in RESERVED_FILES
             and self._matches(self.writable, norm)
+            and not self._matches(self.excluded, norm)
         )
 
     def can_list(self, path: str) -> bool:

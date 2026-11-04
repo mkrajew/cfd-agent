@@ -173,3 +173,31 @@ def test_uniform_fixed_value_with_a_function1_works_where_coded_patches_are_refu
     log = run_dir.read_text("case/log.icoFoam", max_bytes=5_000_000)
     assert "case-supplied code" not in log
     assert "eprecat" not in log
+
+
+def test_check_case_consistency_reads_the_real_mesh_and_dictionaries(job):
+    client, run_dir = job
+    good = client.call(
+        "check_case_consistency", {"case_dir": "case", "solver": "icoFoam"}, timeout_s=120
+    )
+    assert good.ok, good.error
+    assert good.data["report"]["patches"]["frontAndBack"] == "empty"
+    wrong = client.call(
+        "check_case_consistency", {"case_dir": "case", "solver": "simpleFoam"}, timeout_s=120
+    )
+    assert wrong.ok is False and wrong.internal is False
+    assert "application" in wrong.error and "simpleFoam" in wrong.error
+
+
+def test_knowledge_ops_search_and_read_the_installed_tutorials(job):
+    client, _ = job
+    found = client.call(
+        "search_knowledge", {"query": "icoFoam controlDict", "max_hits": 5}, timeout_s=120
+    )
+    assert found.ok, found.error
+    hits = found.data["hits"]
+    assert 0 < len(hits) <= 5 and {"path", "line", "text"} <= set(hits[0])
+    text = client.call("read_knowledge", {"path": hits[0]["path"]}, timeout_s=120)
+    assert text.ok and "FoamFile" in text.data["text"]
+    outside = client.call("read_knowledge", {"path": "../../etc/passwd"}, timeout_s=120)
+    assert outside.ok is False and outside.internal is False
