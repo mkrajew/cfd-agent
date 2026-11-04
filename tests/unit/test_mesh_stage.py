@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 from test_casespec import make_spec
 from test_geometry_stage import (
-    GATE_OK,
     RUN_OK,
     Clock,
     FakeSandbox,
@@ -79,6 +78,12 @@ def write_boundary(ctx, args, patches):
     (case / "gmshToFoam.log").write_text("converted", encoding="utf-8")
 
 
+def check_with_cells(cells):
+    return OpResponse(
+        ok=True, data={"ok": True, "errors": [], "report": {"n_cells": cells, "patches": {}}}
+    )
+
+
 def stage_ctx(tmp_path, spec=None, geometry_manifest=None, **kwargs):
     """A context with a promoted geometry (step and manifest) and a fake sandbox.
 
@@ -96,7 +101,7 @@ def stage_ctx(tmp_path, spec=None, geometry_manifest=None, **kwargs):
         {
             "run_script": kwargs.pop("run", RUN_OK),
             "convert_mesh": kwargs.pop("convert", default_convert),
-            "check_mesh": kwargs.pop("check", GATE_OK),
+            "check_mesh": kwargs.pop("check", check_with_cells(4096)),
         }
     )
     ctx = make_ctx(tmp_path, sandbox, spec=spec, **kwargs)
@@ -420,6 +425,91 @@ def test_a_promoted_geometry_directory_swapped_for_a_link_is_put_back(tmp_path):
     assert_inputs_restored(ctx, attempt)
 
 
+@pytest.mark.parametrize("where", ["attempt", "geometry"])
+def test_a_planted_oversized_input_is_never_read_into_memory(tmp_path, monkeypatch, where):
+    big = b"x" * 5_000_000
+
+    def action(attempt, root):
+        directory = attempt if where == "attempt" else root / "geometry"
+        (directory / "geometry.step").write_bytes(big)
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("the planted file was read")
+
+        monkeypatch.setattr(Path, "read_bytes", forbidden)
+        monkeypatch.setattr(Path, "read_text", forbidden)
+        real_open = open
+
+        class Bounded:
+            def __init__(self, handle):
+                self._handle = handle
+
+            def read(self, size=-1):
+                if size is None or size < 0 or size > 1_000_000:
+                    raise AssertionError("an unbounded read of the planted file")
+                return self._handle.read(size)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._handle.close()
+
+            def __getattr__(self, name):
+                return getattr(self._handle, name)
+
+        def guarded_open(file, mode="r", *args, **kwargs):
+            handle = real_open(file, mode, *args, **kwargs)
+            return Bounded(handle) if "b" in mode and "r" in mode else handle
+
+        monkeypatch.setattr("builtins.open", guarded_open)
+
+    holder = []
+    ctx = stage_ctx(tmp_path, run=tampering(holder, action))
+    holder.append(ctx)
+    attempt = prepared_attempt(ctx)
+    result = MeshStage().execute_and_gate(ctx, attempt)
+    monkeypatch.undo()
+    assert not result.ok and "mesh.py modified" in " ".join(result.errors)
+    assert_inputs_restored(ctx, attempt)
+
+
+def test_a_same_size_change_is_still_detected(tmp_path):
+    def action(attempt, root):
+        original = (attempt / "geometry.step").read_bytes()
+        (attempt / "geometry.step").write_bytes(b"Z" * len(original))
+
+    ctx, attempt, result = tampered_gate(tmp_path, action)
+    assert not result.ok and "mesh.py modified geometry.step" in " ".join(result.errors)
+    assert_inputs_restored(ctx, attempt)
+
+
+def test_an_oversized_promoted_input_is_a_pipeline_error(tmp_path, monkeypatch):
+    import cfdagent.agents.mesh as mesh_module
+
+    ctx = stage_ctx(tmp_path)
+    monkeypatch.setattr(mesh_module, "INPUT_MAX_BYTES", 5)
+    with pytest.raises(ToolFailure, match="geometry/geometry.step.*larger than 5 bytes"):
+        MeshStage().prepare_attempt(ctx, ctx.run.attempt_dir("mesh", 1))
+
+
+def test_a_restore_that_fails_is_a_failed_gate_not_an_exception(tmp_path, monkeypatch):
+    import cfdagent.agents.mesh as mesh_module
+
+    def action(attempt, root):
+        (attempt / "geometry.step").write_bytes(b"tampered")
+
+        def broken(root_dir, rel, data):
+            raise mesh_module._RestoreError(f"{rel}: PermissionError")
+
+        monkeypatch.setattr(mesh_module, "_write_clean", broken)
+
+    ctx, attempt, result = tampered_gate(tmp_path, action)
+    text = " ".join(result.errors)
+    assert not result.ok and "mesh.py modified geometry.step" in text
+    assert "could not be put back" in text and "PermissionError" in text
+
+
 def test_an_unmodified_script_leaves_the_inputs_alone(tmp_path):
     ctx, attempt, result = tampered_gate(tmp_path, lambda attempt, root: None)
     assert result.ok, result.errors
@@ -586,6 +676,11 @@ def axisymmetric_plan(extra=(), drop=()):
         ("axisLine", "x"),
         ("axis2", "x"),
         ("x", "axis of revolution"),
+        ("centreLine", "x"),
+        ("center_line", "x"),
+        ("x", "centre line of the body"),
+        ("Centerline", "x"),
+        ("x", "the center  line"),
     ],
 )
 def test_the_axis_of_an_axisymmetric_plan_is_found_in_name_or_role(tmp_path, name, role):
@@ -605,6 +700,16 @@ def test_an_axis_boundary_does_not_use_up_a_free_structural_patch(tmp_path):
         extra=[("axis", "symmetry"), ("nose", "wall"), ("tail", "wall")], drop=("wedgeFront",)
     )
     assert not gate(stage_ctx(tmp_path / "again", spec=two, **kwargs)).ok
+
+
+def test_words_that_only_look_like_an_axis_are_no_exemption(tmp_path):
+    for name, role in (("center", "line load"), ("outletCenter", "wall"), ("line", "centre")):
+        (tmp_path / name).mkdir()
+        spec = axisymmetric_plan(extra=[(name, role)])
+        ctx = stage_ctx(
+            tmp_path / name, spec=spec, geometry_manifest=wedge_manifest(), patches=WEDGE_PATCHES
+        )
+        assert not gate(ctx).ok, (name, role)
 
 
 def test_front_of_the_body_is_no_axis_and_no_structural_face(tmp_path):
@@ -650,12 +755,6 @@ def test_plan_problems_and_sandbox_problems_are_reported_together(tmp_path):
 # ------------------------------------------------------------------ the cell limit (R33)
 
 
-def check_with_cells(cells):
-    return OpResponse(
-        ok=True, data={"ok": True, "errors": [], "report": {"n_cells": cells, "patches": {}}}
-    )
-
-
 def limited(tmp_path, cells, max_cells=5000):
     ctx = stage_ctx(tmp_path, check=check_with_cells(cells))
     ctx.config = ctx.config.model_copy(
@@ -677,8 +776,18 @@ def test_a_mesh_at_the_cell_limit_passes(tmp_path):
     assert gate(limited(tmp_path, 5000)).ok
 
 
-def test_the_cell_limit_is_not_checked_when_the_report_has_no_count(tmp_path):
-    assert gate(stage_ctx(tmp_path, check=GATE_OK)).ok  # the fake gate has no report
+@pytest.mark.parametrize("data", [None, {"ok": True, "errors": []}, {"report": {"cells": 1}}])
+def test_a_passing_check_without_a_cell_count_is_a_wiring_break(tmp_path, data):
+    ctx = stage_ctx(tmp_path, check=OpResponse(ok=True, data=data))
+    with pytest.raises(ToolFailure, match="n_cells"):
+        gate(ctx)
+
+
+def test_the_resource_message_uses_the_planners_prefix(tmp_path):
+    from cfdagent.agents.planner import RESOURCE_PREFIX
+
+    (message,) = gate(limited(tmp_path, 6000)).errors
+    assert message.startswith(RESOURCE_PREFIX)
 
 
 def test_a_failed_check_reports_its_own_errors_not_the_cell_limit(tmp_path):
@@ -850,6 +959,14 @@ def test_promotion_puts_the_geometry_manifest_even_if_the_attempt_copy_was_chang
     assert root_manifest == manifest()
 
 
+def test_promote_needs_only_the_manifest_of_the_geometry(tmp_path):
+    ctx = stage_ctx(tmp_path)
+    attempt = converted_attempt(ctx)
+    (ctx.run.root / "geometry" / "geometry.step").unlink()  # not needed to hand the mesh on
+    MeshStage().promote(ctx, attempt)
+    assert (ctx.run.root / "boundary_manifest.json").is_file()
+
+
 def test_promote_without_a_converted_mesh_is_a_pipeline_error(tmp_path):
     ctx = stage_ctx(tmp_path)
     with pytest.raises(ToolFailure, match="polyMesh"):
@@ -954,6 +1071,7 @@ def test_prompt_states_the_contract_and_the_physics_rules():
     ):
         assert needle in text, needle
     assert "40 degrees" not in text  # no self-check the agent cannot make
+    assert "usually all hexahedral" in text and "gives an all-hexahedral" not in text
     assert "geometry.step's size" not in text
     assert "never above resource_estimate_cells" not in text
     assert re.search(r"do not set\s+`?Geometry\.OCCTargetUnit", text, re.I)
@@ -1030,7 +1148,7 @@ def test_mesh_stage_gate_errors_are_fed_back(tmp_path):
 
     verdicts = [
         gate_failed("max non-orthogonality is 81.5, above the limit 70. Refine near the corner"),
-        GATE_OK,
+        check_with_cells(4096),
     ]
     holder = []
     run_script = writes_mesh(holder)

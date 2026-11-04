@@ -8,10 +8,12 @@ copies of the Geometry stage's ``geometry.step`` and ``boundary_manifest.json`` 
 the manifest) and lets the sandbox check the result against the plan (``check_mesh``: checkMesh,
 patch names and placement, bounding box, one cell through the thickness, quality limits).
 
-The host adds one check that needs the plan: every boundary of the plan that is not structural must
-have a patch with faces in the converted ``polyMesh/boundary``. Structural boundaries are the
-``empty`` and ``wedge`` patches of the manifest (any name) and, by their role, the front and back
-faces of a 2D case and the axis of an axisymmetric case, which have no patch of that name.
+The host adds checks that need the plan. Before the script runs: every boundary of the plan needs
+a patch of its name in the manifest, except the axis of an axisymmetric plan (an axis word in its
+name or role; it has no face) and as many names as the manifest has ``empty`` or ``wedge`` patches
+with names the plan does not list (the Geometry gate lets those patches have any name; each of them
+absorbs one plan name). After the conversion: a boundary with a manifest patch must have faces in
+``polyMesh/boundary``. After ``check_mesh``: the cell count must not exceed ``limits.max_cells``.
 
 An axisymmetric mesh is one flat-faced cell through the wedge angle ``a``: its vertices lie on the
 true radii, but the faces between them are flat. The bounding box of such a mesh is therefore
@@ -39,6 +41,7 @@ from cfdagent.agents.casespec import BoundarySpec, CaseSpec
 from cfdagent.agents.gatehelp import last_bytes, names, read_manifest
 from cfdagent.agents.geometry import PROMOTED_DIR as GEOMETRY_DIR
 from cfdagent.agents.geometry import STEP_NAME
+from cfdagent.agents.planner import RESOURCE_PREFIX
 from cfdagent.agents.stage import Stage, StageContext
 from cfdagent.agents.tools import FileScope
 from cfdagent.errors import ToolFailure
@@ -64,6 +67,8 @@ _STRUCTURAL_TYPES = frozenset({"empty", "wedge"})
 # An axis of revolution has no face, so a plan boundary that names it needs no patch. Words are
 # found in the name and the role after splitting camelCase, underscores, digits and spaces.
 _AXIS_WORDS = frozenset({"axis", "centreline", "centerline", "revolution"})
+_AXIS_PAIRS = frozenset({"centreline", "centerline"})  # also written as two words
+INPUT_MAX_BYTES = 256 * 1024 * 1024  # the Geometry stage's STEP file is megabytes at most
 _WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+")
 _CONVERSION_HINT = (
     "gmshToFoam names the patches after the physical groups of mesh.msh and puts every boundary "
@@ -130,8 +135,12 @@ def _is_axis(spec: CaseSpec, boundary: BoundarySpec) -> bool:
     """An axisymmetric plan's boundary that names the axis of revolution (it has no face)."""
     if spec.dimensionality != "axisymmetric":
         return False
-    words = {w.lower() for w in _WORD.findall(f"{boundary.name} {boundary.role}")}
-    return bool(words & _AXIS_WORDS)
+    for text in (boundary.name, boundary.role):
+        words = [w.lower() for w in _WORD.findall(text)]
+        pairs = {a + b for a, b in zip(words, words[1:], strict=False)}
+        if set(words) & _AXIS_WORDS or pairs & _AXIS_PAIRS:
+            return True
+    return False
 
 
 def _free_structural_patches(spec: CaseSpec, manifest: BoundaryManifest) -> int:
@@ -237,9 +246,13 @@ def _holds(root: Path, rel: str, data: bytes) -> bool:
         if os.path.islink(current):
             return False
     try:
-        if not stat.S_ISREG(os.lstat(current).st_mode):
+        status = os.lstat(current)
+        if not stat.S_ISREG(status.st_mode):
             return False  # a directory or a FIFO: do not open it
-        return current.read_bytes() == data
+        if status.st_size != len(data):
+            return False  # and never read a file of another size: it may be huge
+        with open(current, "rb") as handle:
+            return handle.read(len(data) + 1) == data
     except OSError:
         return False
 
@@ -301,8 +314,8 @@ class MeshStage(Stage):
             "must resolve what requested_outputs asks for. Aim for about "
             f"{spec.resource_estimate.cells} cells (the plan's resource estimate, which the run "
             f"time was planned for); the hard limit of this run is {ctx.config.limits.max_cells} "
-            'cells, and a mesh above it fails the check ("exceeds resources"). Units are metres, '
-            "as in the geometry."
+            f'cells, and a mesh above it fails the check ("{RESOURCE_PREFIX.rstrip(":")}"). Units '
+            "are metres, as in the geometry."
             f"{extra}"
         )
 
@@ -409,7 +422,7 @@ class MeshStage(Stage):
         polymesh_rel = f"{rel}/{CASE_NAME}/constant/polyMesh"
         if not ctx.run.path(polymesh_rel).is_dir():
             raise ToolFailure(f"{polymesh_rel} does not exist; the gate has not converted a mesh")
-        manifest = self._read_inputs(ctx)[MANIFEST_FILE_NAME]
+        manifest = self._read_inputs(ctx, (MANIFEST_FILE_NAME,))[MANIFEST_FILE_NAME]
         try:
             ctx.run.promote(attempt_dir, PROMOTED_DIR)
             _remove(ctx.run.root / PROMOTED_DIR / CASE_NAME / "constant")
@@ -428,16 +441,21 @@ class MeshStage(Stage):
         return ctx.casespec
 
     @staticmethod
-    def _read_inputs(ctx: StageContext) -> dict[str, bytes]:
-        """The bytes of the promoted geometry files; a missing one is a broken pipeline order."""
+    def _read_inputs(ctx: StageContext, wanted: tuple[str, ...] = INPUT_FILES) -> dict[str, bytes]:
+        """The bytes of promoted geometry files; a missing or oversized one is a broken pipeline."""
         data = {}
-        for name in INPUT_FILES:
+        for name in wanted:
             try:
                 path = ctx.run.path(f"{GEOMETRY_DIR}/{name}")
                 if not path.is_file():
                     raise ToolFailure(
                         f"{GEOMETRY_DIR}/{name} does not exist: the geometry stage has not "
                         "produced it, so the pipeline order is broken"
+                    )
+                if path.stat().st_size > INPUT_MAX_BYTES:
+                    raise ToolFailure(
+                        f"{GEOMETRY_DIR}/{name} is larger than {INPUT_MAX_BYTES} bytes; the "
+                        "geometry stage should not have produced it"
                     )
                 data[name] = path.read_bytes()
             except RunDirError as exc:
@@ -482,10 +500,14 @@ class MeshStage(Stage):
         """The run's own limit on cells (the planner checks the plan against it, too)."""
         report = (check.data or {}).get("report")
         cells = report.get("n_cells") if isinstance(report, dict) else None
+        if not isinstance(cells, int) or isinstance(cells, bool):
+            raise ToolFailure(
+                "check_mesh passed without report.n_cells; the executor and the stage disagree"
+            )
         limit = ctx.config.limits.max_cells
-        if isinstance(cells, int) and not isinstance(cells, bool) and cells > limit:
+        if cells > limit:
             return [
-                f"exceeds resources: the mesh has {cells} cells but this run allows at most "
+                f"{RESOURCE_PREFIX} the mesh has {cells} cells but this run allows at most "
                 f"{limit}. Coarsen the mesh where the physics allows it (the plan's estimate is "
                 f"{spec.resource_estimate.cells} cells) and keep the resolution at walls and in "
                 "shear layers"
