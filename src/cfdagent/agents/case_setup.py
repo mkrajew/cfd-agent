@@ -65,6 +65,7 @@ PROMOTED_DIR = "case_setup"  # the notes of the accepted attempt
 PROMOTED_CASE_DIR = "case"  # the case of the later stages: 0/, constant/ (mesh included), system/
 POLYMESH_REL = "constant/polyMesh"
 MESH_NOTES = "mesh/notes.md"  # what the Mesh stage may have left for this stage
+MESH_LOGS = ("mesh/mesh.log", "mesh/case/checkMesh.log")  # its script output and checkMesh report
 CONTROL_DICT_REL = "system/controlDict"
 # The solvers the executor runs (``tools.foam.SOLVERS``); host code must not import the tool
 # layer, so a unit test keeps the two in step.
@@ -73,9 +74,16 @@ TRIAL_STEPS = 3
 GATE_TIMEOUT_S = 300.0  # the dictionary check has its own total limit of 300 s
 TRIAL_TIMEOUT_S = 600.0  # the op limits the solver to 300 s; the rest is set-up of the scratch copy
 KNOWLEDGE_TIMEOUT_S = 60.0
-TAIL_BYTES = 3000  # the loop shows the model at most 4096 bytes of all errors together
+TAIL_BYTES = 2500  # the loop shows the model at most 4096 bytes of all errors together
+HEADLINE_CHARS = 500  # headline and OpenFOAM's own message in a trial failure
+# A fixed time step whose trial run measured a Courant number above this fails the gate. The value
+# is a judgment of the project (it is far above the limit of a stable PISO step on purpose, so
+# that only clearly broken steps fail) and awaits the owner's confirmation.
+TRIAL_MAX_COURANT = 10.0
+TRIAL_COURANT_TARGET = 0.5  # the Courant number the suggested deltaT aims at
+TRANSIENT_SOLVERS = ("icoFoam", "pimpleFoam")
 READ_BYTES = 7000  # a tool result is cut at 8000 bytes; this keeps the truncation marker visible
-POLYMESH_MAX_BYTES = 256 * 1024 * 1024  # the mesh of a run is megabytes to a few hundred
+POLYMESH_MAX_BYTES = 1 << 30  # an ascii mesh is ~170 bytes per cell; the run limit is 2e6 cells
 POLYMESH_MAX_FILES = 1000  # a polyMesh directory holds about ten files
 POLYMESH_MAX_DEPTH = 6
 _CHUNK = 1 << 20
@@ -207,16 +215,20 @@ def _errors(response: OpResponse, fallback: str) -> list[str]:
     return [response.error or fallback]
 
 
+def _clip(text: str, limit: int = HEADLINE_CHARS) -> str:
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
 def _trial_failure(response: OpResponse, solver: str) -> str:
     """The message for a trial run that failed: the headline, what OpenFOAM reported and the end
     of the solver output, where the cause is."""
     data = response.data or {}
     error = response.error or "the trial run failed without a message"
     headline, _, rest = error.partition("\n")
-    message = f"the {TRIAL_STEPS}-step trial run of {solver} failed: {headline}"
+    message = f"the {TRIAL_STEPS}-step trial run of {solver} failed: {_clip(headline)}"
     fatal = data.get("fatal_error")
     if isinstance(fatal, str) and fatal.strip() and fatal not in headline:
-        message += f"\nOpenFOAM reported: {fatal.strip()}"
+        message += f"\nOpenFOAM reported: {_clip(fatal.strip())}"
     tail = data.get("tail")
     if not isinstance(tail, str) or not tail.strip():
         tail = rest
@@ -231,7 +243,7 @@ class CaseSetupStage(Stage):
     name = STAGE
     agent = AGENT
     scope = FileScope(
-        readable=("casespec.json", MESH_NOTES, "attempts/case_setup-*/*"),
+        readable=("casespec.json", MESH_NOTES, *MESH_LOGS, "attempts/case_setup-*/*"),
         writable=(
             "attempts/case_setup-*/case/0/*",
             "attempts/case_setup-*/case/constant/*",
@@ -241,11 +253,11 @@ class CaseSetupStage(Stage):
         excluded=(
             "attempts/case_setup-*/case/constant/polyMesh",
             "attempts/case_setup-*/case/constant/polyMesh/*",
+            # OpenFOAM reads a polyMesh in a time directory in preference to constant/polyMesh.
+            "attempts/case_setup-*/case/0/polyMesh",
+            "attempts/case_setup-*/case/0/polyMesh/*",
         ),
     )
-
-    def __init__(self) -> None:
-        self._meshes: dict[str, _Snapshot] = {}  # attempt directory -> the mesh it started with
 
     # ------------------------------------------------------------------ the agent's task
 
@@ -267,9 +279,12 @@ class CaseSetupStage(Stage):
             "requested_outputs": [o.model_dump() for o in spec.requested_outputs],
             "assumptions": spec.assumptions,
         }
-        notes = ""
+        notes = (
+            f" The Mesh stage's output is readable: {MESH_LOGS[0]} (its script's printout) and "
+            f"{MESH_LOGS[1]} (cell sizes, non-orthogonality, skewness)."
+        )
         if self._has_mesh_notes(ctx):
-            notes = (
+            notes += (
                 f" The Mesh stage left notes in {MESH_NOTES}: read them before choosing the "
                 "convection schemes."
             )
@@ -289,7 +304,7 @@ class CaseSetupStage(Stage):
     # ------------------------------------------------------------------ attempts
 
     def prepare_attempt(self, ctx: StageContext, attempt_dir: Path) -> None:
-        """Copy the run's mesh-only ``case/`` into the attempt and remember what the mesh was."""
+        """Copy the run's mesh-only ``case/`` into the attempt and check the copy."""
         self._solver(self._spec(ctx))
         rel = ctx.run.relative(attempt_dir)
         source_rel = f"{CASE_NAME}/{POLYMESH_REL}"
@@ -306,7 +321,6 @@ class CaseSetupStage(Stage):
             raise ToolFailure(f"could not copy the mesh into {rel}/: {exc}") from exc
         if _changes(ctx.run.path(f"{rel}/{CASE_NAME}/{POLYMESH_REL}"), snapshot):
             raise ToolFailure(f"the copy of {source_rel} in {rel}/ differs from the original")
-        self._meshes[rel] = snapshot
 
     def extra_tools(self, ctx: StageContext, attempt_dir: Path) -> list[Tool]:
         case_rel = f"{ctx.run.relative(attempt_dir)}/{CASE_NAME}"
@@ -348,7 +362,7 @@ class CaseSetupStage(Stage):
         problem = self._mesh_problem(ctx, rel)
         if problem:
             return GateResult(False, [problem])
-        errors = self._static_problems(ctx, case_rel, solver)
+        errors, settings = self._static_problems(ctx, case_rel, solver)
         if errors:
             return GateResult(False, errors)
         response = ctx.sandbox.call(
@@ -360,7 +374,8 @@ class CaseSetupStage(Stage):
             raise _internal(response, "the trial run")
         if not response.ok:
             return GateResult(False, [_trial_failure(response, solver)])
-        return GateResult(True, [])
+        courant = self._courant_problem(response, solver, settings)
+        return GateResult(courant is None, [] if courant is None else [courant])
 
     def promote(self, ctx: StageContext, attempt_dir: Path) -> None:
         """``case/``: the attempt's case (0/, constant/ with the unchanged mesh, system/), replacing
@@ -410,26 +425,44 @@ class CaseSetupStage(Stage):
         except RunDirError:
             return False
 
-    def _mesh_problem(self, ctx: StageContext, rel: str) -> str | None:
-        """A message when the attempt's ``constant/polyMesh`` is not the mesh the attempt started
-        with, else ``None``. A missing snapshot means ``prepare_attempt`` did not run."""
-        snapshot = self._meshes.get(rel)
-        if snapshot is None:
-            raise ToolFailure(f"prepare_attempt has not run for {rel}; there is no mesh to compare")
-        differences = _changes(ctx.run.path(f"{rel}/{CASE_NAME}/{POLYMESH_REL}"), snapshot)
-        if not differences:
-            return None
-        return (
-            f"{POLYMESH_REL} in the attempt was changed ({'; '.join(differences)}). The mesh "
-            "belongs to the Mesh stage: do not edit the mesh, not even to add a file. Write only "
-            "case/0/, case/constant/ (other than polyMesh) and case/system/. The next attempt "
-            "starts again from the original mesh"
-        )
+    @staticmethod
+    def _reference_mesh(ctx: StageContext) -> _Snapshot:
+        """Size and digest of the run directory's mesh (the agent cannot write there)."""
+        source_rel = f"{CASE_NAME}/{POLYMESH_REL}"
+        source = ctx.run.path(source_rel)
+        if not source.is_dir():
+            raise ToolFailure(
+                f"{source_rel} does not exist: the Mesh stage has not produced it, so the "
+                "pipeline order is broken"
+            )
+        return _snapshot(source)
 
-    def _static_problems(self, ctx: StageContext, case_rel: str, solver: str) -> list[str]:
-        """The checks that run no solver: ``controlDict``, the dictionary syntax, the consistency
-        of the case. Stops after the first step that fails, except that all consistency problems
-        come together."""
+    def _mesh_problem(self, ctx: StageContext, rel: str) -> str | None:
+        """A message when the attempt's ``constant/polyMesh`` is not the mesh of the run directory
+        or a mesh also sits in ``0/``, else ``None``."""
+        reference = self._reference_mesh(ctx)
+        differences = _changes(ctx.run.path(f"{rel}/{CASE_NAME}/{POLYMESH_REL}"), reference)
+        if differences:
+            return (
+                f"{POLYMESH_REL} in the attempt was changed ({'; '.join(differences)}). The mesh "
+                "belongs to the Mesh stage: do not edit the mesh, not even to add a file. Write "
+                "only case/0/, case/constant/ (other than polyMesh) and case/system/. The next "
+                "attempt starts again from the original mesh"
+            )
+        if os.path.lexists(ctx.run.path(f"{rel}/{CASE_NAME}/0/polyMesh")):
+            return (
+                "case/0/polyMesh exists: OpenFOAM reads a mesh in a time directory in "
+                f"preference to {POLYMESH_REL}, so this would replace the Mesh stage's mesh. "
+                "Do not create a polyMesh directory in 0/; the next attempt starts clean"
+            )
+        return None
+
+    def _static_problems(
+        self, ctx: StageContext, case_rel: str, solver: str
+    ) -> tuple[list[str], dict]:
+        """The checks that run no solver: ``controlDict`` exists, then the dictionary syntax and
+        the consistency of the case, both run so that their problems come together. Returns the
+        problems and the time settings the consistency check reported."""
         control = f"{case_rel}/{CONTROL_DICT_REL}"
         try:
             exists = ctx.run.path(control).is_file()
@@ -440,15 +473,13 @@ class CaseSetupStage(Stage):
                 f"{CONTROL_DICT_REL} does not exist in {case_rel}/. Write it with write_file "
                 f"(path {control}): application, startFrom, startTime, endTime, deltaT and the "
                 "write settings"
-            ]
+            ], {}
         gate_s = ctx.inner_timeout(GATE_TIMEOUT_S)
         parsed = ctx.sandbox.call(
             "check_dictionaries", CheckDictionariesArgs(case_dir=case_rel), outer_timeout(gate_s)
         )
         if parsed.internal:
             raise _internal(parsed, "checking the dictionaries")
-        if not parsed.ok:
-            return _errors(parsed, "the dictionaries do not parse")
         consistent = ctx.sandbox.call(
             "check_case_consistency",
             CheckCaseConsistencyArgs(case_dir=case_rel, solver=solver),
@@ -456,9 +487,41 @@ class CaseSetupStage(Stage):
         )
         if consistent.internal:
             raise _internal(consistent, "checking the case")
+        errors = []
+        if not parsed.ok:
+            errors += _errors(parsed, "the dictionaries do not parse")
         if not consistent.ok:
-            return _errors(consistent, "the case is not consistent")
-        return []
+            errors += _errors(consistent, "the case is not consistent")
+        report = (consistent.data or {}).get("report")
+        return errors, report if isinstance(report, dict) else {}
+
+    @staticmethod
+    def _courant_problem(response: OpResponse, solver: str, settings: dict) -> str | None:
+        """A fixed time step whose trial run reached a Courant number far above what the scheme
+        tolerates. Steady solvers and an adjustable time step are not judged."""
+        courant = (response.data or {}).get("max_courant")
+        if solver not in TRANSIENT_SOLVERS or settings.get("adjust_time_step"):
+            return None
+        if isinstance(courant, bool) or not isinstance(courant, (int, float)):
+            return None
+        if courant <= TRIAL_MAX_COURANT:
+            return None
+        delta_t = settings.get("delta_t") or (response.data or {}).get("delta_t")
+        hint = ""
+        if isinstance(delta_t, (int, float)) and delta_t > 0:
+            suggested = delta_t * TRIAL_COURANT_TARGET / courant
+            hint = (
+                f" with deltaT {delta_t:g}. Lower deltaT to about {suggested:.2g} "
+                f"(= deltaT * {TRIAL_COURANT_TARGET:g} / {courant:.3g}, a Courant target of "
+                f"{TRIAL_COURANT_TARGET:g})"
+            )
+        return (
+            f"the {TRIAL_STEPS}-step trial run measured a maximum Courant number of "
+            f"{courant:.3g}{hint}. A fixed time step needs a Courant number of order 1; the "
+            f"limit of this check is {TRIAL_MAX_COURANT:g}. Recompute deltaT from the smallest "
+            "cell size and the highest velocity, or use an adjustable time step where the "
+            "solver supports it"
+        )
 
     # ------------------------------------------------------------------ the agent's tools
 
@@ -496,7 +559,7 @@ class CaseSetupStage(Stage):
         return text
 
     def _validate(self, ctx: StageContext, case_rel: str, solver: str) -> str:
-        problems = self._static_problems(ctx, case_rel, solver)
+        problems, _ = self._static_problems(ctx, case_rel, solver)
         if not problems:
             return (
                 "No problems found: every dictionary parses and the case is consistent with the "

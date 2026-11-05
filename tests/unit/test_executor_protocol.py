@@ -665,7 +665,11 @@ def _boundary_case(run, kind="empty"):
     from test_mesh_stage import boundary_text
 
     run.write_text("case/constant/polyMesh/boundary", boundary_text({"side": (kind, 4)}))
-    run.write_text("case/system/controlDict", "application icoFoam;\nstartTime 0;\nendTime 1;\n")
+    run.write_text(
+        "case/system/controlDict",
+        "application icoFoam;\nstartFrom startTime;\nstartTime 0;\nstopAt endTime;\nendTime 1;\n"
+        "deltaT 0.1;\nwriteControl timeStep;\nwriteInterval 5;\n",
+    )
     field = "boundaryField { side { type %s; } }\n"
     run.write_text("case/0/p", field % kind)
 
@@ -701,3 +705,9 @@ def test_the_solver_list_of_the_host_stage_matches_the_tool_layer():
     from cfdagent.agents.case_setup import KNOWN_SOLVERS
 
     assert set(KNOWN_SOLVERS) == set(foam.SOLVERS)
+
+
+def test_read_knowledge_refuses_an_absolute_path_with_dot_dot(run, tutorials):
+    for path in (str(tutorials) + "/../../../etc/hostname", str(tutorials) + "/flow/../.."):
+        _, answer = _call(run, "read_knowledge", {"path": path})
+        assert answer.ok is False and answer.internal is False, path

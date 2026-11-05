@@ -201,3 +201,7 @@ def test_knowledge_ops_search_and_read_the_installed_tutorials(job):
     assert text.ok and "FoamFile" in text.data["text"]
     outside = client.call("read_knowledge", {"path": "../../etc/passwd"}, timeout_s=120)
     assert outside.ok is False and outside.internal is False
+    root = os.environ["FOAM_TUTORIALS"]
+    for path in (root + "/../../../../../etc/hostname", root + "/../.."):
+        escaped = client.call("read_knowledge", {"path": path}, timeout_s=120)
+        assert escaped.ok is False and escaped.internal is False, path

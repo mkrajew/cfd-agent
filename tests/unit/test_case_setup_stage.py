@@ -4,6 +4,7 @@ The case files are the hand-written dictionaries of ``tests/fixtures/handwritten
 (a fixture, not source) with a generated ``constant/polyMesh/boundary``.
 """
 
+import json
 import shutil
 from pathlib import Path
 
@@ -254,7 +255,14 @@ POLYMESH_FILES = {
     "neighbour": "neighbour of the mesh\n",
 }
 DICTIONARIES_OK = OpResponse(ok=True, data={"errors": [], "checked": 6})
-CONSISTENT = OpResponse(ok=True, data={"ok": True, "errors": [], "report": {"patches": {}}})
+
+
+def consistent(adjust=False, delta_t=0.005):
+    report = {"patches": {}, "adjust_time_step": adjust, "delta_t": delta_t}
+    return OpResponse(ok=True, data={"ok": True, "errors": [], "report": report})
+
+
+CONSISTENT = consistent()
 TRIAL_OK = OpResponse(ok=True, data={"completed": True, "end_time": 0.015, "last_step": 3})
 
 
@@ -392,11 +400,17 @@ def test_case_setup_rejects_missing_controldict_without_a_sandbox_call(tmp_path)
     assert setup.calls() == []
 
 
-def test_a_dictionary_that_does_not_parse_stops_the_gate(tmp_path):
-    setup = Setup(tmp_path, dictionaries=failed("system/fvSchemes cannot be parsed:\nbad brace"))
+def test_syntax_and_consistency_problems_are_reported_together_and_the_trial_is_skipped(tmp_path):
+    setup = Setup(
+        tmp_path,
+        dictionaries=failed("system/fvSchemes cannot be parsed:\nbad brace"),
+        consistency=failed("0/p has no entry for patch `a`"),
+    )
     result = setup.gate()
-    assert not result.ok and "system/fvSchemes cannot be parsed" in result.errors[0]
-    assert setup.calls() == ["check_dictionaries"]
+    assert not result.ok
+    assert "system/fvSchemes cannot be parsed" in result.errors[0]
+    assert "0/p has no entry for patch `a`" in result.errors[-1]
+    assert setup.calls() == ["check_dictionaries", "check_case_consistency"]
 
 
 def test_every_consistency_problem_is_reported_at_once_and_the_trial_is_skipped(tmp_path):
@@ -509,13 +523,13 @@ def test_an_unchanged_mesh_passes_the_comparison(tmp_path):
     assert result.ok, result.errors
 
 
-def test_the_mesh_comparison_is_made_with_what_was_read_before_the_agent_worked(tmp_path):
+def test_any_stage_instance_can_gate_an_attempt_prepared_by_another(tmp_path):
     setup = Setup(tmp_path)
-    setup.prepare()
+    attempt = setup.prepare()
     write_case(setup.ctx)
-    # The run's own copy of the mesh changing later does not make the attempt's copy "wrong".
-    (setup.ctx.run.root / "case" / "constant" / "polyMesh" / "points").write_bytes(b"new\n")
-    assert setup.stage.execute_and_gate(setup.ctx, setup.attempt).ok
+    assert CaseSetupStage().execute_and_gate(setup.ctx, attempt).ok  # no state on the instance
+    (attempt / "case" / "constant" / "polyMesh" / "points").write_bytes(b"edited\n")
+    assert not CaseSetupStage().execute_and_gate(setup.ctx, attempt).ok
 
 
 def test_the_mesh_is_read_with_a_size_limit(tmp_path, monkeypatch):
@@ -527,11 +541,12 @@ def test_the_mesh_is_read_with_a_size_limit(tmp_path, monkeypatch):
         setup.prepare()
 
 
-def test_a_gate_run_without_prepare_is_a_pipeline_error(tmp_path):
+def test_a_gate_run_without_the_run_mesh_is_a_pipeline_error(tmp_path):
     setup = Setup(tmp_path)
-    attempt = setup.ctx.run.attempt_dir("case_setup", 1)
+    attempt = setup.prepare()
     write_case(setup.ctx)
-    with pytest.raises(ToolFailure, match="prepare"):
+    shutil.rmtree(setup.ctx.run.root / "case")
+    with pytest.raises(ToolFailure, match="case/constant/polyMesh"):
         setup.stage.execute_and_gate(setup.ctx, attempt)
 
 
@@ -747,7 +762,7 @@ def test_validate_dictionaries_reports_parse_and_consistency_problems(tmp_path):
     write_case(unparsed.ctx)
     out = registry.dispatch(call("validate_dictionaries"))
     assert "system/fvSchemes cannot be parsed" in out
-    assert unparsed.calls() == ["check_dictionaries"]
+    assert unparsed.calls() == ["check_dictionaries", "check_case_consistency"]
 
 
 def test_validate_dictionaries_without_a_control_dict_says_so(tmp_path):
@@ -790,3 +805,305 @@ def test_run_stage_with_a_scripted_agent_promotes_the_case(tmp_path):
     points = ctx.run.root / "case" / "constant" / "polyMesh" / "points"
     assert points.read_bytes() == POLYMESH_FILES["points"].encode()
     assert [a.ok for a in ctx.record.stages[0].attempts] == [True]
+
+
+# ------------------------------------------------------------------ fix round 1: the checker
+
+
+def write_field(case, rel, body, kind="volScalarField"):
+    head = f"FoamFile {{ version 2.0; format ascii; class {kind}; object f; }}\n"
+    (case / rel).write_bytes((head + "dimensions [0 0 0 0 0 0 0];\n" + body).encode("utf-8"))
+
+
+def test_a_wildcard_with_constraint_types_included_is_accepted(tmp_path):
+    case = make_case(tmp_path)
+    write_field(
+        case,
+        "0/p",
+        "internalField uniform 0;\nboundaryField\n{\n"
+        "    movingWall { type zeroGradient; }\n"
+        '    ".*" { type zeroGradient; }\n'
+        '    #includeEtc "caseDicts/setConstraintTypes"\n}\n',
+    )
+    assert errors_of(case) == []
+
+
+def test_entries_are_looked_up_in_openfoam_order_exact_group_then_regex(tmp_path):
+    case = make_case(tmp_path)
+    write_field(
+        case,
+        "0/p",
+        "internalField uniform 0;\nboundaryField\n{\n"
+        "    movingWall { type zeroGradient; }\n"
+        "    empty { type empty; }\n"
+        '    ".*" { type zeroGradient; }\n}\n',
+    )
+    assert errors_of(case) == []
+
+
+def test_an_exact_entry_beats_a_later_regular_expression(tmp_path):
+    case = make_case(tmp_path)
+    body = (
+        "internalField uniform 0;\nboundaryField\n{\n"
+        "    frontAndBack { type empty; }\n"
+        '    ".*" { type zeroGradient; }\n}\n'
+    )
+    write_field(case, "0/p", body)
+    assert errors_of(case) == []
+
+
+def test_the_type_of_an_empty_patch_is_never_judged_from_a_regular_expression(tmp_path):
+    case = make_case(tmp_path)
+    write_field(
+        case,
+        "0/p",
+        'internalField uniform 0;\nboundaryField\n{\n    ".*" { type zeroGradient; }\n}\n',
+    )
+    assert errors_of(case) == []
+
+
+def test_a_regular_expression_is_still_judged_for_a_wedge_patch_without_includes(tmp_path):
+    case = make_case(tmp_path, {"inlet": ("patch", 4), "side": ("wedge", 8)})
+    for rel in ("0/U", "0/p"):
+        write_field(
+            case,
+            rel,
+            'internalField uniform 0;\nboundaryField\n{\n    ".*" { type zeroGradient; }\n}\n',
+        )
+    errors = errors_of(case)
+    assert errors and all("side" in e and "wedge" in e for e in errors)
+
+
+def test_the_missing_entry_message_says_the_pipeline_requires_it(tmp_path):
+    case = make_case(tmp_path)
+    edit(case, "0/p", "    frontAndBack\n    {\n        type            empty;\n    }\n", "")
+    (message,) = errors_of(case)
+    assert "this pipeline requires" in message.lower() and "frontAndBack" in message
+    assert "OpenFOAM requires an entry" not in message
+
+
+def test_point_fields_are_not_judged_with_the_volume_field_rules(tmp_path):
+    case = make_case(tmp_path)
+    write_field(
+        case,
+        "0/pointDisplacement",
+        "internalField uniform (0 0 0);\nboundaryField\n{\n    movingWall {type fixed;}\n}\n",
+        kind="pointVectorField",
+    )
+    result = check_case_consistency(case, "icoFoam")
+    assert result.ok, result.errors
+    assert "pointDisplacement" not in result.data["fields"]
+
+
+CONTROL_BASE = "endTime         40;"
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "needle"),
+    [
+        ("writeControl    timeStep;", "writeControl    writeTime;", "function objects"),
+        ("writeControl    timeStep;", "writeControl    clockTime;", "writeControl"),
+        ("writeControl    timeStep;", "writeControl    none;", "writeControl"),
+        ("writeInterval   1000;", "writeInterval   0.1;", "writeInterval"),
+        ("writeInterval   1000;", "writeInterval   0;", "writeInterval"),
+        ("writeInterval   1000;", "writeInterval   -5;", "writeInterval"),
+        ("writeInterval   1000;", "writeInterval   100000;", "write time"),
+        ("startFrom       startTime;", "startFrom       sometime;", "startFrom"),
+        ("stopAt          endTime;", "stopAt          never;", "stopAt"),
+        ("writeFormat     ascii;", "writeFormat     binary;", "ascii"),
+        ("writeCompression off;", "writeCompression on;", "writeCompression"),
+    ],
+)
+def test_control_dict_keys_that_the_trial_run_overwrites_are_validated(tmp_path, old, new, needle):
+    case = make_case(tmp_path)
+    edit(case, "system/controlDict", old, new)
+    errors = errors_of(case)
+    assert len(errors) == 1, errors
+    assert "system/controlDict" in errors[0] and needle in errors[0]
+
+
+def test_run_time_write_controls_need_a_write_time_before_the_end(tmp_path):
+    for control, interval, ok in (
+        ("runTime", "5", True),
+        ("runTime", "50", False),
+        ("adjustableRunTime", "10", True),
+        ("adjustableRunTime", "41", False),
+        ("adjustable", "10", True),
+    ):
+        case = make_case(tmp_path, name=f"case-{control}-{interval}")
+        edit(case, "system/controlDict", "writeControl    timeStep;", f"writeControl {control};")
+        edit(case, "system/controlDict", "writeInterval   1000;", f"writeInterval {interval};")
+        assert (errors_of(case) == []) == ok, (control, interval)
+
+
+def test_missing_control_dict_keys_are_reported_unless_an_include_may_supply_them(tmp_path):
+    case = make_case(tmp_path)
+    edit(case, "system/controlDict", "startFrom       startTime;\n", "")
+    edit(case, "system/controlDict", "stopAt          endTime;\n", "")
+    edit(case, "system/controlDict", "writeInterval   1000;\n", "")
+    errors = errors_of(case)
+    assert any("startFrom" in e for e in errors)
+    assert any("stopAt" in e for e in errors)
+    assert any("writeInterval" in e for e in errors)
+
+    other = make_case(tmp_path, name="other")
+    (other / "system" / "controlDict").write_bytes(
+        b"FoamFile { version 2.0; format ascii; class dictionary; object controlDict; }\n"
+        b'#include "timeSettings"\napplication icoFoam;\n'
+    )
+    assert errors_of(other) == []  # nothing is judged missing; what is there is right
+    (other / "system" / "controlDict").write_bytes(
+        b"FoamFile { version 2.0; format ascii; class dictionary; object controlDict; }\n"
+        b'#include "timeSettings"\napplication pimpleFoam;\n'
+    )
+    assert any("application" in e for e in errors_of(other))
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("", False),
+        ("adjustTimeStep yes;\n", True),
+        ("adjustTimeStep on;\n", True),
+        ("adjustTimeStep no;\n", False),
+        ("adjustTimeStep true;\n", True),
+    ],
+)
+def test_the_report_carries_the_time_step_settings(tmp_path, line, expected):
+    case = make_case(tmp_path)
+    edit(case, "system/controlDict", "deltaT          0.005;", "deltaT          0.005;\n" + line)
+    data = check_case_consistency(case, "icoFoam").data
+    assert data["adjust_time_step"] is expected
+    assert data["delta_t"] == 0.005
+
+
+# ------------------------------------------------------------------ fix round 1: the stage
+
+
+def trial_with(courant):
+    return OpResponse(
+        ok=True, data={"completed": True, "max_courant": courant, "delta_t": 0.005, "last_step": 3}
+    )
+
+
+def test_a_fixed_time_step_far_above_the_courant_limit_fails_the_gate(tmp_path):
+    setup = Setup(tmp_path, trial=trial_with(50.0))
+    result = setup.gate()
+    assert not result.ok
+    text = "\n".join(result.errors)
+    assert "50" in text and "Courant" in text and "0.005" in text
+    assert "5e-05" in text or "0.00005" in text  # deltaT * 0.5 / 50
+    assert "0.5" in text
+    assert setup.calls()[-1] == "trial_run"
+
+
+@pytest.mark.parametrize("solver", ["icoFoam", "pimpleFoam"])
+def test_the_courant_limit_is_exceeded_only_above_ten(tmp_path, solver):
+    from cfdagent.agents.case_setup import TRIAL_MAX_COURANT
+
+    assert TRIAL_MAX_COURANT == 10
+    assert Setup(tmp_path / "a", solver=solver, trial=trial_with(10.0)).gate().ok
+    assert Setup(tmp_path / "b", solver=solver, trial=trial_with(0.3)).gate().ok
+    assert Setup(tmp_path / "c", solver=solver, trial=trial_with(None)).gate().ok
+    assert not Setup(tmp_path / "d", solver=solver, trial=trial_with(10.01)).gate().ok
+
+
+def test_the_courant_gate_is_skipped_with_an_adjustable_time_step_and_for_steady_solvers(tmp_path):
+    adjustable = Setup(
+        tmp_path / "a",
+        solver="pimpleFoam",
+        consistency=consistent(adjust=True),
+        trial=trial_with(80),
+    )
+    assert adjustable.gate().ok
+    steady = Setup(tmp_path / "b", solver="simpleFoam", trial=trial_with(80.0))
+    assert steady.gate().ok
+
+
+def test_a_directory_polymesh_under_0_fails_the_gate(tmp_path):
+    setup = Setup(tmp_path)
+    setup.prepare()
+    write_case(setup.ctx)
+    shadow = setup.attempt / "case" / "0" / "polyMesh"
+    shadow.mkdir()
+    (shadow / "points").write_bytes(b"shadow mesh\n")
+    result = setup.stage.execute_and_gate(setup.ctx, setup.attempt)
+    assert not result.ok and "0/polyMesh" in result.errors[0]
+    assert setup.calls() == []
+    scope = CaseSetupStage.scope
+    assert not scope.can_write(f"{CASE}/0/polyMesh/points")
+    assert not scope.can_write(f"{CASE}/0/polyMesh")
+    assert scope.can_write(f"{CASE}/0/U")
+
+
+def test_the_mesh_logs_of_the_mesh_stage_are_readable_and_named_to_the_agent(tmp_path):
+    scope = CaseSetupStage.scope
+    assert scope.can_read("mesh/mesh.log") and scope.can_read("mesh/case/checkMesh.log")
+    assert not scope.can_read("mesh/mesh.py")
+    setup = Setup(tmp_path)
+    text = setup.stage.opening_message(setup.ctx)
+    assert "mesh/mesh.log" in text and "mesh/case/checkMesh.log" in text
+    assert "mesh/mesh.log" in setup.stage.system_prompt()
+    assert "checkMesh.log" in setup.stage.system_prompt()
+
+
+def test_the_mesh_size_cap_allows_the_largest_mesh_a_run_may_have():
+    import cfdagent.agents.case_setup as module
+    from cfdagent.config import RunConfig
+
+    max_cells = RunConfig.default().limits.max_cells
+    assert module.POLYMESH_MAX_BYTES >= 1 << 30
+    assert module.POLYMESH_MAX_BYTES >= 400 * max_cells  # an ascii polyMesh is ~170 bytes/cell
+
+
+def test_a_huge_trial_failure_message_stays_small(tmp_path):
+    trial = OpResponse(
+        ok=False,
+        data={"tail": "t" * 20000, "fatal_error": "f" * 20000},
+        error="h" * 20000 + "\n" + "t" * 20000,
+    )
+    result = Setup(tmp_path, trial=trial).gate()
+    assert not result.ok
+    assert len("\n".join(result.errors).encode("utf-8")) <= 4000
+
+
+def test_the_scripted_cavity_fixture_matches_the_handwritten_dictionaries():
+    steps = json.loads((FIXTURES / "scripted" / "case_setup_ok.json").read_text(encoding="utf-8"))
+    written = {}
+    for step in steps:
+        for tool_call in step["tool_calls"]:
+            if tool_call["name"] == "write_file":
+                path = tool_call["arguments"]["path"].removeprefix("attempts/case_setup-1/case/")
+                written[path] = tool_call["arguments"]["content"]
+    on_disk = {
+        path.relative_to(CASE_FIXTURE).as_posix(): path.read_bytes().decode("utf-8")
+        for path in CASE_FIXTURE.rglob("*")
+        if path.is_file()
+    }
+    assert written == on_disk
+
+
+def test_prompt_carries_the_rules_of_fix_round_1():
+    lowered = load_prompt("case_setup").text.lower()
+    for needle in (
+        "`writetime` is valid only inside function objects",
+        "mesh/mesh.log",
+        "mesh/case/checkmesh.log",
+        "dropped without any message",
+        "cos(a/2)",
+        "sagitta",
+        "`axis`",
+        "`npoints`",
+        "cuttingplane",
+        "sampledsurface",
+        "cofr",
+        "0.orig",
+        "limitedlinearv",
+        "named exactly",
+        "noutercorrectors",
+        "round-off",
+        "perturbation",
+        "0.16",
+        "starting from",
+    ):
+        assert needle in lowered, needle

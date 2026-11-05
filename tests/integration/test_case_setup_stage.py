@@ -378,3 +378,41 @@ def test_a_laminar_pimple_case_with_wall_shear_stress_runs_in_the_trial(tmp_path
     )
     outcome = run_case_setup(ctx, first, extra, check_step(1))
     assert outcome.ok, ctx.record.stages[2].attempts[0].errors
+
+
+def test_a_fixed_time_step_with_a_huge_courant_number_is_rejected_by_the_trial_gate(tmp_path):
+    ctx = pipeline(tmp_path)
+
+    def big_step(text):
+        changed = text.replace("deltaT          0.005;", "deltaT          0.5;")
+        return changed.replace("writeInterval   1000;", "writeInterval   10;")
+
+    outcome = run_case_setup(
+        ctx,
+        write_case_step(1, {"system/controlDict": big_step}),
+        check_step(1),
+        write_case_step(2),
+        check_step(2),
+    )
+    assert outcome.ok and outcome.attempts == 2
+    errors = "\n".join(ctx.record.stages[2].attempts[0].errors)
+    assert "Courant number of" in errors and "deltaT 0.5" in errors and "about" in errors
+
+
+def test_run_settings_that_the_trial_overwrites_are_rejected_before_the_trial(tmp_path):
+    ctx = pipeline(tmp_path)
+
+    def bad_write(text):
+        return text.replace("writeControl    timeStep;", "writeControl    writeTime;")
+
+    outcome = run_case_setup(
+        ctx,
+        write_case_step(1, {"system/controlDict": bad_write}),
+        check_step(1),
+        write_case_step(2),
+        check_step(2),
+    )
+    assert outcome.ok and outcome.attempts == 2
+    errors = ctx.record.stages[2].attempts[0].errors
+    assert any("writeTime" in e and "function objects" in e for e in errors)
+    assert not any("trial run" in e for e in errors)

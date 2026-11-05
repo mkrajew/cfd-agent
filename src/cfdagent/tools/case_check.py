@@ -153,51 +153,63 @@ def _mesh_patches(case_dir: Path) -> tuple[dict[str, tuple[str, list[str]]], lis
     return patches, []
 
 
-def _find_entry(boundary_field: Dictionary, patch: str, groups: list[str]) -> tuple[Any, bool]:
-    """The entry that applies to ``patch`` and whether a regular expression was too complex to
-    try. OpenFOAM tries the exact name first, then the patterns and groups, last written first."""
+def _find_entry(
+    boundary_field: Dictionary, patch: str, groups: list[str]
+) -> tuple[Any, str | None, bool]:
+    """The entry that applies to ``patch``, how it was found (``exact``, ``group``, ``regex`` or
+    ``None``) and whether a regular expression was too complex to try.
+
+    OpenFOAM's order: the exact patch name; then the patch groups, the last written first; then
+    the regular expressions, the last written first.
+    """
     if isinstance(boundary_field.get(patch), dict):
-        return boundary_field[patch], False
+        return boundary_field[patch], "exact", False
+    keys = [
+        key
+        for key in reversed(list(boundary_field))
+        if key != DIRECTIVES and isinstance(boundary_field[key], dict)
+    ]
+    for key in keys:
+        if not key.startswith('"') and key in groups:
+            return boundary_field[key], "group", False
     too_complex = False
-    for key in reversed(list(boundary_field)):
-        entry = boundary_field[key]
-        if key == DIRECTIVES or not isinstance(entry, dict):
+    for key in keys:
+        if not key.startswith('"'):
             continue
-        if key.startswith('"'):
-            pattern = _unquote(key)
-            if len(pattern) > MAX_REGEX_CHARS or _NESTED_QUANTIFIER.search(pattern):
-                too_complex = True
-                continue
-            try:
-                if re.fullmatch(pattern, patch):
-                    return entry, too_complex
-            except re.error:
-                continue
-        elif key in groups:
-            return entry, too_complex
-    return None, too_complex
+        pattern = _unquote(key)
+        if len(pattern) > MAX_REGEX_CHARS or _NESTED_QUANTIFIER.search(pattern):
+            too_complex = True
+            continue
+        try:
+            if re.fullmatch(pattern, patch):
+                return boundary_field[key], "regex", too_complex
+        except re.error:
+            continue
+    return None, None, too_complex
 
 
 def _field_problems(
     name: str, boundary_field: Dictionary, patches: dict[str, tuple[str, list[str]]]
 ) -> list[str]:
     problems = []
-    opaque = DIRECTIVES in boundary_field  # an #include may supply entries we cannot see
+    opaque = DIRECTIVES in boundary_field  # an #include may supply or override entries
     for patch, (patch_type, groups) in patches.items():
-        entry, too_complex = _find_entry(boundary_field, patch, groups)
+        entry, how, too_complex = _find_entry(boundary_field, patch, groups)
         if entry is None:
             if not opaque and not too_complex:
                 hint = (
-                    f"; a {patch_type} patch needs `type {patch_type};`"
+                    f"; a {patch_type} patch is written as `type {patch_type};`"
                     if patch_type in CONSTRAINT_TYPES
                     else ""
                 )
                 problems.append(
                     f"0/{name} has no entry for patch `{patch}` (type {patch_type}) in "
-                    f"boundaryField{hint}. Every patch of constant/polyMesh/boundary needs an "
-                    "entry in every field file"
+                    f"boundaryField{hint}. This pipeline requires an entry for every patch of "
+                    "constant/polyMesh/boundary in every field file"
                 )
             continue
+        if how == "regex" and (opaque or patch_type == "empty"):
+            continue  # a wildcard: OpenFOAM fixes the type of an empty patch itself
         found = _entry_type(entry)
         if patch_type in CONSTRAINT_TYPES and found is not None and found != patch_type:
             problems.append(
@@ -224,45 +236,149 @@ def _number(entry: Any) -> float | None:
     return None
 
 
-def _control_problems(case_dir: Path, solver: str, skipped: list[str]) -> list[str]:
+START_FROM = ("firstTime", "startTime", "latestTime")
+STOP_AT = ("endTime", "noWriteNow", "writeNow", "nextWrite")
+WRITE_CONTROLS = ("timeStep", "runTime", "adjustableRunTime", "adjustable")
+_OFF = frozenset({"off", "no", "false", "none", "n", "f", "0"})
+_ON = frozenset({"yes", "on", "true", "y", "t", "1"})
+_CONTROL = "system/controlDict"
+
+
+def _word(entry: Any) -> str | None:
+    return _unquote(entry[0]) if isinstance(entry, list) and entry else None
+
+
+def _choice(control: Dictionary, key: str, allowed: tuple[str, ...], opaque: bool):
+    """The word of ``key`` and a problem text: the key is missing (unless an include may supply
+    it) or its word is not one of ``allowed``."""
+    entry = control.get(key)
+    if entry is None:
+        if opaque:
+            return None, None
+        return None, f"{_CONTROL} has no `{key}`; set `{key} {allowed[0]};`"
+    word = _word(entry)
+    if word is not None and word not in allowed:
+        return word, f"{_CONTROL} has {key} `{word}`; it must be one of {', '.join(allowed)}"
+    return word, None
+
+
+def _write_problems(control: Dictionary, opaque: bool, start: float | None, end: float | None):
+    problems = []
+    write_control = _word(control.get("writeControl"))
+    if write_control is None:
+        write_control = "timeStep"  # OpenFOAM's default, and what an include may replace
+    elif write_control not in WRITE_CONTROLS:
+        extra = (
+            ". `writeTime` is valid only inside function objects, not as the run's writeControl"
+            if write_control == "writeTime"
+            else ""
+        )
+        _, problem = _choice(control, "writeControl", WRITE_CONTROLS, True)
+        problems.append(f"{problem}{extra}")
+        write_control = None
+    interval_entry = control.get("writeInterval")
+    if interval_entry is None:
+        if not opaque:
+            problems.append(
+                f"{_CONTROL} has no `writeInterval`; this pipeline requires it (steps for "
+                "timeStep, seconds for runTime and adjustableRunTime)"
+            )
+        return problems
+    interval = _number(interval_entry)
+    if interval is None or write_control is None:
+        return problems
+    if interval <= 0 or (write_control == "timeStep" and not float(interval).is_integer()):
+        need = "an integer of at least 1" if write_control == "timeStep" else "above 0"
+        problems.append(
+            f"{_CONTROL} has writeInterval {interval:g}; with {write_control} it must be {need}"
+        )
+        return problems
+    delta_t = _number(control.get("deltaT"))
+    if write_control == "timeStep":
+        step = interval * delta_t if delta_t and delta_t > 0 else None
+    else:
+        step = interval
+    span = None if start is None or end is None else end - start
+    if step is not None and span is not None and span > 0 and step > span:
+        problems.append(
+            f"{_CONTROL}: writeInterval {interval:g} with {write_control} gives the first write "
+            f"time after {step:g}, beyond the run length {span:g}; the run would write no result. "
+            "Choose a smaller writeInterval"
+        )
+    return problems
+
+
+def _format_problems(control: Dictionary) -> list[str]:
+    problems = []
+    write_format = _word(control.get("writeFormat"))
+    if write_format is not None and write_format != "ascii":
+        problems.append(
+            f"{_CONTROL} has writeFormat `{write_format}`; use `writeFormat ascii;` so that the "
+            "results can be read by the analysis"
+        )
+    compression = _word(control.get("writeCompression"))
+    if compression is not None and compression.lower() not in _OFF:
+        problems.append(
+            f"{_CONTROL} has writeCompression `{compression}`; use `writeCompression off;`"
+        )
+    return problems
+
+
+def _control_problems(
+    case_dir: Path, solver: str, skipped: list[str]
+) -> tuple[list[str], dict[str, Any]]:
+    """Problems of ``system/controlDict`` and its time settings (``adjust_time_step``,
+    ``delta_t``). A key that an ``#include`` or directive may supply is not reported missing."""
+    settings: dict[str, Any] = {"adjust_time_step": False, "delta_t": None}
     path = case_dir / "system" / "controlDict"
     if not path.is_file():
-        return ["system/controlDict does not exist; write it (application, time controls)"]
-    control = _read(path, "system/controlDict", skipped)
+        return [f"{_CONTROL} does not exist; write it (application, time controls)"], settings
+    control = _read(path, _CONTROL, skipped)
     if control is None:
-        return []
+        return [], settings
+    opaque = DIRECTIVES in control
     problems = []
     application = control.get("application")
     if not isinstance(application, list) or not application:
-        problems.append(
-            f"system/controlDict has no `application`; set `application {solver};`, the solver "
-            "this run uses"
-        )
+        if not opaque:
+            problems.append(
+                f"{_CONTROL} has no `application`; set `application {solver};`, the solver "
+                "this run uses"
+            )
     elif _unquote(application[0]) != solver:
         problems.append(
-            f"system/controlDict has application `{_unquote(application[0])}` but this run uses "
+            f"{_CONTROL} has application `{_unquote(application[0])}` but this run uses "
             f"the solver `{solver}` (the plan's suggested solver); set `application {solver};`"
         )
     start, end = control.get("startTime"), control.get("endTime")
-    if start is None:
-        problems.append("system/controlDict has no `startTime`; set `startTime 0;` or the start")
-    if end is None:
-        problems.append("system/controlDict has no `endTime`; set the time the run must reach")
+    if start is None and not opaque:
+        problems.append(f"{_CONTROL} has no `startTime`; set `startTime 0;` or the start")
+    if end is None and not opaque:
+        problems.append(f"{_CONTROL} has no `endTime`; set the time the run must reach")
     start_value, end_value = _number(start), _number(end)
     if start_value is not None and end_value is not None and end_value <= start_value:
         problems.append(
-            f"system/controlDict has endTime {end_value:g} which is not above startTime "
+            f"{_CONTROL} has endTime {end_value:g} which is not above startTime "
             f"{start_value:g}; the run would do nothing. Set endTime to the time the run must "
             "reach (iterations for a steady solver)"
         )
-    return problems
+    for key, allowed in (("startFrom", START_FROM), ("stopAt", STOP_AT)):
+        problem = _choice(control, key, allowed, opaque)[1]
+        if problem:
+            problems.append(problem)
+    problems += _write_problems(control, opaque, start_value, end_value)
+    problems += _format_problems(control)
+    settings["adjust_time_step"] = (_word(control.get("adjustTimeStep")) or "").lower() in _ON
+    settings["delta_t"] = _number(control.get("deltaT"))
+    return problems, settings
 
 
 def check_case_consistency(case_dir: Path, solver: str) -> GateResult:
     """Check the case in ``case_dir`` as described in the module docstring.
 
-    ``data`` holds ``patches`` (name -> type from the mesh), ``fields`` (the field files judged)
-    and ``skipped`` (what could not be read, with the reason).
+    ``data`` holds ``patches`` (name -> type from the mesh), ``fields`` (the field files judged),
+    ``skipped`` (what could not be read, with the reason) and the time settings the stage needs:
+    ``adjust_time_step`` (bool) and ``delta_t`` (float or ``None``).
     """
     case_dir = Path(case_dir)
     skipped: list[str] = []
@@ -270,11 +386,13 @@ def check_case_consistency(case_dir: Path, solver: str) -> GateResult:
     fields: list[str] = []
     if patches:
         problems += _field_files(case_dir, patches, fields, skipped)
-    problems += _control_problems(case_dir, solver, skipped)
+    control_problems, settings = _control_problems(case_dir, solver, skipped)
+    problems += control_problems
     data = {
         "patches": {name: kind for name, (kind, _groups_) in patches.items()},
         "fields": fields,
         "skipped": skipped,
+        **settings,
     }
     return GateResult(not problems, problems, data=data)
 
@@ -305,6 +423,9 @@ def _field_files(
         boundary_field = parsed.get("boundaryField") if parsed is not None else None
         if not isinstance(boundary_field, dict):
             continue  # not a field file (or not readable: already in ``skipped``)
+        header = parsed.get("FoamFile") if parsed is not None else None
+        if isinstance(header, dict) and (_word(header.get("class")) or "").startswith("point"):
+            continue  # a point field has its own patch rules; the volume rules do not apply
         fields.append(entry.name)
         problems += _field_problems(entry.name, boundary_field, patches)
     if not fields and not skipped:

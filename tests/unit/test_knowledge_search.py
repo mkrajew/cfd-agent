@@ -170,3 +170,51 @@ def test_read_tutorial_refuses_binary_and_missing_and_lists_directories(tutorial
     assert read_tutorial("dir", tutorials).splitlines() == ["a/", "b"]
     with pytest.raises(ValueError):
         read_tutorial("dir/b", tutorials, max_bytes=0)
+
+
+# ------------------------------------------------------------------ fix round 1
+
+
+def test_read_tutorial_refuses_dot_dot_after_an_absolute_prefix(tutorials, tmp_path):
+    write(tutorials, "ok/dict", "fine\n")
+    (tmp_path / "secret").write_bytes(b"hidden\n")
+    base = str(tutorials)
+    for bad in (
+        base + "/../secret",
+        base + "/ok/../../secret",
+        base + "/../../../../../../../../etc/hostname",
+        base + "/..",
+        "/ok/../../secret",
+    ):
+        with pytest.raises(AgentInputError):
+            read_tutorial(bad, tutorials)
+    # A dot-dot that stays inside is refused too: the rule is "no `..` at all".
+    with pytest.raises(AgentInputError):
+        read_tutorial(base + "/ok/../ok/dict", tutorials)
+
+
+def test_read_tutorial_checks_the_real_path_as_defence_in_depth(tutorials, tmp_path, monkeypatch):
+    import cfdagent.knowledge.search as module
+
+    write(tutorials, "ok/dict", "fine\n")
+    monkeypatch.setattr(module, "_parts_below", lambda path, root: ["..", "secret"])
+    (tmp_path / "secret").write_bytes(b"hidden\n")
+    with pytest.raises(AgentInputError, match="outside"):
+        read_tutorial("anything", tutorials)
+
+
+def test_validation_directories_and_plot_files_are_not_searched_or_readable(tutorials):
+    write(tutorials, "case/system/controlDict", "needle\n")
+    write(tutorials, "case/validation/Data/profile.dat", "needle\n")
+    write(tutorials, "case/Validation/x", "needle\n")
+    write(tutorials, "case/plotResults", "needle\n")
+    write(tutorials, "case/Plot.gp", "needle\n")
+    write(tutorials, "case/plain/notplot", "needle\n")
+    paths = [h.path for h in search_tutorials("needle", tutorials)]
+    assert paths == ["case/plain/notplot", "case/system/controlDict"]
+    for hidden in ("case/validation/Data/profile.dat", "case/plotResults", "case/Plot.gp"):
+        with pytest.raises(AgentInputError, match="not available"):
+            read_tutorial(hidden, tutorials)
+    assert read_tutorial("case", tutorials).splitlines() == ["plain/", "system/"]
+    with pytest.raises(AgentInputError):
+        read_tutorial("case/validation", tutorials)

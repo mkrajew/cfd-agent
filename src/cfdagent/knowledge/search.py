@@ -85,8 +85,11 @@ def _files(root: Path):
                 if entry.is_symlink() or os.path.isjunction(entry.path):
                     continue
                 if entry.is_dir(follow_symlinks=False):
-                    subdirectories.append(Path(entry.path))
+                    if not _excluded_name(entry.name, True):
+                        subdirectories.append(Path(entry.path))
                 elif entry.is_file(follow_symlinks=False):
+                    if _excluded_name(entry.name, False):
+                        continue
                     count += 1
                     if count > MAX_FILES:
                         return
@@ -158,19 +161,30 @@ def _parts_below(path: str, root: Path) -> list[str]:
     if PurePath(path).is_absolute() or path.startswith(_SEPARATORS):
         for base in (root, Path(os.path.abspath(root))):
             try:
-                return list(Path(path).relative_to(base).parts)
+                parts = list(Path(path).relative_to(base).parts)
             except ValueError:
                 continue
-        raise AgentInputError(
-            "the path is outside the tutorial directory; use a path relative to it, as the "
-            "search results show them"
-        )
-    if chr(92) in path:
-        raise AgentInputError("use '/' as the path separator")
-    parts = [p for p in path.split("/") if p not in ("", ".")]
+            break
+        else:
+            raise AgentInputError(
+                "the path is outside the tutorial directory; use a path relative to it, as the "
+                "search results show them"
+            )
+    else:
+        if chr(92) in path:
+            raise AgentInputError("use '/' as the path separator")
+        parts = path.split("/")
+    parts = [p for p in parts if p not in ("", ".")]
     if ".." in parts:
         raise AgentInputError("the path must stay inside the tutorial directory (no '..')")
     return parts
+
+
+def _excluded_name(name: str, is_dir: bool) -> bool:
+    """Experimental data and plotting scripts are not set-up knowledge: directories named
+    ``validation`` and files whose name starts with ``plot`` are neither searched nor read."""
+    lowered = name.lower()
+    return lowered == "validation" if is_dir else lowered.startswith("plot")
 
 
 def _listing(directory: str) -> str:
@@ -182,8 +196,10 @@ def _listing(directory: str) -> str:
     for entry in entries:
         if entry.is_symlink() or os.path.isjunction(entry.path):
             continue
-        suffix = "/" if entry.is_dir(follow_symlinks=False) else ""
-        lines.append(entry.name + suffix)
+        is_dir = entry.is_dir(follow_symlinks=False)
+        if _excluded_name(entry.name, is_dir):
+            continue
+        lines.append(entry.name + ("/" if is_dir else ""))
     shown = lines[:MAX_LISTING_ENTRIES]
     if len(lines) > len(shown):
         shown.append(f"[{len(lines) - len(shown)} more entries not shown]")
@@ -203,6 +219,17 @@ def read_tutorial(path: str, root: Path, max_bytes: int = 20000) -> str:
         current = os.path.join(current, part)
         if _is_link(current):
             raise AgentInputError(f"{path!r} goes through a symbolic link, which is not followed")
+    # Defence in depth: whatever the path text was, the file must really lie below the root.
+    real = os.path.realpath(current)
+    if real != str(base) and os.path.commonpath([str(base), real]) != str(base):
+        raise AgentInputError(f"{path!r} is outside the tutorial directory")
+    names = parts[:-1] if parts else []
+    if any(_excluded_name(n, True) for n in names) or (
+        parts and _excluded_name(parts[-1], os.path.isdir(current))
+    ):
+        raise AgentInputError(
+            f"{path!r} is not available: experimental data and plotting scripts are not shown"
+        )
     try:
         status = os.lstat(current)
     except FileNotFoundError:
