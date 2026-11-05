@@ -180,11 +180,22 @@ def _parts_below(path: str, root: Path) -> list[str]:
     return parts
 
 
+def _is_inside(base: str, real: str) -> bool:
+    """``real`` is ``base`` or lies below it; a path on another drive is outside."""
+    if real == base:
+        return True
+    try:
+        return os.path.commonpath([base, real]) == base
+    except ValueError:  # different drives (Windows) or a mix of absolute and relative
+        return False
+
+
 def _excluded_name(name: str, is_dir: bool) -> bool:
     """Experimental data and plotting scripts are not set-up knowledge: directories named
-    ``validation`` and files whose name starts with ``plot`` are neither searched nor read."""
+    ``validation`` or ``experimentalData`` and files whose name starts with ``plot`` are neither
+    searched nor read. (Set-ups under ``verificationAndValidation`` stay searchable.)"""
     lowered = name.lower()
-    return lowered == "validation" if is_dir else lowered.startswith("plot")
+    return lowered in ("validation", "experimentaldata") if is_dir else lowered.startswith("plot")
 
 
 def _listing(directory: str) -> str:
@@ -221,7 +232,7 @@ def read_tutorial(path: str, root: Path, max_bytes: int = 20000) -> str:
             raise AgentInputError(f"{path!r} goes through a symbolic link, which is not followed")
     # Defence in depth: whatever the path text was, the file must really lie below the root.
     real = os.path.realpath(current)
-    if real != str(base) and os.path.commonpath([str(base), real]) != str(base):
+    if not _is_inside(str(base), real):
         raise AgentInputError(f"{path!r} is outside the tutorial directory")
     names = parts[:-1] if parts else []
     if any(_excluded_name(n, True) for n in names) or (

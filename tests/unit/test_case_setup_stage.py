@@ -942,9 +942,8 @@ def test_missing_control_dict_keys_are_reported_unless_an_include_may_supply_the
     edit(case, "system/controlDict", "stopAt          endTime;\n", "")
     edit(case, "system/controlDict", "writeInterval   1000;\n", "")
     errors = errors_of(case)
-    assert any("startFrom" in e for e in errors)
-    assert any("stopAt" in e for e in errors)
-    assert any("writeInterval" in e for e in errors)
+    assert not any("startFrom" in e or "stopAt" in e for e in errors)  # OpenFOAM has defaults
+    assert any("writeInterval" in e for e in errors)  # but it fails without writeInterval
 
     other = make_case(tmp_path, name="other")
     (other / "system" / "controlDict").write_bytes(
@@ -1107,3 +1106,43 @@ def test_prompt_carries_the_rules_of_fix_round_1():
         "starting from",
     ):
         assert needle in lowered, needle
+
+
+# ------------------------------------------------------------------ fix round 2
+
+
+def test_icofoam_is_judged_even_when_it_is_told_to_adjust_the_time_step(tmp_path):
+    # icoFoam ignores adjustTimeStep, so writing it must not switch the Courant gate off.
+    setup = Setup(
+        tmp_path, solver="icoFoam", consistency=consistent(adjust=True), trial=trial_with(114.0)
+    )
+    result = setup.gate()
+    assert not result.ok and "Courant" in result.errors[0]
+
+
+def test_start_from_is_listed_with_start_time_first_and_judged_only_when_present():
+    from cfdagent.tools.case_check import START_FROM
+
+    assert START_FROM[0] == "startTime"
+
+
+def test_macros_and_directives_in_the_judged_keys_are_not_judged(tmp_path):
+    case = make_case(tmp_path)
+    edit(case, "system/controlDict", "writeFormat     ascii;", "writeFormat     $fmt;")
+    edit(case, "system/controlDict", "writeCompression off;", "writeCompression $comp;")
+    edit(case, "system/controlDict", "stopAt          endTime;", "stopAt          $stop;")
+    assert errors_of(case) == []
+
+
+def test_uncompressed_is_a_valid_way_to_switch_compression_off(tmp_path):
+    case = make_case(tmp_path)
+    edit(case, "system/controlDict", "writeCompression off;", "writeCompression uncompressed;")
+    assert errors_of(case) == []
+
+
+def test_a_write_time_exactly_at_the_end_is_not_a_rounding_failure(tmp_path):
+    case = make_case(tmp_path)
+    edit(case, "system/controlDict", "endTime         40;", "endTime         0.3;")
+    edit(case, "system/controlDict", "deltaT          0.005;", "deltaT          0.1;")
+    edit(case, "system/controlDict", "writeInterval   1000;", "writeInterval   3;")
+    assert errors_of(case) == []

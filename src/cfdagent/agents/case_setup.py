@@ -500,8 +500,10 @@ class CaseSetupStage(Stage):
         """A fixed time step whose trial run reached a Courant number far above what the scheme
         tolerates. Steady solvers and an adjustable time step are not judged."""
         courant = (response.data or {}).get("max_courant")
-        if solver not in TRANSIENT_SOLVERS or settings.get("adjust_time_step"):
+        if solver not in TRANSIENT_SOLVERS:
             return None
+        if solver == "pimpleFoam" and settings.get("adjust_time_step"):
+            return None  # only pimpleFoam adjusts its step; icoFoam ignores adjustTimeStep
         if isinstance(courant, bool) or not isinstance(courant, (int, float)):
             return None
         if courant <= TRIAL_MAX_COURANT:

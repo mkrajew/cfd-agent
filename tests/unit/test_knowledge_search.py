@@ -218,3 +218,31 @@ def test_validation_directories_and_plot_files_are_not_searched_or_readable(tuto
     assert read_tutorial("case", tutorials).splitlines() == ["plain/", "system/"]
     with pytest.raises(AgentInputError):
         read_tutorial("case/validation", tutorials)
+
+
+def test_experimental_data_directories_are_skipped_but_validation_set_ups_stay(tutorials):
+    write(tutorials, "case/system/controlDict", "needle\n")
+    write(tutorials, "case/experimentalData/profile.dat", "needle\n")
+    write(tutorials, "verificationAndValidation/setup/system/controlDict", "needle\n")
+    paths = [h.path for h in search_tutorials("needle", tutorials)]
+    assert paths == [
+        "case/system/controlDict",
+        "verificationAndValidation/setup/system/controlDict",
+    ]
+    with pytest.raises(AgentInputError, match="not available"):
+        read_tutorial("case/experimentalData/profile.dat", tutorials)
+    assert read_tutorial("case", tutorials).splitlines() == ["system/"]
+
+
+def test_a_real_path_on_another_drive_counts_as_outside_the_root(monkeypatch):
+    import types
+
+    import cfdagent.knowledge.search as module
+
+    def different_drives(paths):
+        raise ValueError("Paths don't have the same drive")
+
+    fake_os = types.SimpleNamespace(path=types.SimpleNamespace(commonpath=different_drives))
+    monkeypatch.setattr(module, "os", fake_os)
+    assert module._is_inside("/root", "/root") is True
+    assert module._is_inside("/root", "elsewhere") is False

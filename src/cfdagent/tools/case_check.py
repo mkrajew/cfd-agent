@@ -236,10 +236,10 @@ def _number(entry: Any) -> float | None:
     return None
 
 
-START_FROM = ("firstTime", "startTime", "latestTime")
+START_FROM = ("startTime", "firstTime", "latestTime")
 STOP_AT = ("endTime", "noWriteNow", "writeNow", "nextWrite")
 WRITE_CONTROLS = ("timeStep", "runTime", "adjustableRunTime", "adjustable")
-_OFF = frozenset({"off", "no", "false", "none", "n", "f", "0"})
+_OFF = frozenset({"off", "no", "false", "none", "n", "f", "0", "uncompressed"})
 _ON = frozenset({"yes", "on", "true", "y", "t", "1"})
 _CONTROL = "system/controlDict"
 
@@ -248,16 +248,16 @@ def _word(entry: Any) -> str | None:
     return _unquote(entry[0]) if isinstance(entry, list) and entry else None
 
 
-def _choice(control: Dictionary, key: str, allowed: tuple[str, ...], opaque: bool):
-    """The word of ``key`` and a problem text: the key is missing (unless an include may supply
-    it) or its word is not one of ``allowed``."""
-    entry = control.get(key)
-    if entry is None:
-        if opaque:
-            return None, None
-        return None, f"{_CONTROL} has no `{key}`; set `{key} {allowed[0]};`"
-    word = _word(entry)
-    if word is not None and word not in allowed:
+def _macro(word: str | None) -> bool:
+    """A value that OpenFOAM expands (``$name``) or a directive: it cannot be judged here."""
+    return word is not None and word.startswith(("$", "#"))
+
+
+def _choice(control: Dictionary, key: str, allowed: tuple[str, ...]):
+    """The word of ``key`` and a problem text if the word is not one of ``allowed``. A missing key
+    is not a problem (OpenFOAM supplies a default), nor is a macro."""
+    word = _word(control.get(key))
+    if word is not None and not _macro(word) and word not in allowed:
         return word, f"{_CONTROL} has {key} `{word}`; it must be one of {', '.join(allowed)}"
     return word, None
 
@@ -267,13 +267,15 @@ def _write_problems(control: Dictionary, opaque: bool, start: float | None, end:
     write_control = _word(control.get("writeControl"))
     if write_control is None:
         write_control = "timeStep"  # OpenFOAM's default, and what an include may replace
+    elif _macro(write_control):
+        write_control = None
     elif write_control not in WRITE_CONTROLS:
         extra = (
             ". `writeTime` is valid only inside function objects, not as the run's writeControl"
             if write_control == "writeTime"
             else ""
         )
-        _, problem = _choice(control, "writeControl", WRITE_CONTROLS, True)
+        _, problem = _choice(control, "writeControl", WRITE_CONTROLS)
         problems.append(f"{problem}{extra}")
         write_control = None
     interval_entry = control.get("writeInterval")
@@ -299,7 +301,7 @@ def _write_problems(control: Dictionary, opaque: bool, start: float | None, end:
     else:
         step = interval
     span = None if start is None or end is None else end - start
-    if step is not None and span is not None and span > 0 and step > span:
+    if step is not None and span is not None and span > 0 and step > span * (1 + 1e-9):
         problems.append(
             f"{_CONTROL}: writeInterval {interval:g} with {write_control} gives the first write "
             f"time after {step:g}, beyond the run length {span:g}; the run would write no result. "
@@ -311,13 +313,13 @@ def _write_problems(control: Dictionary, opaque: bool, start: float | None, end:
 def _format_problems(control: Dictionary) -> list[str]:
     problems = []
     write_format = _word(control.get("writeFormat"))
-    if write_format is not None and write_format != "ascii":
+    if write_format is not None and not _macro(write_format) and write_format != "ascii":
         problems.append(
             f"{_CONTROL} has writeFormat `{write_format}`; use `writeFormat ascii;` so that the "
             "results can be read by the analysis"
         )
     compression = _word(control.get("writeCompression"))
-    if compression is not None and compression.lower() not in _OFF:
+    if compression is not None and not _macro(compression) and compression.lower() not in _OFF:
         problems.append(
             f"{_CONTROL} has writeCompression `{compression}`; use `writeCompression off;`"
         )
@@ -363,7 +365,7 @@ def _control_problems(
             "reach (iterations for a steady solver)"
         )
     for key, allowed in (("startFrom", START_FROM), ("stopAt", STOP_AT)):
-        problem = _choice(control, key, allowed, opaque)[1]
+        problem = _choice(control, key, allowed)[1]
         if problem:
             problems.append(problem)
     problems += _write_problems(control, opaque, start_value, end_value)
