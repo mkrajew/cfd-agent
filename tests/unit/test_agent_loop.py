@@ -123,7 +123,7 @@ def make_ctx(
     progress: list | None = None,
 ):
     root = tmp_path / "run"
-    root.mkdir(exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
     run = RunDir(root)
     config = RunConfig.default()
     if limits is not None:
@@ -869,3 +869,135 @@ def test_prepare_attempt_errors_propagate_as_tool_failure(tmp_path):
     ctx, _ = make_ctx(tmp_path / "second", [reply(None, check())])
     with pytest.raises(ToolFailure, match="cannot copy the inputs"):
         run_stage(BadFiles([GateResult(True, [])]), ctx)
+
+
+# ------------------------------------------------------------------ the diagnosis hook (R43)
+
+DIAGNOSE = "Explain the cause in two sentences."
+
+
+class DiagnosingStage(ToyStage):
+    """A toy stage that asks for a diagnosis after every failed gate."""
+
+    def __init__(self, gates, **kwargs):
+        super().__init__(gates, **kwargs)
+        self.requests: list[list[str]] = []
+
+    def diagnosis_request(self, ctx, errors):
+        self.requests.append(list(errors))
+        return DIAGNOSE
+
+
+def test_a_stage_without_the_hook_is_never_asked_for_a_diagnosis(tmp_path):
+    ctx, backend = make_ctx(tmp_path, [reply(None, check("k1")), reply(None, check("k2"))])
+    run_stage(ToyStage([GateResult(False, ["bad"]), GateResult(True, [])]), ctx)
+    assert len(backend.calls) == 2
+    assert [a.diagnosis for a in ctx.record.stages[0].attempts] == [None, None]
+
+
+def test_a_diagnosis_is_asked_for_after_a_failed_gate_and_stored_on_that_attempt(tmp_path):
+    steps = [reply(None, check("k1")), reply("The cause is X; fix Y."), reply(None, check("k2"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    stage = DiagnosingStage([GateResult(False, ["it broke"]), GateResult(True, [])])
+    outcome = run_stage(stage, ctx)
+    assert outcome.ok and outcome.attempts == 2
+    attempts = ctx.record.stages[0].attempts
+    assert [a.diagnosis for a in attempts] == ["The cause is X; fix Y.", None]
+    assert stage.requests == [["it broke"]]  # not asked after the pass
+    asked = backend.calls[1]
+    assert asked.tools is None  # the diagnosis turn offers no tools
+    assert asked.messages[-1]["role"] == "user" and DIAGNOSE in asked.messages[-1]["content"]
+    assert asked.messages[-2]["role"] == "tool" and "it broke" in asked.messages[-2]["content"]
+    resumed = backend.calls[2].messages  # the conversation goes on from a user message
+    assert resumed[-1]["role"] == "user" and "attempt" in resumed[-1]["content"].lower()
+    assert resumed[-2]["role"] == "assistant" and resumed[-2]["content"] == "The cause is X; fix Y."
+
+
+def test_the_last_failed_attempt_also_gets_one_diagnosis_turn(tmp_path):
+    steps = []
+    for i in range(1, 4):
+        steps += [reply(None, check(f"k{i}")), reply(f"diagnosis {i}")]
+    steps.append(reply("never asked"))
+    ctx, backend = make_ctx(tmp_path, steps)
+    stage = DiagnosingStage([GateResult(False, [f"failure {i}"]) for i in range(1, 4)])
+    outcome = run_stage(stage, ctx)
+    assert not outcome.ok and outcome.attempts == 3
+    assert len(backend.calls) == 6  # three work turns, three diagnosis turns, nothing more
+    attempts = ctx.record.stages[0].attempts
+    assert [a.diagnosis for a in attempts] == ["diagnosis 1", "diagnosis 2", "diagnosis 3"]
+    assert "failure 3" in outcome.reason
+
+
+def test_a_reply_without_a_tool_call_that_runs_the_gate_is_followed_by_the_diagnosis(tmp_path):
+    steps = [reply("I am done."), reply("cause one"), reply("Now fixed.")]
+    ctx, backend = make_ctx(tmp_path, steps)
+    stage = DiagnosingStage([GateResult(False, ["output missing"]), GateResult(True, [])])
+    outcome = run_stage(stage, ctx)
+    assert outcome.ok and outcome.attempts == 2
+    assert ctx.record.stages[0].attempts[0].diagnosis == "cause one"
+    asked = backend.calls[1].messages
+    assert "output missing" in asked[-2]["content"] and DIAGNOSE in asked[-1]["content"]
+    assert asked[-3]["role"] == "assistant"
+
+
+def test_the_diagnosis_turn_is_billed_and_counted_as_a_turn(tmp_path):
+    one_attempt = RunLimits(max_attempts_per_stage=1)
+    with_diagnosis, _ = make_ctx(
+        tmp_path / "a", [reply(None, check("k1")), reply("because")], limits=one_attempt
+    )
+    run_stage(DiagnosingStage([GateResult(False, ["x"])]), with_diagnosis)
+    without, _ = make_ctx(tmp_path / "b", [reply(None, check("k1"))], limits=one_attempt)
+    run_stage(ToyStage([GateResult(False, ["x"])]), without)
+    assert with_diagnosis.cost.total_usd > without.cost.total_usd
+    steps = [reply(None, check("k1")), reply("because"), reply(None, check("k2"))]
+    roomy, backend = make_ctx(tmp_path / "roomy", steps, limits=RunLimits(max_turns_per_attempt=2))
+    assert run_stage(DiagnosingStage([GateResult(False, ["x"]), GateResult(True, [])]), roomy).ok
+    tight, backend = make_ctx(tmp_path / "tight", steps, limits=RunLimits(max_turns_per_attempt=1))
+    outcome = run_stage(DiagnosingStage([GateResult(False, ["x"]), GateResult(True, [])]), tight)
+    # The diagnosis is the first turn of attempt 2: with one turn per attempt, nothing is left.
+    assert not outcome.ok and "turns" in outcome.reason
+
+
+def test_tool_calls_in_the_diagnosis_reply_are_answered_and_not_run(tmp_path):
+    steps = [
+        reply(None, check("k1")),
+        reply("It diverged.", tc("write_file", "w1", path="attempts/toy-2/a", content="x")),
+        reply(None, check("k2")),
+    ]
+    ctx, backend = make_ctx(tmp_path, steps)
+    outcome = run_stage(DiagnosingStage([GateResult(False, ["x"]), GateResult(True, [])]), ctx)
+    assert outcome.ok
+    assert ctx.record.stages[0].attempts[0].diagnosis == "It diverged."
+    assert not (ctx.run.root / "attempts" / "toy-2" / "a").exists()
+    answered = [m for m in backend.calls[2].messages if m.get("tool_call_id") == "w1"]
+    assert len(answered) == 1 and "not run" in answered[0]["content"]
+
+
+def test_an_unusable_diagnosis_reply_leaves_the_diagnosis_empty_and_the_stage_goes_on(tmp_path):
+    steps = [
+        reply(None, check("k1")),
+        reply(None, finish_reason="length"),
+        reply(None, check("k2")),
+    ]
+    ctx, _ = make_ctx(tmp_path, steps)
+    outcome = run_stage(DiagnosingStage([GateResult(False, ["x"]), GateResult(True, [])]), ctx)
+    assert outcome.ok
+    assert ctx.record.stages[0].attempts[0].diagnosis is None
+
+
+def test_a_hook_that_declines_costs_no_model_turn(tmp_path):
+    class Declining(ToyStage):
+        def diagnosis_request(self, ctx, errors):
+            return None
+
+    ctx, backend = make_ctx(tmp_path, [reply(None, check("k1")), reply(None, check("k2"))])
+    run_stage(Declining([GateResult(False, ["x"]), GateResult(True, [])]), ctx)
+    assert len(backend.calls) == 2
+
+
+def test_the_cost_limit_during_the_diagnosis_stops_the_stage(tmp_path):
+    steps = [reply(None, check("k1")), reply("because", usage=Usage(10_000_000, 0, None))]
+    ctx, backend = make_ctx(tmp_path, steps, cost_limit=0.5)
+    outcome = run_stage(DiagnosingStage([GateResult(False, ["x"])] * 3), ctx)
+    assert not outcome.ok and "cost" in outcome.reason
+    assert len(backend.calls) == 2

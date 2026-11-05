@@ -10,6 +10,12 @@ result and a fresh attempt directory is prepared. If the model replies without a
 no gate has passed, the loop runs the gate itself, which also counts as an attempt, and sends the
 errors back as a user message.
 
+A stage may ask its agent for a diagnosis of every failed attempt (``Stage.diagnosis_request``).
+Right after the gate's errors have been shown to the model, the loop then spends one more model turn
+without tools: the text of the reply becomes ``AttemptRecord.diagnosis`` of the attempt that failed,
+also for the last attempt, after which the stage ends. A stage that returns no question gets no
+extra turn.
+
 A stage ends, with a reason, when: the gate passes; ``max_attempts_per_stage`` gates have failed;
 ``max_turns_per_attempt`` model turns pass without a check; the run's wall-clock budget is used;
 the cost limit is exceeded; or the model service fails for good. A ``SchemaError`` is a
@@ -70,6 +76,11 @@ CUT_OFF_ADVICE = (
 )
 MAX_REASON_CHARS = 1500
 MAX_ECHOED_ERROR_CHARS = 600
+DIAGNOSIS_TOOL_ANSWER = "not run: this turn is for the diagnosis; reply with plain text"
+DIAGNOSIS_RESUME = (
+    "Your diagnosis is recorded. Continue with attempt {n} of {limit}: work in {directory} and "
+    "call check_stage when done."
+)
 
 
 @dataclass(frozen=True)
@@ -305,6 +316,7 @@ class _StageRun(ModelConversation):
         self.stage = stage
         self.passed = False
         self.exhausted = False
+        self.diagnosis_due: tuple[AttemptRecord, str] | None = None  # failed attempt, question
         self.attempt_dir = Path()
         self.attempt_started = 0.0
 
@@ -365,6 +377,8 @@ class _StageRun(ModelConversation):
             self.passed = True
             return "The checks passed. The stage is complete."
         self.last_errors = errors
+        request = self.stage.diagnosis_request(self.ctx, list(errors))
+        self.diagnosis_due = (self.record.attempts[-1], request) if request else None
         listing = truncate_utf8(
             "\n".join(f"- {e}" for e in errors), CHECK_ERROR_BYTES, "\n[errors truncated]"
         )
@@ -406,15 +420,15 @@ class _StageRun(ModelConversation):
                 continue
             if not result.tool_calls:
                 text = self._check()
-                if self.passed or self.exhausted or self.abort is not None:
+                ended = self.passed or self.exhausted or self.abort is not None
+                if self.diagnosis_due is not None and self.abort is None:
+                    self._tell_gate_ran_for_the_model(text)
+                    self._collect_diagnosis()
+                    ended = self.passed or self.exhausted or self.abort is not None
+                elif not ended:
+                    self._tell_gate_ran_for_the_model(text)
+                if ended:
                     break
-                self.messages.append(
-                    {
-                        "role": "user",
-                        "content": "You replied without calling a tool, so the checks were run "
-                        f"for you.\n\n{text}",
-                    }
-                )
                 continue
             ran_gate = False  # at most one gate run per reply
             for call in result.tool_calls:
@@ -422,6 +436,7 @@ class _StageRun(ModelConversation):
                 output = self._answer(call, ran_gate)
                 ran_gate = ran_gate or self.attempts != before
                 self.messages.append({"role": "tool", "tool_call_id": call.id, "content": output})
+            self._collect_diagnosis()
             if self.passed or self.exhausted or self.abort is not None:
                 break
         if self.abort is not None:
@@ -435,6 +450,49 @@ class _StageRun(ModelConversation):
         shown = short("; ".join(self.last_errors), MAX_REASON_CHARS - 200)
         return self._fail(
             f"stage {self.stage.name!r} failed after {self.attempts} attempts; last errors: {shown}"
+        )
+
+    def _tell_gate_ran_for_the_model(self, text: str) -> None:
+        self.messages.append(
+            {
+                "role": "user",
+                "content": "You replied without calling a tool, so the checks were run for "
+                f"you.\n\n{text}",
+            }
+        )
+
+    def _collect_diagnosis(self) -> None:
+        """Spend one model turn on the diagnosis of the attempt that has just failed, if the stage
+        asked for one. The conversation then ends in a user message (unless the stage is over)."""
+        if self.diagnosis_due is None:
+            return
+        attempt, request = self.diagnosis_due
+        self.diagnosis_due = None
+        if self.abort is not None:
+            return
+        self.messages.append({"role": "user", "content": request})
+        result = self._ask(with_tools=False)
+        if self.abort is not None:
+            return
+        if result is not None:
+            for call in result.tool_calls:  # no tools were offered; keep the history well formed
+                self.messages.append(
+                    {"role": "tool", "tool_call_id": call.id, "content": DIAGNOSIS_TOOL_ANSWER}
+                )
+            text = (result.content or "").strip()
+            if text:
+                attempt.diagnosis = text
+        if self.exhausted:
+            return
+        self.messages.append(
+            {
+                "role": "user",
+                "content": DIAGNOSIS_RESUME.format(
+                    n=self.attempts + 1,
+                    limit=self.limits.max_attempts_per_stage,
+                    directory=self._relative(self.attempt_dir),
+                ),
+            }
         )
 
     def _answer(self, call: ToolCall, ran_gate: bool) -> str:
