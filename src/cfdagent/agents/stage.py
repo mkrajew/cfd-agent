@@ -111,6 +111,20 @@ class Stage(ABC):
         ``diagnosis``) or ``None`` for no question. The default asks nothing."""
         return None
 
+    def retry_after_failure(self, errors: list[str]) -> bool:
+        """Whether another attempt can fix a failure (``errors`` are the gate's). A stage whose
+        failures are deterministic and outside the agent's reach returns ``False``: the loop then
+        ends the stage after the diagnosis. The default is ``True``."""
+        return True
+
+    def retry_text(self, previous: str) -> str:
+        """What the agent is told about the fresh attempt directory after a failed gate
+        (``previous`` is the failed attempt's directory, relative to the run directory)."""
+        return (
+            "Write the corrected files there; the files of the previous attempt stay readable in "
+            f"{previous}. Call check_stage again when done."
+        )
+
     @abstractmethod
     def promote(self, ctx: StageContext, attempt_dir: Path) -> None:
         """Copy the accepted attempt to its canonical place in the run directory."""

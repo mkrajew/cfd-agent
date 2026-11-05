@@ -509,7 +509,7 @@ def test_run_solver_parallel_rejects_mismatching_existing_dict(tmp_path, fake):
     (tmp_path / "system" / "decomposeParDict").write_text(
         "numberOfSubdomains 4;\nmethod scotch;\n", encoding="utf-8"
     )
-    with pytest.raises(ValueError, match="numberOfSubdomains"):
+    with pytest.raises(AgentInputError, match="numberOfSubdomains"):  # the agent can fix it
         run_solver(tmp_path, "icoFoam", n_procs=2)
     assert fake.calls == []
 
@@ -1468,3 +1468,45 @@ def test_a_non_finite_last_step_in_the_log_is_ignored():
 def test_a_negative_last_step_does_not_shrink_the_tolerance():
     assert _solver_run(0.02, 0.015, delta_t=0.005, last_step=-3.0).ok
     assert not _solver_run(0.0201, 0.015, delta_t=0.005, last_step=-3.0).ok
+
+
+# ------------------------------------------------------------------ initial residuals (fix round 1)
+
+
+def test_initial_residuals_are_those_of_the_last_and_the_first_solve():
+    summary = parse_solver_log(_read("icoFoam_ok.log"))
+    # The last solve of p in the log is the second corrector of the last step.
+    assert summary.initial_residuals["p"] == pytest.approx(9.59103e-07)
+    assert summary.initial_residuals["Ux"] == pytest.approx(2.3091e-07)
+    # The first solve of each field in the log is the first step's.
+    assert summary.first_initial_residuals["p"] == pytest.approx(1.0)
+    assert summary.first_initial_residuals["Ux"] == pytest.approx(1.0)
+    assert set(summary.first_initial_residuals) == set(summary.initial_residuals)
+
+
+def test_initial_residuals_differ_from_the_final_ones_of_a_run_that_blew_up():
+    summary = parse_solver_log(
+        "Time = 1\n"
+        "smoothSolver:  Solving for Ux, Initial residual = 0.78, Final residual = 5.6e-08, "
+        "No Iterations 12\n"
+    )
+    assert summary.final_residuals["Ux"] == pytest.approx(5.6e-08)
+    assert summary.initial_residuals["Ux"] == pytest.approx(0.78)
+
+
+def test_a_log_without_solves_has_empty_initial_residuals():
+    summary = parse_solver_log("")
+    assert summary.initial_residuals == {} and summary.first_initial_residuals == {}
+    assert summary.max_linear_iterations is None and summary.bounding_count == 0
+
+
+def test_the_largest_linear_iteration_count_and_the_bounding_messages_are_counted():
+    summary = parse_solver_log(
+        "DICPCG:  Solving for p, Initial residual = 1, Final residual = 0.1, No Iterations 12\n"
+        "DICPCG:  Solving for p, Initial residual = 1, Final residual = 0.1, No Iterations 1000\n"
+        "bounding k, min: -1e-05 max: 3 average: 0.1\n"
+        "bounding epsilon, min: -2 max: 30 average: 1\n"
+        "an unrelated line about bounding the domain\n"
+    )
+    assert summary.max_linear_iterations == 1000
+    assert summary.bounding_count == 2

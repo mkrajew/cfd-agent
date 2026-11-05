@@ -13,8 +13,10 @@ errors back as a user message.
 A stage may ask its agent for a diagnosis of every failed attempt (``Stage.diagnosis_request``).
 Right after the gate's errors have been shown to the model, the loop then spends one more model turn
 without tools: the text of the reply becomes ``AttemptRecord.diagnosis`` of the attempt that failed,
-also for the last attempt, after which the stage ends. A stage that returns no question gets no
-extra turn.
+also for the last attempt, after which the stage ends. The turn is billed, logged under the failed
+attempt's number and not charged to the next attempt's turns or time. A stage that returns no
+question gets no extra turn. A stage whose failures no other attempt can fix says so with
+``Stage.retry_after_failure``; the loop then ends the stage after the diagnosis.
 
 A stage ends, with a reason, when: the gate passes; ``max_attempts_per_stage`` gates have failed;
 ``max_turns_per_attempt`` model turns pass without a check; the run's wall-clock budget is used;
@@ -78,8 +80,7 @@ MAX_REASON_CHARS = 1500
 MAX_ECHOED_ERROR_CHARS = 600
 DIAGNOSIS_TOOL_ANSWER = "not run: this turn is for the diagnosis; reply with plain text"
 DIAGNOSIS_RESUME = (
-    "Your diagnosis is recorded. Continue with attempt {n} of {limit}: work in {directory} and "
-    "call check_stage when done."
+    "Your diagnosis is recorded. Continue with attempt {n} of {limit}, in {directory}."
 )
 
 
@@ -163,6 +164,7 @@ class ModelConversation:
         self.logged = 0  # messages already written to the transcript
         self.last_problem: str | None = None  # what the last unusable reply was reported as
         self.last_errors: list[str] = []  # the errors of the last failed attempt
+        self.log_attempt: int | None = None  # transcript label override (the diagnosis turn)
         self.record = StageRecord(name=stage_name, ok=False)
         ctx.record.stages.append(self.record)
 
@@ -211,7 +213,7 @@ class ModelConversation:
         self.ctx.transcript.append(
             self.stage_name,
             self.agent,
-            self.attempts + 1,
+            self.log_attempt if self.log_attempt is not None else self.attempts + 1,
             self.model.deployment,
             self.messages[self.logged : sent],
             result,
@@ -316,6 +318,7 @@ class _StageRun(ModelConversation):
         self.stage = stage
         self.passed = False
         self.exhausted = False
+        self.no_retry = False  # the stage ended because the stage said a retry cannot help
         self.diagnosis_due: tuple[AttemptRecord, str] | None = None  # failed attempt, question
         self.attempt_dir = Path()
         self.attempt_started = 0.0
@@ -388,14 +391,18 @@ class _StageRun(ModelConversation):
             self.exhausted = True
             self._progress()
             return text + "\nNo attempts are left."
+        if not self.stage.retry_after_failure(list(errors)):
+            self.exhausted = True
+            self.no_retry = True
+            self._progress()
+            return text + "\nNo retry: another attempt of this stage cannot fix this failure."
         previous = self._relative(self.attempt_dir)
         self._start_attempt()
         self._progress()
         return (
             f"{text}\n\nA fresh attempt directory {self._relative(self.attempt_dir)} is ready "
-            f"(attempt {self.attempts + 1} of {self.limits.max_attempts_per_stage}). Write the "
-            f"corrected files there; the files of the previous attempt stay readable in "
-            f"{previous}. Call check_stage again when done."
+            f"(attempt {self.attempts + 1} of {self.limits.max_attempts_per_stage}). "
+            f"{self.stage.retry_text(previous)}"
         )
 
     # ------------------------------------------------------------------ the loop
@@ -448,6 +455,11 @@ class _StageRun(ModelConversation):
             self._progress()
             return StageOutcome(ok=True, attempts=self.attempts, errors=[], reason=None)
         shown = short("; ".join(self.last_errors), MAX_REASON_CHARS - 200)
+        if self.no_retry:
+            return self._fail(
+                f"stage {self.stage.name!r} failed after {self.attempts} attempt(s) and is not "
+                f"retried (another attempt cannot fix it); last errors: {shown}"
+            )
         return self._fail(
             f"stage {self.stage.name!r} failed after {self.attempts} attempts; last errors: {shown}"
         )
@@ -471,7 +483,16 @@ class _StageRun(ModelConversation):
         if self.abort is not None:
             return
         self.messages.append({"role": "user", "content": request})
-        result = self._ask(with_tools=False)
+        # The turn belongs to the attempt that failed: it is logged under its number, and neither
+        # its turn nor its time is taken from the next attempt (the cost is billed as always).
+        turns_before, started = self.turns, self.ctx.clock()
+        self.log_attempt = attempt.n
+        try:
+            result = self._ask(with_tools=False)
+        finally:
+            self.log_attempt = None
+            self.turns = turns_before
+            self.attempt_started += self.ctx.clock() - started
         if self.abort is not None:
             return
         if result is not None:
@@ -482,6 +503,7 @@ class _StageRun(ModelConversation):
             text = (result.content or "").strip()
             if text:
                 attempt.diagnosis = text
+                self._progress()
         if self.exhausted:
             return
         self.messages.append(

@@ -103,7 +103,9 @@ def test_solver_stage_passes_scripted_cavity(tmp_path):
     summary = json.loads((root / "logs" / "solver_run.json").read_text(encoding="utf-8"))
     assert summary["ok"] is True and summary["solver"] == "icoFoam" and summary["n_procs"] == 1
     assert summary["end_time"] == 40 and summary["max_courant"] < 1
-    assert summary["final_residuals"]["p"] < 1e-3
+    last, first = summary["initial_residuals"], summary["first_initial_residuals"]
+    assert first["p"] > 0.1 and last["p"] < first["p"] / 1000  # the start-up transient has decayed
+    assert summary["steady_expected"] is True and summary["warnings"] == []
 
 
 def test_the_model_sees_the_summary_of_the_run(tmp_path):
@@ -120,7 +122,8 @@ def test_the_model_sees_the_summary_of_the_run(tmp_path):
         if m["role"] == "tool" and m["tool_call_id"] == "r1"
     ][0]
     assert "reached the end time" in text and "Maximum Courant number" in text
-    assert "Final residuals" in text and "Transient run" in text and "End of the log" in text
+    assert "Initial residuals of the last iteration" in text and "End of the log" in text
+    assert "no stopping test" in text or "Transient run" in text
 
 
 def test_solver_stage_fails_on_divergent_case(tmp_path):
@@ -130,27 +133,34 @@ def test_solver_stage_fails_on_divergent_case(tmp_path):
         "writeInterval   1000;": "writeInterval   20;",
     }
     ctx = handmade_case(tmp_path, huge)
-    steps = []
-    for number in (1, 2, 3):
-        steps += [
-            reply(run_solver_call(f"r{number}")),
-            reply(check_call(f"k{number}")),
-            text_reply(f"diagnosis {number}: the Courant number is far too high"),
-        ]
+    steps = [
+        reply(run_solver_call("r1")),
+        reply(call("l1", "read_solver_log", offset_lines=0, n_lines=20)),
+        reply(check_call("k1")),
+        text_reply("diagnosis: the Courant number is far too high; lower deltaT"),
+        text_reply("never asked"),
+    ]
     backend = ScriptedBackend(steps)
     ctx.backend = backend
     outcome = run_stage(SolverRunnerStage(), ctx)
-    assert not outcome.ok and outcome.attempts == 3
-    attempts = ctx.record.stages[-1].attempts
-    assert [a.ok for a in attempts] == [False, False, False]
-    assert [a.diagnosis for a in attempts] == [
-        f"diagnosis {n}: the Courant number is far too high" for n in (1, 2, 3)
-    ]
-    errors = "\n".join(attempts[0].errors)
+    # The solver is deterministic and the stage cannot change the case: one attempt, then the end.
+    assert not outcome.ok and outcome.attempts == 1 and "not retried" in outcome.reason
+    (attempt,) = ctx.record.stages[-1].attempts
+    assert not attempt.ok
+    assert attempt.diagnosis == "diagnosis: the Courant number is far too high; lower deltaT"
+    errors = "\n".join(attempt.errors)
     assert "icoFoam run" in errors and "failed" in errors and "diverged" in errors
     assert len(errors.encode("utf-8")) <= 4000
+    assert "addr2line" not in errors
     assert not (ctx.run.root / "logs").exists()  # nothing is promoted from a failed stage
-    assert len(backend.calls) == 9
+    assert len(backend.calls) == 4
+    summary_text = [
+        m["content"]
+        for m in backend.calls[1].messages
+        if m["role"] == "tool" and m["tool_call_id"] == "r1"
+    ][0]
+    assert "FAILED" in summary_text and "Maximum Courant number" in summary_text
+    assert "Initial residuals of the last iteration" in summary_text
 
 
 def test_a_second_call_starts_from_the_original_case(tmp_path):

@@ -45,7 +45,6 @@ from pydantic import BaseModel, Field, StrictInt
 
 from cfdagent.agents.case_setup import KNOWN_SOLVERS
 from cfdagent.agents.casespec import CaseSpec
-from cfdagent.agents.gatehelp import last_bytes
 from cfdagent.agents.stage import Stage, StageContext
 from cfdagent.agents.tools import FileScope, Tool
 from cfdagent.errors import AgentInputError, ToolFailure
@@ -77,6 +76,13 @@ _CELLS_RE = re.compile(r"^\s*cells:\s+(\d+)\s*$", re.MULTILINE)
 _CHECKMESH_MAX_BYTES = 1_000_000
 _READ_CHUNK = 4096
 LOG_FILE_PREFIX = "log."
+NOT_RUN_PREFIX = "the solver was not run"  # the gate error of an attempt without a run
+RESERVE_S = 600.0  # kept back from the solver for the diagnosis, the Analyst and the upload ...
+RESERVE_FRACTION = 0.2  # ... or this share of the remaining time, whichever is smaller
+COURANT_WARNING = 10.0  # a transient run above this is suspect even when it finishes
+MAX_ITER_DEFAULT = 1000  # OpenFOAM's default maxIter of the linear solvers
+BOUNDING_WARNING = 10  # more 'bounding' messages than this are a warning
+CELLS_PER_RANK = "10 000"  # the Planner's rule: at least about this many cells for every rank
 
 
 class RunSolverToolArgs(BaseModel):
@@ -112,6 +118,18 @@ def _number(value: Any) -> float | None:
 
 def _clip(text: str, limit: int = HEADLINE_CHARS) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _tail(text: str, limit: int) -> str:
+    """The end of a solver output (at most ``limit`` bytes), on a line boundary. Lines of the stack
+    printer's failed ``addr2line`` calls are noise that can fill half the tail: they are dropped."""
+    kept = "\n".join(line for line in text.splitlines() if "addr2line" not in line)
+    data = kept.encode("utf-8", "replace")
+    if len(data) <= limit:
+        return kept
+    cut = data[-limit:].decode("utf-8", "ignore")
+    _, newline, rest = cut.partition("\n")
+    return "[earlier output omitted]\n" + (rest if newline else cut)
 
 
 def _internal(response: OpResponse, label: str) -> ToolFailure:
@@ -176,16 +194,22 @@ class SolverRunnerStage(Stage):
             if solver in STEADY_SOLVERS
             else "a transient solver: it ends at endTime"
         )
+        estimate = spec.resource_estimate.runtime_minutes
         return (
             f"Run the OpenFOAM solver {solver} (the plan's solver, {kind}) on the case that the "
             "Case Setup stage prepared, and report how it went.\n\n"
             f"{json.dumps(plan, indent=2)}\n\n"
-            f"{mesh} Choose n_procs from it: serial unless the cells per rank stay in the tens of "
-            f"thousands; never more than {cap} ranks (the limit of this run) and never more than "
-            "the hardware threads of the machine (a larger n_procs is refused with a message). "
-            f"The case is in case/ of the attempt directory; you cannot edit it. Call "
-            f"run_solver(solver={solver!r}, n_procs=...) once, read the log if needed, and call "
-            "check_stage."
+            f"{mesh} The Planner estimated {estimate:g} minutes of solver run time on one core. "
+            f"Choose n_procs from the cell count: serial unless every rank would keep at least "
+            f"about {CELLS_PER_RANK} cells per rank; never more than {cap} ranks (the limit of "
+            "this run) and never more than the hardware threads of the machine (a larger n_procs "
+            "is refused with a message). "
+            "The case is in case/ of the attempt directory; you cannot edit it. Call "
+            f"run_solver(solver={solver!r}, n_procs=...) once, and call check_stage when it has "
+            "finished. If the run failed, read the log with read_solver_log (the context of the "
+            "FOAM FATAL ERROR, or the first step where a residual or the Courant number jumps) "
+            "before you call check_stage: the diagnosis turn that follows a failed check has no "
+            "tools, so every number you want to cite must already be in front of you."
         )
 
     # ------------------------------------------------------------------ attempts
@@ -220,8 +244,9 @@ class SolverRunnerStage(Stage):
                 f"n_procs MPI ranks (1 for a serial run, at most {self._rank_cap(ctx)}). The run "
                 "ends at the case's endTime or when the time budget of the run is used up. "
                 "Returns a summary (did it reach the end time, the last time, the maximum Courant "
-                "number, the final residuals, whether a steady run converged, the fatal error if "
-                "any) and the end of the log. Each call starts from the original case again.",
+                "number, the initial residuals of the last and the first iteration, whether a "
+                "residualControl criterion ended a steady run, warnings, the fatal error if any) "
+                "and the end of the log. Each call starts from the original case again.",
                 RunSolverToolArgs,
                 lambda args: self._run_solver(ctx, attempt_dir, planned, args),
             ),
@@ -244,7 +269,7 @@ class SolverRunnerStage(Stage):
             return GateResult(
                 False,
                 [
-                    f"the solver was not run in this attempt: call run_solver(solver={solver!r}, "
+                    f"{NOT_RUN_PREFIX} in this attempt: call run_solver(solver={solver!r}, "
                     "n_procs=...) and wait for it to finish before check_stage"
                 ],
             )
@@ -254,12 +279,26 @@ class SolverRunnerStage(Stage):
 
     def diagnosis_request(self, ctx: StageContext, errors: list[str]) -> str | None:
         return (
-            "The solver run failed. You cannot edit the case, so do not try to repair it. Reply "
-            "in plain text, no tool call, in at most about 150 words: (1) the most likely cause, "
+            "This attempt failed; the message of the check is above. You cannot edit the case, so "
+            "do not try to repair it. This turn has no tools: use only what you have already "
+            "read. Reply in plain text in at most about 150 words: (1) the most likely cause, "
             "with the evidence from the log (the FOAM FATAL ERROR message, or the signs of "
             "divergence: which residual or the Courant number started to grow, and at which "
-            "time); (2) the specific fix that a person editing the case would make: which file, "
-            "which keyword, which new value, and why that value."
+            "time); if the solver was not run, say so; (2) the specific fix that a person "
+            "editing the case would make: which file, which keyword, which new value, and why "
+            "that value."
+        )
+
+    def retry_after_failure(self, errors: list[str]) -> bool:
+        """Only a missing run is worth another attempt. A solver run that failed is a property
+        of the case, which this stage cannot change (routing back is M2), and the solver is
+        deterministic: the same case fails the same way."""
+        return len(errors) == 1 and errors[0].startswith(NOT_RUN_PREFIX)
+
+    def retry_text(self, previous: str) -> str:
+        return (
+            "Call run_solver on the fresh copy of the case, wait for the run to finish and call "
+            f"check_stage (the files of the previous attempt stay readable in {previous})."
         )
 
     def promote(self, ctx: StageContext, attempt_dir: Path) -> None:
@@ -353,7 +392,9 @@ class SolverRunnerStage(Stage):
             self._copy_case(ctx, attempt_dir)  # no resume from the time directories of a call
         self._last[attempt_dir] = None  # the case is the original again: nothing has run on it
         self._copies[attempt_dir] = self._copies.get(attempt_dir, 0) + 1
-        inner = ctx.inner_timeout(min(ctx.remaining_s(), MAX_OP_TIMEOUT_S))
+        left = ctx.remaining_s()
+        reserve = min(RESERVE_S, RESERVE_FRACTION * left)
+        inner = ctx.inner_timeout(min(left - reserve, MAX_OP_TIMEOUT_S))
         response = ctx.sandbox.call(
             "run_solver",
             RunSolverArgs(
@@ -371,7 +412,7 @@ class SolverRunnerStage(Stage):
             raise ToolFailure("run_solver answered without data")
         # The executor moves the run's verdict and message out of ``data`` into the response.
         ok = bool(response.ok)
-        summary = self._summary(args, data, ok, response.error)
+        summary = self._summary(args, data, ok, response.error, self._spec(ctx))
         run = _Run(args.solver, args.n_procs, ok, data, summary)
         self._last[attempt_dir] = run
         try:
@@ -381,13 +422,41 @@ class SolverRunnerStage(Stage):
         return self._summary_text(run)
 
     @staticmethod
+    def _residuals(value: Any) -> dict[str, float]:
+        if not isinstance(value, dict):
+            return {}
+        return {str(k): float(v) for k, v in value.items() if _number(v) is not None}
+
+    @classmethod
     def _summary(
-        args: RunSolverToolArgs, data: dict, ok: bool, error: str | None
+        cls, args: RunSolverToolArgs, data: dict, ok: bool, error: str | None, spec: CaseSpec
     ) -> dict[str, Any]:
         steady = args.solver in STEADY_SOLVERS
         converged_at = _number(data.get("converged_at"))
-        residuals = data.get("final_residuals")
         fatal = data.get("fatal_error")
+        courant = _number(data.get("max_courant"))
+        iterations = data.get("max_linear_iterations")
+        bounding = data.get("bounding_count")
+        warnings = []
+        if not steady and courant is not None and courant > COURANT_WARNING:
+            warnings.append(
+                f"The maximum Courant number was {courant:.3g}, far above the order of 1 that a "
+                "fixed time step needs: the result may be finite and still wrong (a value above 1 "
+                "is legitimate only with several outer correctors or an adjustable time step "
+                "that holds maxCo)."
+            )
+        if isinstance(iterations, int) and not isinstance(iterations, bool):
+            if iterations >= MAX_ITER_DEFAULT:
+                warnings.append(
+                    f"A linear solve ran {iterations} iterations (the default limit maxIter is "
+                    f"{MAX_ITER_DEFAULT}): it stopped without reaching its tolerance."
+                )
+        if isinstance(bounding, int) and not isinstance(bounding, bool):
+            if bounding > BOUNDING_WARNING:
+                warnings.append(
+                    f"OpenFOAM printed {bounding} 'bounding' messages: a field left its physical "
+                    "range and was clipped."
+                )
         return {
             "solver": args.solver,
             "n_procs": args.n_procs,
@@ -396,19 +465,21 @@ class SolverRunnerStage(Stage):
             "diverged": bool(data.get("diverged")),
             "timed_out": bool(data.get("timed_out")),
             "steady": steady,
-            "converged": (converged_at is not None) if steady else None,
+            "time_dependence": spec.time_dependence,
+            "steady_expected": steady or spec.time_dependence == "steady",
+            "stopped_by_residual_control": (converged_at is not None) if steady and ok else None,
             "converged_at": converged_at,
             "first_time": _number(data.get("first_time")),
             "end_time": _number(data.get("end_time")),
             "case_end_time": _number(data.get("case_end_time")),
             "last_step": _number(data.get("last_step")),
             "delta_t": _number(data.get("delta_t")),
-            "max_courant": _number(data.get("max_courant")),
-            "final_residuals": {
-                str(k): v
-                for k, v in (residuals.items() if isinstance(residuals, dict) else [])
-                if _number(v) is not None
-            },
+            "max_courant": courant,
+            "initial_residuals": cls._residuals(data.get("initial_residuals")),
+            "first_initial_residuals": cls._residuals(data.get("first_initial_residuals")),
+            "max_linear_iterations": iterations if isinstance(iterations, int) else None,
+            "bounding_count": bounding if isinstance(bounding, int) else None,
+            "warnings": warnings,
             "fatal_error": _clip(str(fatal)) if fatal else None,
             "error": _clip(str(error)) if error and not ok else None,
         }
@@ -418,11 +489,12 @@ class SolverRunnerStage(Stage):
         s = run.summary
         ranks = f"{run.n_procs} rank" + ("s" if run.n_procs != 1 else "")
         end, case_end = s["end_time"], s["case_end_time"]
+        end_text = "unknown" if end is None else f"{end:g}"
         if run.ok:
-            if s["steady"] and s["converged"]:
-                head = f"{run.solver} on {ranks}: finished; it stopped itself at time {end:g}."
+            if s["stopped_by_residual_control"]:
+                head = f"{run.solver} on {ranks}: finished; it stopped itself at time {end_text}."
             else:
-                head = f"{run.solver} on {ranks}: finished and reached the end time {end:g}."
+                head = f"{run.solver} on {ranks}: finished and reached the end time {end_text}."
         else:
             reason = (s["error"] or "the run failed without a message").partition("\n")[0]
             head = f"{run.solver} on {ranks}: FAILED. {_clip(reason)}"
@@ -438,32 +510,26 @@ class SolverRunnerStage(Stage):
             times.append(f"last step {s['last_step']:g}")
         if times:
             lines.append("Time: " + ", ".join(times) + ".")
-        if s["max_courant"] is None:
-            lines.append("Maximum Courant number: no Courant number in the log.")
-        else:
+        if s["max_courant"] is not None:
             lines.append(f"Maximum Courant number: {s['max_courant']:.3g}.")
-        residuals = s["final_residuals"]
-        if residuals:
-            shown = ", ".join(f"{k} {v:.3g}" for k, v in sorted(residuals.items()))
-            lines.append(f"Final residuals (last solve of each field): {shown}.")
+        elif s["steady"]:
+            lines.append("Maximum Courant number: steady solver: not printed.")
         else:
-            lines.append("Final residuals: no residuals in the log.")
-        if s["steady"]:
-            if s["converged"]:
-                lines.append(
-                    f"Steady run: converged. The residualControl criterion was met at iteration "
-                    f"{s['converged_at']:g} and the solver stopped early."
-                )
-            else:
-                lines.append(
-                    "Steady run: NOT converged. The run reached the end time without meeting "
-                    "residualControl (the log has no 'SIMPLE solution converged' line); the "
-                    "final residuals above show how far it is. The Analyst is told."
-                )
-        else:
+            lines.append("Maximum Courant number: no Courant number in the log.")
+        last, first = s["initial_residuals"], s["first_initial_residuals"]
+        if last:
+            shown = ", ".join(f"{k} {v:.3g}" for k, v in sorted(last.items()))
+            started = ", ".join(f"{k} {v:.3g}" for k, v in sorted(first.items()))
             lines.append(
-                "Transient run: no convergence criterion applies; the run ends at endTime."
+                f"Initial residuals of the last iteration (last solve of each field): {shown}"
+                + (f"; first iteration: {started}." if started else ".")
             )
+        else:
+            lines.append("Initial residuals: no initial residuals in the log.")
+        lines.extend(SolverRunnerStage._convergence_lines(run))
+        if s["warnings"]:
+            lines.append("Warnings:")
+            lines.extend(f"- {w}" for w in s["warnings"])
         if s["fatal_error"] and s["fatal_error"] not in lines[0]:
             lines.append(f"OpenFOAM reported: {s['fatal_error']}")
         if s["diverged"]:
@@ -472,8 +538,40 @@ class SolverRunnerStage(Stage):
             lines.append("The run hit the time limit and was killed.")
         tail = run.data.get("tail")
         if isinstance(tail, str) and tail.strip():
-            lines.append("End of the log:\n" + last_bytes(tail, SUMMARY_TAIL_BYTES))
+            lines.append("End of the log:\n" + _tail(tail, SUMMARY_TAIL_BYTES))
         return "\n".join(lines)
+
+    @staticmethod
+    def _convergence_lines(run: _Run) -> list[str]:
+        s = run.summary
+        lines = []
+        if s["steady"]:
+            if s["stopped_by_residual_control"]:
+                lines.append(
+                    f"Steady run: the solver stopped itself at iteration {s['converged_at']:g} "
+                    "because the residualControl criteria in case/system/fvSolution were met."
+                )
+            elif run.ok:
+                lines.append(
+                    "Steady run: No residualControl criterion ended the run (none set, or not met "
+                    "before the end time); judge convergence by the initial residuals above and "
+                    "by residualControl in case/system/fvSolution."
+                )
+            if s["time_dependence"] == "transient":
+                lines.append(
+                    f"Note: the plan says time_dependence 'transient' but {run.solver} is a "
+                    "steady-state solver; its result is a steady state, not a time history."
+                )
+        elif s["steady_expected"] and run.ok:
+            lines.append(
+                f"The plan expects a steady state, but {run.solver} is a transient solver with no "
+                "stopping test and ran to endTime: compare the initial residuals of the last step "
+                "with those of the first step above (a steady state shows them falling by orders "
+                "of magnitude and staying low)."
+            )
+        elif not s["steady_expected"]:
+            lines.append("Transient run: no convergence criterion applies; it ends at endTime.")
+        return lines
 
     @staticmethod
     def _failure_text(run: _Run) -> str:
@@ -487,7 +585,7 @@ class SolverRunnerStage(Stage):
         if not isinstance(tail, str) or not tail.strip():
             tail = rest
         if tail.strip():
-            message += f"\nEnd of the solver output:\n{last_bytes(tail, TAIL_BYTES)}"
+            message += f"\nEnd of the solver output:\n{_tail(tail, TAIL_BYTES)}"
         return message
 
     # ------------------------------------------------------------------ read_solver_log

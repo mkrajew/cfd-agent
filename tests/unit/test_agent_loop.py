@@ -940,7 +940,7 @@ def test_a_reply_without_a_tool_call_that_runs_the_gate_is_followed_by_the_diagn
     assert asked[-3]["role"] == "assistant"
 
 
-def test_the_diagnosis_turn_is_billed_and_counted_as_a_turn(tmp_path):
+def test_the_diagnosis_turn_is_billed_but_does_not_use_a_turn_of_the_next_attempt(tmp_path):
     one_attempt = RunLimits(max_attempts_per_stage=1)
     with_diagnosis, _ = make_ctx(
         tmp_path / "a", [reply(None, check("k1")), reply("because")], limits=one_attempt
@@ -949,13 +949,67 @@ def test_the_diagnosis_turn_is_billed_and_counted_as_a_turn(tmp_path):
     without, _ = make_ctx(tmp_path / "b", [reply(None, check("k1"))], limits=one_attempt)
     run_stage(ToyStage([GateResult(False, ["x"])]), without)
     assert with_diagnosis.cost.total_usd > without.cost.total_usd
+    # One turn per attempt is enough for "check" in each attempt: the diagnosis turn in between
+    # belongs to the failed attempt and leaves the next attempt its whole turn budget.
     steps = [reply(None, check("k1")), reply("because"), reply(None, check("k2"))]
-    roomy, backend = make_ctx(tmp_path / "roomy", steps, limits=RunLimits(max_turns_per_attempt=2))
-    assert run_stage(DiagnosingStage([GateResult(False, ["x"]), GateResult(True, [])]), roomy).ok
     tight, backend = make_ctx(tmp_path / "tight", steps, limits=RunLimits(max_turns_per_attempt=1))
     outcome = run_stage(DiagnosingStage([GateResult(False, ["x"]), GateResult(True, [])]), tight)
-    # The diagnosis is the first turn of attempt 2: with one turn per attempt, nothing is left.
-    assert not outcome.ok and "turns" in outcome.reason
+    assert outcome.ok and len(backend.calls) == 3
+
+
+def test_the_diagnosis_turn_is_logged_under_the_failed_attempt(tmp_path):
+    steps = [reply(None, check("k1")), reply("cause one"), reply(None, check("k2"))]
+    ctx, _ = make_ctx(tmp_path, steps)
+    run_stage(DiagnosingStage([GateResult(False, ["x"]), GateResult(True, [])]), ctx)
+    # work of attempt 1, its diagnosis (still attempt 1), work of attempt 2
+    assert [line["attempt"] for line in read_transcript(ctx)] == [1, 1, 2]
+    steps = []
+    for i in range(1, 4):
+        steps += [reply(None, check(f"k{i}")), reply(f"diagnosis {i}")]
+    ctx, _ = make_ctx(tmp_path / "three", steps)
+    run_stage(DiagnosingStage([GateResult(False, ["x"])] * 3), ctx)
+    assert [line["attempt"] for line in read_transcript(ctx)] == [1, 1, 2, 2, 3, 3]
+
+
+class SlowDiagnosisBackend(ScriptedBackend):
+    def __init__(self, steps, clock):
+        super().__init__(steps)
+        self.clock = clock
+
+    def chat(self, messages, model, **kwargs):
+        if messages[-1].get("content") == DIAGNOSE:
+            self.clock.now += 100  # the diagnosis takes 100 s
+        return super().chat(messages, model, **kwargs)
+
+
+def test_the_diagnosis_does_not_count_as_time_of_the_next_attempt(tmp_path):
+    clock = FakeClock()
+    steps = [reply(None, check("k1")), reply("because"), reply(None, check("k2"))]
+    ctx, _ = make_ctx(tmp_path, steps, clock=clock)
+    ctx.backend = SlowDiagnosisBackend(steps, clock)
+    run_stage(DiagnosingStage([GateResult(False, ["x"]), GateResult(True, [])]), ctx)
+    first, second = ctx.record.stages[0].attempts
+    assert second.seconds < 1  # not 100 s
+
+
+def test_the_record_is_saved_again_once_the_diagnosis_is_stored(tmp_path):
+    steps = [reply(None, check("k1")), reply("because"), reply(None, check("k2"))]
+    ctx, _ = make_ctx(tmp_path, steps)
+    seen = []
+    ctx.on_progress = lambda name: seen.append([a.diagnosis for a in ctx.record.stages[0].attempts])
+    run_stage(DiagnosingStage([GateResult(False, ["x"]), GateResult(True, [])]), ctx)
+    assert ["because"] in seen  # a save happened with the diagnosis in the record
+    exhausted, _ = make_ctx(
+        tmp_path / "e",
+        [reply(None, check("k1")), reply("last words")],
+        limits=RunLimits(max_attempts_per_stage=1),
+    )
+    seen.clear()
+    exhausted.on_progress = lambda name: seen.append(
+        [a.diagnosis for a in exhausted.record.stages[0].attempts]
+    )
+    run_stage(DiagnosingStage([GateResult(False, ["x"])]), exhausted)
+    assert seen[-1] == ["last words"]
 
 
 def test_tool_calls_in_the_diagnosis_reply_are_answered_and_not_run(tmp_path):
@@ -1001,3 +1055,75 @@ def test_the_cost_limit_during_the_diagnosis_stops_the_stage(tmp_path):
     outcome = run_stage(DiagnosingStage([GateResult(False, ["x"])] * 3), ctx)
     assert not outcome.ok and "cost" in outcome.reason
     assert len(backend.calls) == 2
+
+
+# ------------------------------------------------------------------ retry hooks (R45)
+
+
+class NoRetryStage(DiagnosingStage):
+    """A stage whose failures cannot be fixed by another attempt."""
+
+    def retry_after_failure(self, errors):
+        return False
+
+    def retry_text(self, previous):
+        return f"custom retry text about {previous}"
+
+
+def test_a_stage_that_declines_a_retry_ends_after_collecting_the_diagnosis(tmp_path):
+    steps = [reply(None, check("k1")), reply("cause"), reply("never asked")]
+    ctx, backend = make_ctx(tmp_path, steps)
+    stage = NoRetryStage([GateResult(False, ["it broke"]), GateResult(True, [])])
+    outcome = run_stage(stage, ctx)
+    assert not outcome.ok and outcome.attempts == 1
+    assert outcome.errors == ["it broke"] and "it broke" in outcome.reason
+    assert "not retried" in outcome.reason
+    assert len(backend.calls) == 2  # the work turn and the diagnosis turn, nothing more
+    assert [d.name for d in stage.extra_calls] == ["toy-1"]  # no fresh attempt was prepared
+    assert stage.promoted == []
+    (stage_record,) = ctx.record.stages
+    assert not stage_record.ok and [a.diagnosis for a in stage_record.attempts] == ["cause"]
+    shown = tool_messages(1, backend)[0]["content"]
+    assert "it broke" in shown and "fresh attempt" not in shown and "No retry" in shown
+
+
+def test_the_decision_is_made_per_failure(tmp_path):
+    class RetryOnlyOnce(NoRetryStage):
+        def retry_after_failure(self, errors):
+            return errors == ["not run"]
+
+    steps = [reply(None, check("k1")), reply("d1"), reply(None, check("k2")), reply("d2")]
+    ctx, backend = make_ctx(tmp_path, steps)
+    stage = RetryOnlyOnce([GateResult(False, ["not run"]), GateResult(False, ["real failure"])])
+    outcome = run_stage(stage, ctx)
+    assert not outcome.ok and outcome.attempts == 2
+    assert [a.diagnosis for a in ctx.record.stages[0].attempts] == ["d1", "d2"]
+
+
+def test_the_default_stage_retries_and_keeps_the_standard_retry_text(tmp_path):
+    steps = [reply(None, check("k1")), reply(None, check("k2"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    run_stage(ToyStage([GateResult(False, ["x"]), GateResult(True, [])]), ctx)
+    shown = tool_messages(1, backend)[0]["content"]
+    assert "Write the corrected files there" in shown
+
+
+def test_a_stage_can_replace_the_retry_text(tmp_path):
+    class Custom(ToyStage):
+        def retry_text(self, previous):
+            return f"custom retry text about {previous}"
+
+    steps = [reply(None, check("k1")), reply(None, check("k2"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    run_stage(Custom([GateResult(False, ["x"]), GateResult(True, [])]), ctx)
+    shown = tool_messages(1, backend)[0]["content"]
+    assert "custom retry text about attempts/toy-1/" in shown
+    assert "Write the corrected files" not in shown
+
+
+def test_the_resume_message_after_a_diagnosis_is_neutral(tmp_path):
+    steps = [reply(None, check("k1")), reply("because"), reply(None, check("k2"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    run_stage(DiagnosingStage([GateResult(False, ["x"]), GateResult(True, [])]), ctx)
+    resumed = backend.calls[2].messages[-1]["content"]
+    assert "attempt 2 of 3" in resumed and "corrected" not in resumed
