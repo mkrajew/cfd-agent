@@ -174,6 +174,9 @@ class SandboxClient:
         self._run = run
         self._counter = itertools.count(1)
         self._lock = threading.Lock()
+        self._active: dict[
+            str, Any
+        ] = {}  # container name -> its client process, while a call waits
 
     # ------------------------------------------------------------------ internals
 
@@ -235,6 +238,20 @@ class SandboxClient:
 
     # ------------------------------------------------------------------ public
 
+    def kill_active(self) -> None:
+        """Stop every executor that a call is waiting for (callable from another thread).
+
+        The waiting calls then return failed responses. Used by the orchestrator when the run
+        directory grows beyond its cap. Never raises.
+        """
+        with self._lock:
+            running = list(self._active.items())
+        for name, proc in running:
+            try:
+                self._stop(proc, name)
+            except Exception:  # best effort: the caller is a watchdog
+                pass
+
     def call(self, op: str, args: BaseModel | dict[str, Any], timeout_s: float) -> OpResponse:
         """Run ``op`` in a fresh executor and return its response; see the module docstring.
 
@@ -289,6 +306,8 @@ class SandboxClient:
 
             timed_out = False
             code: int | None = None
+            with self._lock:
+                self._active[name] = proc
             try:
                 code = proc.wait(timeout=timeout_s)
             except subprocess.TimeoutExpired:
@@ -297,6 +316,9 @@ class SandboxClient:
             except BaseException:  # KeyboardInterrupt included: never leave the container behind
                 self._stop(proc, name)
                 raise
+            finally:
+                with self._lock:
+                    self._active.pop(name, None)
             tail = self._scrub(_tail(output))
 
         if timed_out:

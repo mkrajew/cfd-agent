@@ -1146,3 +1146,16 @@ def test_a_write_time_exactly_at_the_end_is_not_a_rounding_failure(tmp_path):
     edit(case, "system/controlDict", "deltaT          0.005;", "deltaT          0.1;")
     edit(case, "system/controlDict", "writeInterval   1000;", "writeInterval   3;")
     assert errors_of(case) == []
+
+
+def test_the_stage_remembers_every_knowledge_path_it_was_asked_to_read(tmp_path):
+    """Blind-evaluation audit: the orchestrator stores these paths in the run record."""
+    setup = Setup(tmp_path, read=failed("no such file"))
+    assert setup.stage.knowledge_reads == []
+    registry = registry_of(setup)
+    registry.dispatch(call("read_knowledge", path="a/b/controlDict"))
+    registry.dispatch(call("read_knowledge", path="a/b/controlDict"))
+    registry.dispatch(call("read_knowledge", path="../escape"))  # refused, still audited
+    registry.dispatch(call("search_knowledge", query="div phi"))  # a search reads no file
+    assert setup.stage.knowledge_reads == ["a/b/controlDict", "../escape"]
+    assert CaseSetupStage().knowledge_reads == []  # per instance, never shared

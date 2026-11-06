@@ -343,3 +343,34 @@ def test_a_diagnosis_survives_the_round_trip_and_shrinks_with_the_record(run):
         )
     )
     assert len(shrunk.stages[0].attempts[0].diagnosis) <= 200
+
+
+# ------------------------------------------------------- knowledge reads and the residual line
+
+
+def test_knowledge_reads_are_bounded_cleaned_and_survive_the_round_trip(run):
+    paths = [f"flow/tutorial{i}/system/fvSchemes" for i in range(300)]
+    record = make_record(status="completed", finished_at=NOW, knowledge_reads=paths)
+    assert len(record.knowledge_reads) == 200  # bounded
+    assert record.knowledge_reads[0] == "flow/tutorial0/system/fvSchemes"
+    long = make_record(knowledge_reads=["a/" + "b" * 900 + f" at {IP1}"])
+    assert len(long.knowledge_reads[0]) <= 200 and IP1 not in long.knowledge_reads[0]
+    record.knowledge_reads.append("later/appended")  # an in-place change is cleaned on write
+    write_record(run, record)
+    assert len(read_record(run).knowledge_reads) == 200
+    assert make_record().knowledge_reads == []
+    with pytest.raises(ValidationError):
+        make_record(knowledge_reads="not a list")
+
+
+def test_summary_states_residual_control_and_the_knowledge_reads(run):
+    record = make_record(status="completed", knowledge_reads=["a/b", "c/d"])
+    write_summary(run, record, None, residual_control="Residual control: met at time 120.")
+    text = run.read_text("summary.md")
+    assert "Residual control: met at time 120." in text
+    assert "Knowledge files read by the agents: 2" in text
+    assert NO_REFERENCE_SENTENCE in text and "No Critic reviewed this run" in text
+    write_summary(run, make_record(status="completed"), None)  # both optional
+    plain = run.read_text("summary.md")
+    assert "Residual control" not in plain
+    assert "Knowledge files read by the agents: 0" in plain

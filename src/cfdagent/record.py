@@ -51,6 +51,8 @@ MAX_TEXT_CHARS = 4000  # failure reason
 MAX_ERROR_CHARS = 500  # one attempt error
 MAX_ERRORS_PER_ATTEMPT = 50
 MAX_DIAGNOSIS_CHARS = 1500  # the agent's own account of why an attempt failed
+MAX_KNOWLEDGE_READS = 200  # paths an agent asked to read from the knowledge base
+MAX_KNOWLEDGE_PATH_CHARS = 200
 SOFT_RECORD_BYTES = 1_500_000  # above this the attempt errors are cut down (limit is 2 MB)
 SHRUNK_ERRORS = 5
 SHRUNK_ERROR_CHARS = 200
@@ -173,6 +175,13 @@ class RunRecord(BaseModel):
     wall_seconds: float = Field(default=0.0, ge=0)
     critic_verdict: None = None  # filled from M2 on
     comparison: dict[str, Any] | None = None
+    # Blind-evaluation audit: every file path an agent asked to read through ``read_knowledge``.
+    knowledge_reads: list[str] = Field(default_factory=list)
+
+    @field_validator("knowledge_reads")
+    @classmethod
+    def _clean_knowledge_reads(cls, value: list[str]) -> list[str]:
+        return [redact(item, MAX_KNOWLEDGE_PATH_CHARS) for item in value[:MAX_KNOWLEDGE_READS]]
 
     @field_validator("failure_reason")
     @classmethod
@@ -282,10 +291,18 @@ def _comparison_lines(comparison: dict[str, Any]) -> list[str]:
     return lines
 
 
-def write_summary(run: RunDir, record: RunRecord, comparison: dict[str, Any] | None) -> None:
+def write_summary(
+    run: RunDir,
+    record: RunRecord,
+    comparison: dict[str, Any] | None,
+    *,
+    residual_control: str | None = None,
+) -> None:
     """Write ``summary.md``: outcome, stages, cost, and how the result was assessed.
 
-    For the end of the run only: it names the benchmark (see the module docstring).
+    ``residual_control`` is one sentence that says whether the solver's residual control was met
+    (the orchestrator builds it from the solver summary); it is printed as given, in the
+    assessment. For the end of the run only: it names the benchmark (see the module docstring).
     """
     record = _normalised(record)
     lines = [
@@ -317,7 +334,12 @@ def write_summary(run: RunDir, record: RunRecord, comparison: dict[str, Any] | N
     else:
         lines.append("No stage was completed.")
     lines += ["", "## Assessment", ""]
-    if comparison is not None:
+    if comparison is not None and "criteria" not in comparison and "problem" in comparison:
+        lines += [
+            "Benchmark run, but the comparison with the reference data could not be made: "
+            f"{_md(comparison['problem'])}"
+        ]
+    elif comparison is not None:
         lines += ["Compared with the reference data of the benchmark.", ""]
         lines += _comparison_lines(comparison)
     elif record.benchmark_id:
@@ -327,5 +349,14 @@ def write_summary(run: RunDir, record: RunRecord, comparison: dict[str, Any] | N
         )
     else:
         lines.append(NO_REFERENCE_SENTENCE)
-    lines += ["", NO_CRITIC_LINE, ""]
+    if residual_control:
+        lines += ["", _md(residual_control)]
+    lines += [
+        "",
+        f"Knowledge files read by the agents: {len(record.knowledge_reads)} "
+        "(listed in run_record.json).",
+        "",
+        NO_CRITIC_LINE,
+        "",
+    ]
     run.write_text(SUMMARY_FILE, "\n".join(lines))

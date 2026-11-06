@@ -259,6 +259,12 @@ class CaseSetupStage(Stage):
         ),
     )
 
+    def __init__(self) -> None:
+        # Every path the agent asked ``read_knowledge`` for, in order of first request, whether
+        # or not the read succeeded. The orchestrator stores it in the run record (a
+        # blind-evaluation audit: what did the agent look at?).
+        self.knowledge_reads: list[str] = []
+
     # ------------------------------------------------------------------ the agent's task
 
     def opening_message(self, ctx: StageContext) -> str:
@@ -553,6 +559,8 @@ class CaseSetupStage(Stage):
         return "\n".join(lines)
 
     def _read(self, ctx: StageContext, args: ReadKnowledgeToolArgs) -> str:
+        if args.path not in self.knowledge_reads:
+            self.knowledge_reads.append(args.path)
         request = ReadKnowledgeArgs(path=args.path, max_bytes=READ_BYTES)
         data = self._knowledge(ctx, "read_knowledge", request)
         text = data.get("text")
