@@ -32,6 +32,9 @@ BRIEF_OPS = {
     "trial_run",
     "run_solver",
     "run_utility",
+    "search_knowledge",
+    "read_knowledge",
+    "check_case_consistency",
 }
 
 
@@ -77,9 +80,8 @@ def test_protocol_models_forbid_extra_fields_and_bound_error_length():
     assert len(long.error) <= protocol.MAX_ERROR_CHARS + 100
 
 
-def test_registry_has_the_brief_ops_and_no_knowledge_ops_yet():
+def test_registry_has_the_brief_ops_and_the_case_setup_ops():
     assert set(ops.OPS) == set(protocol.ARG_MODELS) == BRIEF_OPS
-    assert not {"search_knowledge", "read_knowledge"} & set(ops.OPS)
 
 
 def test_adding_an_op_is_one_decorator_and_one_model(run, monkeypatch):
@@ -604,3 +606,108 @@ def test_the_executor_refuses_to_start_with_a_home_in_the_job_directory(tmp_path
         text=True,
     )
     assert "HOME" not in done.stderr
+
+
+# ------------------------------------------------------------------ the Case Setup ops
+
+
+@pytest.fixture
+def tutorials(tmp_path, monkeypatch):
+    root = tmp_path / "tutorials"
+    (root / "flow" / "alpha" / "system").mkdir(parents=True)
+    (root / "flow" / "alpha" / "system" / "fvSchemes").write_bytes(b"ddtSchemes { default Euler; }")
+    (root / "flow" / "beta").mkdir()
+    (root / "flow" / "beta" / "notes").write_bytes(b"mentions fvSchemes once")
+    monkeypatch.setenv("FOAM_TUTORIALS", str(root))
+    return root
+
+
+def test_search_knowledge_returns_ranked_hits_from_the_tutorial_directory(run, tutorials):
+    code, answer = _call(run, "search_knowledge", {"query": "fvSchemes", "max_hits": 5})
+    assert code == 0 and answer.ok, answer
+    assert answer.data["hits"] == [
+        {"path": "flow/alpha/system/fvSchemes", "line": 0, "text": "(the file name matches)"},
+        {"path": "flow/beta/notes", "line": 1, "text": "mentions fvSchemes once"},
+    ]
+
+
+def test_search_knowledge_bad_query_is_the_agents_failure(run, tutorials):
+    for args in ({"query": "   "}, {"query": "x" * 300}, {"query": "a", "max_hits": 0}):
+        code, answer = _call(run, "search_knowledge", args)
+        assert code == 0
+        assert answer.ok is False and answer.internal is False, args
+
+
+def test_read_knowledge_reads_files_and_refuses_the_outside(run, tutorials):
+    code, answer = _call(run, "read_knowledge", {"path": "flow/alpha/system/fvSchemes"})
+    assert answer.ok and answer.data["text"] == "ddtSchemes { default Euler; }"
+    code, answer = _call(run, "read_knowledge", {"path": "flow/alpha", "max_bytes": 100})
+    assert answer.ok and answer.data["text"] == "system/"
+    for path in ("../outside", "/etc/passwd", "flow/missing"):
+        code, answer = _call(run, "read_knowledge", {"path": path})
+        assert code == 0
+        assert answer.ok is False and answer.internal is False, path
+
+
+def test_the_knowledge_ops_without_a_tutorial_directory_are_an_internal_failure(
+    run, monkeypatch, tmp_path
+):
+    monkeypatch.delenv("FOAM_TUTORIALS", raising=False)
+    for op, args in (("search_knowledge", {"query": "x"}), ("read_knowledge", {"path": "x"})):
+        _, answer = _call(run, op, args)
+        assert answer.ok is False and answer.internal is True and "FOAM_TUTORIALS" in answer.error
+    monkeypatch.setenv("FOAM_TUTORIALS", str(tmp_path / "missing"))
+    _, answer = _call(run, "search_knowledge", {"query": "x"})
+    assert answer.ok is False and answer.internal is True
+
+
+def _boundary_case(run, kind="empty"):
+    from test_mesh_stage import boundary_text
+
+    run.write_text("case/constant/polyMesh/boundary", boundary_text({"side": (kind, 4)}))
+    run.write_text(
+        "case/system/controlDict",
+        "application icoFoam;\nstartFrom startTime;\nstartTime 0;\nstopAt endTime;\nendTime 1;\n"
+        "deltaT 0.1;\nwriteControl timeStep;\nwriteInterval 5;\n",
+    )
+    field = "boundaryField { side { type %s; } }\n"
+    run.write_text("case/0/p", field % kind)
+
+
+def test_check_case_consistency_op_reports_problems_as_a_gate_failure(run):
+    _boundary_case(run)
+    code, answer = _call(run, "check_case_consistency", {"case_dir": "case", "solver": "icoFoam"})
+    assert code == 0 and answer.ok, answer
+    assert answer.data["report"]["patches"] == {"side": "empty"}
+
+    run.write_text("case/0/p", "boundaryField { side { type zeroGradient; } }\n")
+    code, answer = _call(
+        run, "check_case_consistency", {"case_dir": "case", "solver": "pimpleFoam"}
+    )
+    assert answer.ok is False and answer.internal is False
+    assert len(answer.data["errors"]) == 2  # the constraint type and the application
+    assert "0/p" in answer.error and "pimpleFoam" in answer.error
+
+
+def test_check_case_consistency_op_refuses_other_solvers_and_bad_directories(run):
+    _boundary_case(run)
+    for args in (
+        {"case_dir": "case", "solver": "blockMesh"},
+        {"case_dir": "nowhere", "solver": "icoFoam"},
+        {"case_dir": "../case", "solver": "icoFoam"},
+    ):
+        code, answer = _call(run, "check_case_consistency", args)
+        assert code == 0
+        assert answer.ok is False and answer.internal is False, args
+
+
+def test_the_solver_list_of_the_host_stage_matches_the_tool_layer():
+    from cfdagent.agents.case_setup import KNOWN_SOLVERS
+
+    assert set(KNOWN_SOLVERS) == set(foam.SOLVERS)
+
+
+def test_read_knowledge_refuses_an_absolute_path_with_dot_dot(run, tutorials):
+    for path in (str(tutorials) + "/../../../etc/hostname", str(tutorials) + "/flow/../.."):
+        _, answer = _call(run, "read_knowledge", {"path": path})
+        assert answer.ok is False and answer.internal is False, path

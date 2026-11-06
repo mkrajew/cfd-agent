@@ -217,3 +217,27 @@ class RunUtilityArgs(ArgsModel):
         list[Annotated[str, Field(max_length=1000)]], Field(min_length=1, max_length=64)
     ]
     cwd: RelPath = "."
+
+
+@op_args("search_knowledge")
+class SearchKnowledgeArgs(ArgsModel):
+    """Lexical search over the OpenFOAM tutorials of the image (``$FOAM_TUTORIALS``)."""
+
+    query: str = Field(max_length=1000)
+    max_hits: Annotated[StrictInt, Field(ge=1, le=50)] = 10
+
+
+@op_args("read_knowledge")
+class ReadKnowledgeArgs(ArgsModel):
+    """One file (or directory listing) below ``$FOAM_TUTORIALS``; the path is relative to it."""
+
+    path: str = Field(min_length=1, max_length=1024)
+    max_bytes: Annotated[StrictInt, Field(ge=1, le=100_000)] = 20000
+
+
+@op_args("check_case_consistency")
+class CheckCaseConsistencyArgs(ArgsModel):
+    """Mesh patches against the field files of ``0/``, and ``controlDict`` against the solver."""
+
+    case_dir: RelPath
+    solver: str = Field(max_length=64)
