@@ -6,6 +6,7 @@ import re
 import signal
 import subprocess
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -847,7 +848,8 @@ def test_summary_says_residual_control_was_not_met_for_a_steady_run(tmp_path):
             stopped_by_residual_control=False, warnings=["A linear solve ran 1000 iterations"]
         ),
     )
-    assert "NOT met" in line and "not shown to be converged" in line
+    assert "no residualControl criterion ended the run" in line
+    assert "not shown to be converged" in line
     assert "9.1e-06" in line or "9.1e-6" in line  # the last initial residuals
 
 
@@ -859,7 +861,8 @@ def test_summary_residual_control_is_not_applicable_to_transient_or_unknown_runs
     marched = solver_summary(
         solver="icoFoam", steady=False, steady_expected=True, stopped_by_residual_control=None
     )
-    assert "not applicable" in residual_line(tmp_path / "b", marched)
+    not_tested = residual_line(tmp_path / "b", marched)
+    assert "not available" in not_tested and "convergence was not tested" in not_tested
     assert "not applicable" in residual_line(tmp_path / "c", None)  # no solver summary
     failed_run = solver_summary(ok=False, stopped_by_residual_control=None)
     assert "unknown" in residual_line(tmp_path / "d", failed_run).lower()
@@ -994,3 +997,122 @@ def test_the_default_directory_size_counts_files_without_following_links(tmp_pat
     (tmp_path / "f2").write_bytes(b"y" * 500)
     assert orchestrator.directory_size(tmp_path) == 1500
     assert orchestrator.directory_size(tmp_path / "missing") == 0
+
+
+# ---------------------------------------------------------------------- fix round 1
+
+
+def test_a_baseexception_that_is_not_an_interrupt_never_leaves_a_completed_record(tmp_path):
+    """SystemExit in a step: the record on disk says failed, the exception still propagates."""
+
+    def leave(ctx):
+        raise SystemExit(3)
+
+    uploader = FakeUploader()
+    with pytest.raises(SystemExit):
+        go(tmp_path, FakeStep("one", action=leave), uploader=uploader)
+    (run_dir,) = (tmp_path / "runs").iterdir()
+    record = json.loads((run_dir / "run_record.json").read_text(encoding="utf-8"))
+    assert record["status"] == "failed"
+    assert record["failure_reason"].startswith("internal_error")
+    status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+    assert status["state"] == "failed"
+    summary = (run_dir / "summary.md").read_text(encoding="utf-8")
+    assert "Status: **failed**" in summary
+    assert uploader.calls == 1
+    assert not active_run(tmp_path).exists()
+
+
+def test_the_watchdog_keeps_killing_and_later_executor_calls_are_refused(tmp_path):
+    """The cap is crossed while the agent waits on the model: nothing runs to kill at that
+    moment, so the next executor call must be refused instead of running unwatched."""
+    from cfdagent.sandbox.config import SandboxConfig
+
+    kills = []
+    tripped = threading.Event()
+
+    class Sandbox:
+        closed = False
+
+        def kill_active(self):
+            kills.append(1)
+            self.closed = True
+            tripped.set()
+
+        def call(self, *args):
+            if self.closed:
+                raise ToolFailure("the run directory exceeded its cap; no more executors")
+            return None
+
+    holder = Sandbox()
+
+    def model_wait_then_call(ctx):
+        assert tripped.wait(30), "the watchdog never fired"
+        ctx.sandbox.call("run_script")  # refused: the executor is closed
+
+    result = go(
+        tmp_path,
+        FakeStep("grower", action=model_wait_then_call),
+        sandbox_factory=lambda config, run, run_id: holder,
+        dir_size=lambda root: 50 * GIB,
+        watchdog_interval_s=0.01,
+    )
+    assert result.status == "failed"
+    assert "run directory exceeded 20 GiB" in result.record.failure_reason
+    assert len(kills) >= 1
+    assert SandboxConfig  # (the real client is covered in test_sandbox_client)
+
+
+def test_the_watchdog_loop_goes_on_killing_and_heartbeating_after_the_cap_is_crossed(tmp_path):
+    kills, beats = [], []
+    monitor = orchestrator._Monitor(
+        tmp_path, 10, 0.01, lambda root: 100, lambda: kills.append(1), lambda: beats.append(1)
+    )
+    monitor.start()
+    deadline = time.monotonic() + 5
+    while len(kills) < 3 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    monitor.stop()
+    assert monitor.exceeded and len(kills) >= 3 and len(beats) >= 3
+
+
+def test_a_failing_pre_write_block_does_not_skip_summary_and_upload(tmp_path, monkeypatch):
+    uploader = FakeUploader()
+    original = orchestrator._Session.sync_record
+    calls = []
+
+    def sync_that_fails_at_the_end(self):
+        calls.append(1)
+        if self._finishing:
+            raise RuntimeError("cannot sync")
+        return original(self)
+
+    monkeypatch.setattr(orchestrator._Session, "sync_record", sync_that_fails_at_the_end)
+    result = go(tmp_path, FakeStep("one", ok=False, reason="the real reason"), uploader=uploader)
+    assert result.status == "failed"
+    assert (result.run_dir / "summary.md").is_file() and uploader.calls == 1
+    assert "cannot sync" in log_text(result)
+    assert not active_run(tmp_path).exists()
+
+
+def test_a_failing_knowledge_reads_does_not_break_the_record(tmp_path):
+    class BrokenReads(FakeStep):
+        def knowledge_reads(self):
+            raise RuntimeError("no reads for you")
+
+    result = go(tmp_path, BrokenReads("one"))
+    assert result.status == "completed"
+    assert "no reads for you" in log_text(result)
+
+
+def test_a_comparison_that_cannot_be_recorded_becomes_a_problem_comparison(tmp_path, monkeypatch):
+    root = make_benchmarks(tmp_path)
+
+    def odd(self):
+        return {"passed": True, "criteria": [], "weird": float("nan")}
+
+    monkeypatch.setattr(orchestrator._Session, "compare", odd)
+    analyst = FakeStep("analyst", action=write_quantities(GOOD_QUANTITIES))
+    result = go(tmp_path, analyst, config=bench_config(), benchmarks_root=root)
+    assert result.status == "completed"
+    assert result.comparison["passed"] is False and result.comparison["problem"]

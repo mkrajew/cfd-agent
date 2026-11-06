@@ -500,3 +500,15 @@ def test_kill_active_stops_the_running_container_and_the_call_returns(tmp_path):
     runner.run_calls.clear()
     client.kill_active()  # nothing is active any more: harmless, no command
     assert runner.run_calls == []
+
+
+def test_a_killed_client_refuses_later_calls(tmp_path):
+    """The watchdog may fire while no call is waiting; the next call must not run unwatched."""
+    from cfdagent.errors import ToolFailure
+
+    runner = FakeRunner(response=OpResponse(ok=True, data={"v": 1}))
+    client, _ = _client(tmp_path, runner)
+    client.kill_active()  # nothing is running: nothing to kill, but the client is closed now
+    with pytest.raises(ToolFailure, match="closed"):
+        client.call("run_solver", SOLVE_ARGS, timeout_s=30)
+    assert runner.popen_calls == []

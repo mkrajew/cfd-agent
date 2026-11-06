@@ -31,6 +31,11 @@ the run is going: not in the record on disk (see ``record``), ``status.json``, `
 ``task.md``, and the run id is made from the task's first line, not from the benchmark id.
 Reference files are opened only inside the Scorer step.
 
+Operational notes. The active-run marker is one file per VM: one run at a time is assumed. The
+default run root is ``~/runs``; the command line (Task 21) wires ``CFDAGENT_RUNS_DIR`` to
+``run_root``. ``SandboxClient.kill_active`` in local mode kills only the client process of an
+executor (local mode is test-only); in docker mode it kills the named containers.
+
 Environment variables: ``CFDAGENT_STATE_DIR`` (marker directory), ``CFDAGENT_STORAGE_ACCOUNT_URL``
 (the Blob account URL the upload uses; without it the upload is skipped with a note) and the
 model variables read by ``RunConfig.llm_settings_from_env``.
@@ -226,6 +231,8 @@ def _pricing(config: RunConfig) -> Pricing:
                 "add it to llm.cost.PRICING"
             )
         prices.append(price)
+    # Conservative on purpose: a mixed-model run is priced at the dearest model in each direction,
+    # so the cost is overestimated and the cap trips early rather than late.
     return Pricing(
         input_per_m=max(p.input_per_m for p in prices),
         output_per_m=max(p.output_per_m for p in prices),
@@ -271,9 +278,10 @@ def residual_control_line(run: RunDir) -> str:
         )
     if not data.get("steady"):
         return (
-            prefix + f"not applicable ({solver} is a transient solver and has no residual control; "
-            "whether the flow reached a steady state is judged from the change of the results "
-            "between the last write times, see analysis.md)."
+            prefix + f"not available ({solver} is a transient solver and has no residual control: "
+            "convergence was not tested by the solver; whether the flow reached a steady state "
+            "is judged from the change of the results between the last write times, see "
+            "analysis.md)."
         )
     if data.get("ok") is not True or data.get("stopped_by_residual_control") is None:
         return prefix + "unknown (the solver run did not finish)."
@@ -302,8 +310,9 @@ def residual_control_line(run: RunDir) -> str:
         else ""
     )
     return (
-        prefix + f"NOT met: the run ended{at} without satisfying its residualControl, so the "
-        f"result is not shown to be converged by the solver's own criterion.{shown}{warned}"
+        prefix + f"not met: the run ended{at} and no residualControl criterion ended the run "
+        "(none is set, or it was not satisfied), so the result is not shown to be converged by "
+        f"the solver's own criterion.{shown}{warned}"
     )
 
 
@@ -343,10 +352,11 @@ class _Monitor:
             except Exception:  # a watchdog never raises into the run
                 pass
             try:
-                if self.size_fn(self.root) > self.cap:
+                # Once over the cap, keep killing every interval: an executor started after the
+                # first kill (the agent was waiting on the model) must not run unwatched.
+                if self.exceeded or self.size_fn(self.root) > self.cap:
                     self.exceeded = True  # first, so the run can tell why its executor died
                     self.kill()
-                    return
             except Exception:
                 pass
 
@@ -403,9 +413,12 @@ class _Session:
         )
         self.steps: list[Step] = []
         self.current: str | None = None
-        self.status = "completed"
+        # Pessimistic until the pipeline and the Scorer have returned normally: an exit that is
+        # neither an interrupt nor an Exception (SystemExit and the like) never reads "completed".
+        self.status = "failed"
+        self._failure_set = False
         self.failed_stage: str | None = None
-        self.reason: str | None = None
+        self.reason: str | None = "internal_error: the run ended abnormally"
         self.comparison: dict | None = None
         self.monitor: _Monitor | None = None
         self._marker: Path | None = None
@@ -456,7 +469,13 @@ class _Session:
         record.wall_seconds = max(0.0, self.clock() - self.started_clock)
         reads = list(record.knowledge_reads)
         for step in self.steps:
-            for path in step.knowledge_reads():
+            try:
+                found = step.knowledge_reads()
+            except Exception as exc:  # an audit list must not break the record
+                detail = _exception_text(exc)[:200]
+                self.log(f"knowledge reads of {step.name} unavailable: {detail}")
+                continue
+            for path in found:
                 if path not in reads:
                     reads.append(path)
         record.knowledge_reads = reads
@@ -526,6 +545,7 @@ class _Session:
 
     def fail(self, stage: str | None, reason: str, status: str = "failed") -> None:
         self.status, self.failed_stage, self.reason = status, stage, reason
+        self._failure_set = True
 
     def run_pipeline(self) -> None:
         for make in self.pipeline:
@@ -581,15 +601,25 @@ class _Session:
         }
 
     def run_scorer(self) -> None:
-        if self.benchmark is None or self.status != "completed":
+        """Score the quantities (called only after every step passed)."""
+        if self.benchmark is None:
             return
         self.current = "scorer"
         self.log("scorer: start")
-        self.comparison = self.compare()
-        self.record.comparison = self.comparison
-        self.log("scorer: done" if "criteria" in self.comparison else "scorer: could not score")
         try:
-            self.run.write_text(COMPARISON_FILE, json.dumps(self.comparison, indent=2) + "\n")
+            comparison = self.compare()
+            text = json.dumps(comparison, indent=2, allow_nan=False) + "\n"  # NaN is not JSON
+            self.record.comparison = comparison
+        except Exception as exc:  # an odd value must not turn a passed gate into a failed run
+            comparison = self._problem(
+                f"the comparison could not be recorded: {_exception_text(exc)}"
+            )
+            text = json.dumps(comparison, indent=2) + "\n"
+            self.record.comparison = comparison
+        self.comparison = comparison
+        self.log("scorer: done" if "criteria" in comparison else "scorer: could not score")
+        try:
+            self.run.write_text(COMPARISON_FILE, text)
         except Exception as exc:
             self.log(f"comparison.json could not be written: {_exception_text(exc)[:200]}")
 
@@ -614,7 +644,9 @@ class _Session:
                 self.save_record()
                 self.write_status("running", None)
                 self.run_pipeline()
-                self.run_scorer()
+                if not self._failure_set:
+                    self.run_scorer()
+                    self.status, self.failed_stage, self.reason = "completed", None, None
             except KeyboardInterrupt as exc:
                 what = "SIGTERM" if isinstance(exc, _Terminated) else "the user (KeyboardInterrupt)"
                 self.fail(self.current, f"interrupted by {what}", "interrupted")
@@ -625,6 +657,10 @@ class _Session:
                     self.fail(self.current, f"run directory exceeded {_format_bytes(self.cap)}")
                 else:
                     self.fail(self.current, f"internal_error: {_exception_text(exc)}")
+            except BaseException as exc:  # SystemExit and the like: record it, then let it go on
+                name = type(exc).__name__
+                self.fail(self.current, f"internal_error: the run ended abnormally ({name})")
+                raise
         finally:
             self._finishing = True
             try:
@@ -640,11 +676,14 @@ class _Session:
         if self.monitor is not None:
             self.monitor.stop()
         record = self.record
-        record.status = self.status  # type: ignore[assignment]
-        record.failed_stage = self.failed_stage
-        record.failure_reason = self.reason
-        record.finished_at = self.now()
-        self.sync_record()
+        try:
+            record.status = self.status  # type: ignore[assignment]
+            record.failed_stage = self.failed_stage
+            record.failure_reason = self.reason
+            record.finished_at = self.now()
+            self.sync_record()
+        except Exception as exc:  # the summary and the upload must still happen
+            self.log(f"the final record could not be prepared: {_exception_text(exc)[:200]}")
         suffix = f" ({redact(self.reason, MAX_LOG_REASON_CHARS)})" if self.reason else ""
         self.log(f"run: {self.status}{suffix}")
         self.write_status(self.status, self.failed_stage)
