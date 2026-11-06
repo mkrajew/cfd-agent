@@ -24,6 +24,8 @@ MAX_SLUG_CHARS = 40
 MAX_RANKS_LIMIT = 4  # pipeline invariant: never more than four MPI ranks
 
 _NOT_SLUG = re.compile(r"[^a-z0-9]+")
+# ``YYYYMMDD-HHMMSS-<slug>``; match with ``fullmatch`` (``$`` would accept a trailing newline).
+RUN_ID_PATTERN = re.compile(r"\d{8}-\d{6}-[a-z0-9-]+")
 
 
 class RunLimits(BaseModel):
@@ -93,6 +95,11 @@ def slugify(text: str) -> str:
     """Lowercase ``[a-z0-9-]`` slug of at most 40 characters; ``run`` if nothing is left."""
     slug = _NOT_SLUG.sub("-", text.lower()).strip("-")[:MAX_SLUG_CHARS].strip("-")
     return slug or "run"
+
+
+def is_run_id(text: object) -> bool:
+    """True when ``text`` has the shape of a run id; it is then safe as one path component."""
+    return isinstance(text, str) and RUN_ID_PATTERN.fullmatch(text) is not None
 
 
 def make_run_id(slug: str, now: datetime) -> str:

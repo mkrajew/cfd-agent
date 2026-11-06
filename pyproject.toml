@@ -30,6 +30,9 @@ toolchain = [
     "matplotlib",
 ]
 
+[project.scripts]
+cfdagent = "cfdagent.cli:app"
+
 [project.urls]
 Repository = "https://github.com/mkrajew/cfd-agent"
 
