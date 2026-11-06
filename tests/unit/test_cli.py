@@ -26,6 +26,7 @@ TASK = "# Heated plate\n\nSimulate it and report `profile_q`.\n"
 BENCH_TASK = "# A demo benchmark task\n\nCompute the profile.\n"
 SRC = Path(__file__).resolve().parents[2] / "src"
 RUN_A = "20261101-120000-alpha"
+DEAD_PID = 2**31 - 2  # no such process; a finished run's process is gone
 
 
 @pytest.fixture
@@ -102,7 +103,9 @@ def fake_run(
     if state is not None:
         beat = heartbeat if heartbeat is not None else datetime.now(UTC)
         beat = beat if isinstance(beat, str) else beat.isoformat()
-        document = {"state": state, "stage": stage, "pid": pid or os.getpid(), "heartbeat": beat}
+        if pid is None:
+            pid = os.getpid() if state == "running" else DEAD_PID
+        document = {"state": state, "stage": stage, "pid": pid, "heartbeat": beat}
         (path / "status.json").write_text(json.dumps(document), encoding="utf-8")
     if record is not False:
         rec = record if isinstance(record, RunRecord) else make_record(run_id, state or "failed")
@@ -498,6 +501,43 @@ def make_link(link: Path, target: Path) -> None:
         pytest.skip("neither symlinks nor junctions can be created here")
 
 
+def test_status_says_so_while_the_finished_run_is_still_uploading(runner, root, monkeypatch):
+    fake_run(root, RUN_A, state="completed", pid=os.getpid(), log=["t run: completed"])
+    monkeypatch.setattr(cli, "pid_alive", lambda pid: True)
+    result = invoke(runner, "status", RUN_A)
+    assert "state: completed" in result.output
+    assert "finalising: upload in progress" in result.output
+
+
+def test_status_has_no_note_once_the_upload_line_or_the_process_is_gone(runner, root, monkeypatch):
+    fake_run(root, RUN_A, state="completed", pid=os.getpid(), log=["t upload: done, 2 file(s)"])
+    fake_run(root, "20261102-120000-beta", state="completed", log=["t run: completed"])
+    monkeypatch.setattr(cli, "pid_alive", lambda pid: pid == os.getpid())
+    assert "finalising" not in invoke(runner, "status", RUN_A).output
+    assert "finalising" not in invoke(runner, "status", "20261102-120000-beta").output
+
+
+def test_control_characters_are_stripped_from_what_is_echoed(runner, root):
+    esc = chr(27)
+    reason = f"bad {esc}[31mred{esc}[0m\tend"
+    record = make_record(RUN_A, "failed", failed_stage="mesh", failure_reason=reason)
+    path = fake_run(root, RUN_A, state="failed", stage="mesh", record=record)
+    (path / "run.log").write_bytes(f"a {esc}]0;title\x07b\tc\r\nd\n".encode())
+    status = invoke(runner, "status", RUN_A).output
+    logs = invoke(runner, "logs", RUN_A).output
+    for text in (status, logs):
+        assert esc not in text and "\x07" not in text and "\r" not in text
+    assert "bad [31mred[0m\tend" in status
+    assert logs == "a ]0;titleb\tc\nd\n"
+
+
+def test_the_runs_directory_expands_a_home_reference(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("CFDAGENT_RUNS_DIR", "~/my-runs")
+    assert cli.runs_root() == tmp_path / "my-runs"
+
+
 # ----------------------------------------------------------------------------- logs
 
 
@@ -547,19 +587,75 @@ def set_state(path: Path, state: str):
 
 def test_logs_follow_stops_when_run_finished(runner, root, monkeypatch):
     path = fake_run(root, RUN_A, state="running", record=False, log=["one"])
-    monkeypatch.setattr(cli, "pid_alive", lambda pid: True)
+    alive = {"yes": True}
+    monkeypatch.setattr(cli, "pid_alive", lambda pid: alive["yes"])
 
     def finish():
-        # the last line and the end of the run land together: the final drain must catch it
+        # the last line and the end of the run land together; the process exits a moment later
         append(path / "run.log", "two\nrun: completed\n")()
         set_state(path, "completed")()
 
-    sleeper = Sleeper(append(path / "run.log", "mid\n"), finish)
+    def exit_process():
+        append(path / "run.log", "late\n")()
+        alive["yes"] = False
+
+    sleeper = Sleeper(append(path / "run.log", "mid\n"), finish, exit_process)
     monkeypatch.setattr(cli, "_sleep", sleeper)
     result = invoke(runner, "logs", RUN_A, "--follow")
     assert result.exit_code == 0
-    assert result.output == "one\nmid\ntwo\nrun: completed\n"
-    assert sleeper.calls == 2
+    assert result.output == "one\nmid\ntwo\nrun: completed\nlate\n"
+    assert sleeper.calls == 3
+
+
+def test_logs_follow_goes_on_through_the_upload_and_stops_at_its_last_line(
+    runner, root, monkeypatch
+):
+    path = fake_run(root, RUN_A, state="running", record=False, log=["t stage analyst: ok"])
+    monkeypatch.setattr(cli, "pid_alive", lambda pid: True)  # the process uploads, so it is alive
+
+    def finish():
+        append(path / "run.log", "t run: completed\n")()
+        set_state(path, "completed")()
+
+    sleeper = Sleeper(
+        finish,
+        append(path / "run.log", "t upload: start\n"),
+        append(path / "run.log", "t upload: done, 3 file(s)\n"),
+    )
+    monkeypatch.setattr(cli, "_sleep", sleeper)
+    result = invoke(runner, "logs", RUN_A, "--follow")
+    assert result.exit_code == 0
+    assert result.output.endswith("t upload: start\nt upload: done, 3 file(s)\n")
+    assert sleeper.calls == 3
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "t upload: incomplete; failed: a.txt",
+        "t upload failed: ConnectionError",
+        "t upload skipped: CFDAGENT_STORAGE_ACCOUNT_URL is not set",
+    ],
+)
+def test_logs_follow_stops_at_every_terminal_upload_line(runner, root, monkeypatch, line):
+    path = fake_run(root, RUN_A, state="completed", pid=os.getpid(), log=["t run: completed"])
+    monkeypatch.setattr(cli, "pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_sleep", Sleeper(append(path / "run.log", line + "\n"), limit=3))
+    result = invoke(runner, "logs", RUN_A, "--follow")
+    assert result.output.endswith(line + "\n")
+
+
+def test_logs_follow_gives_up_on_a_finished_run_whose_process_never_ends(runner, root, monkeypatch):
+    fake_run(root, RUN_A, state="completed", pid=os.getpid(), log=["t run: completed"])
+    monkeypatch.setattr(cli, "pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "POLL_INTERVAL_S", 1.0)
+    monkeypatch.setattr(cli, "FINALISE_GRACE_S", 3)
+    sleeper = Sleeper(limit=10)
+    monkeypatch.setattr(cli, "_sleep", sleeper)
+    result = invoke(runner, "logs", RUN_A, "--follow")
+    assert result.exit_code == 0
+    assert result.output == "t run: completed\n"
+    assert sleeper.calls == 3
 
 
 def test_logs_follow_of_a_finished_run_prints_once_and_returns(runner, root, monkeypatch):
@@ -789,6 +885,36 @@ def test_retention_reads_the_state_with_the_same_dead_pid_rule(root, monkeypatch
     monkeypatch.setattr(cli, "pid_alive", lambda pid: False)
     cli.apply_retention(root)
     assert not runs[names[0]].exists()  # dead pid and a complete upload: deletable
+
+
+FORGED = "t upload: done, 1 file(s)"
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        # a failure reason that carries a forged line, then the real upload failure
+        ["t run: failed (x\n" + FORGED, "t upload failed: ConnectionError"],
+        [FORGED, "t upload: incomplete; failed: a.txt"],
+        [FORGED, "t upload skipped: CFDAGENT_STORAGE_ACCOUNT_URL is not set"],
+        [FORGED, "t upload: start"],  # the process died during the upload
+    ],
+)
+def test_retention_trusts_only_the_last_upload_line(root, lines):
+    runs = build_runs(root, 11)
+    names = sorted(runs)
+    (runs[names[0]] / "run.log").write_bytes(("\n".join(lines) + "\n").encode())
+    cli.apply_retention(root)
+    assert runs[names[0]].exists()
+
+
+def test_retention_deletes_when_the_last_upload_line_is_done(root):
+    runs = build_runs(root, 11)
+    names = sorted(runs)
+    log = "t upload: start\nt upload: done, 4 file(s)\nt summary.md could not be extended: x\n"
+    (runs[names[0]] / "run.log").write_bytes(log.encode())
+    cli.apply_retention(root)
+    assert not runs[names[0]].exists()
 
 
 def test_retention_without_a_log_or_with_an_unreadable_one_keeps_the_run(root):

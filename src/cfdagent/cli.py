@@ -27,6 +27,17 @@ was incomplete is never deleted, so the directory count can exceed 10. Links are
 ``status`` and ``list`` show a record in state ``running`` as ``interrupted`` when its process is
 gone or its heartbeat is older than five minutes.
 
+The orchestrator writes the final ``status.json`` before it uploads. While that process is still
+alive and ``run.log`` has no closing upload line, ``status`` adds a note ("finalising") and
+``logs --follow`` goes on, until the process is gone, a line that ends the upload (``done``,
+``incomplete``, ``failed``, ``skipped``) appears, or ``FINALISE_GRACE_S`` (10 minutes) passes, so
+that a hung process cannot hold the command forever. Retention trusts only the last upload line
+of ``run.log``: a failure text that contains a forged ``upload: done`` line is followed by the
+real upload line, which decides.
+
+Text taken from run files is printed without control characters (terminal escape sequences);
+only newline and tab stay.
+
 Importing this module is cheap on purpose: the orchestrator (and with it the agents, the sandbox
 client and the storage layer) is imported inside ``run`` only.
 """
@@ -62,13 +73,17 @@ KEEP_RUNS = 10
 HEARTBEAT_STALE_S = 300.0
 POLL_INTERVAL_S = 1.0
 START_GRACE_S = 60  # how long ``logs --follow`` waits for a detached run to appear
+FINALISE_GRACE_S = 600  # how long it waits for a finished run's process to end its upload
 ORPHAN_LAUNCHER_LOG_S = 24 * 3600.0
 LOG_TAIL_BYTES = 256 * 1024
 READ_CHUNK = 64 * 1024
 FINISHED_STATES = ("completed", "failed", "interrupted")
 STATES = ("running", *FINISHED_STATES)
 
-_UPLOAD_DONE = re.compile(r"^\S+ upload: done, \d+ file\(s\)\r?$", re.MULTILINE)
+_UPLOAD_LINE = re.compile(r"^\S+ upload[: ].*$", re.MULTILINE)
+_UPLOAD_DONE = re.compile(r"^\S+ upload: done, \d+ file\(s\)$")
+_UPLOAD_ENDED = re.compile(r"^\S+ upload(: done|: incomplete| failed| skipped)")
+_CONTROL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _LAUNCHER_LOG = re.compile(r"\.launch-(?P<run_id>\d{8}-\d{6}-[a-z0-9-]+)\.log")
 
 app = typer.Typer(
@@ -90,7 +105,7 @@ class Effort(StrEnum):
 def runs_root() -> Path:
     """The directory of the run directories: ``$CFDAGENT_RUNS_DIR`` or ``~/runs``."""
     value = os.environ.get(RUNS_DIR_ENV)
-    return Path(value) if value else Path.home() / "runs"
+    return Path(value).expanduser() if value else Path.home() / "runs"
 
 
 def _usage_error(message: str) -> NoReturn:
@@ -136,6 +151,11 @@ def _is_real_dir(path: Path) -> bool:
         return stat.S_ISDIR(os.lstat(path).st_mode) and not _is_link(path)
     except OSError:
         return False
+
+
+def _clean(text: str) -> str:
+    """``text`` without control characters (no terminal escape sequences); newline and tab stay."""
+    return _CONTROL.sub("", text)
 
 
 def _money(value: float | None) -> str:
@@ -201,6 +221,7 @@ class RunView:
     started: datetime | None
     finished: datetime | None
     reason: str | None
+    finalising: bool = False  # finished, but its process is alive and the upload is not over
 
 
 def _read_dict(run: RunDir, name: str) -> dict[str, Any] | None:
@@ -249,14 +270,22 @@ def view_of(path: Path) -> RunView:
     stage = status.get("stage") if status is not None else None
     if not isinstance(stage, str):
         stage = record.failed_stage if record is not None else None
+    finalising = (
+        status is not None
+        and status.get("state") in FINISHED_STATES
+        and pid_alive(status.get("pid"))
+        and not _upload_has_ended(path)
+    )
+    reason = record.failure_reason if record is not None else None
     return RunView(
         run_id=path.name,
         state=state or "unknown",
-        stage=stage,
+        stage=_clean(stage) if stage is not None else None,
         cost_usd=record.cost_usd if record is not None else None,
         started=record.started_at if record is not None else None,
         finished=record.finished_at if record is not None else None,
-        reason=record.failure_reason if record is not None else None,
+        reason=_clean(reason) if reason is not None else None,
+        finalising=finalising,
     )
 
 
@@ -289,18 +318,34 @@ def run_directories(root: Path) -> list[Path]:
 # ---------------------------------------------------------------------------------- retention
 
 
-def _upload_is_complete(path: Path) -> bool:
+def _last_upload_line(path: Path) -> str | None:
+    """The last ``<time> upload...`` line of the run's ``run.log`` (its tail), or ``None``.
+
+    Only the last one counts: a message of the orchestrator may contain text from the sandbox,
+    including a forged upload line, but the real upload lines come after it.
+    """
     log = path / LOG_FILE
     if not _is_regular_file(log):
-        return False
+        return None
     try:
         size = os.lstat(log).st_size
         with open(log, "rb") as handle:
             handle.seek(max(0, size - LOG_TAIL_BYTES))
             tail = handle.read(LOG_TAIL_BYTES)
     except OSError:
-        return False
-    return _UPLOAD_DONE.search(tail.decode("utf-8", errors="replace")) is not None
+        return None
+    lines = _UPLOAD_LINE.findall(tail.decode("utf-8", errors="replace"))
+    return lines[-1].rstrip("\r") if lines else None
+
+
+def _upload_is_complete(path: Path) -> bool:
+    line = _last_upload_line(path)
+    return line is not None and _UPLOAD_DONE.match(line) is not None
+
+
+def _upload_has_ended(path: Path) -> bool:
+    line = _last_upload_line(path)
+    return line is not None and _UPLOAD_ENDED.match(line) is not None
 
 
 def _is_live(path: Path) -> bool:
@@ -539,9 +584,9 @@ def run(
     typer.echo(f"cost: {_money(record.cost_usd)}")
     typer.echo(f"run directory: {result.run_dir}")
     if result.status == "failed":
-        typer.echo(f"failed at stage: {record.failed_stage or 'n/a'}")
+        typer.echo(f"failed at stage: {_clean(record.failed_stage or 'n/a')}")
     if record.failure_reason and result.status != "completed":
-        typer.echo(f"reason: {record.failure_reason}")
+        typer.echo(f"reason: {_clean(record.failure_reason)}")
 
     if not no_upload:
         try:
@@ -576,6 +621,8 @@ def status(run_id: Annotated[str, typer.Argument(help="Run id.")]) -> None:
     view = view_of(path)
     typer.echo(f"run: {view.run_id}")
     typer.echo(f"state: {view.state}")
+    if view.finalising:
+        typer.echo("note: finalising: upload in progress")
     typer.echo(f"stage: {view.stage or '-'}")
     typer.echo(f"cost: {_money(view.cost_usd)}")
     if view.started is not None:
@@ -606,7 +653,7 @@ def _drain(path: Path, offset: int, decoder: codecs.IncrementalDecoder) -> int:
             handle.seek(offset)
             while chunk := handle.read(READ_CHUNK):
                 offset += len(chunk)
-                text = decoder.decode(chunk)
+                text = _clean(decoder.decode(chunk))
                 if text:
                     typer.echo(text, nl=False)
     except OSError:
@@ -643,12 +690,20 @@ def logs(
     decoder = _new_decoder()
     waits = 0
     max_waits = math.ceil(START_GRACE_S / POLL_INTERVAL_S)
+    max_finalising = math.ceil(FINALISE_GRACE_S / POLL_INTERVAL_S)
+    finalising = 0
     try:
         while True:
             run_path = _existing_run(root, run_id)
             view = view_of(run_path) if run_path is not None else None
             # The state is read before the drain, so the drain after it sees every final line.
-            finished = view is not None and view.state in FINISHED_STATES
+            finished = False
+            if view is not None and view.state in FINISHED_STATES:
+                # The final status is written before the upload: wait for the upload lines.
+                if view.finalising and finalising < max_finalising:
+                    finalising += 1
+                else:
+                    finished = True
             target = run_path / LOG_FILE if run_path is not None else launcher
             if target != source:
                 source, offset, decoder = target, 0, _new_decoder()
