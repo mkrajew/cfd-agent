@@ -29,7 +29,48 @@ by Azure AI Foundry models. This is a research project; see
 
 ## Quick start
 
-Available from v0.1.0.
+Install the dependencies and the `cfdagent` command (Python 3.12 and [uv](https://docs.astral.sh/uv/)):
+
+```bash
+uv sync
+```
+
+The agents need a model endpoint; results are uploaded to Blob Storage when an account is
+configured. Authentication is keyless (Entra ID), so no key is involved. Use your own values for
+the placeholders:
+
+```bash
+export CFDAGENT_LLM_ENDPOINT="https://<account>.services.ai.azure.com/openai/v1/"
+export CFDAGENT_STORAGE_ACCOUNT_URL="https://<storage-account>.blob.core.windows.net"  # optional
+export CFDAGENT_RUNS_DIR="$HOME/runs"                                                   # default
+```
+
+Run a task written in a Markdown file, or a registered benchmark:
+
+```bash
+cfdagent run task.md
+cfdagent run --benchmark <benchmark-id>
+cfdagent run task.md --model <deployment> --reasoning-effort high
+cfdagent run task.md --no-upload      # keep the results on this machine only
+```
+
+`cfdagent run` waits for the run and prints one line `run <run-id>: <status>` with the cost and the
+run directory. The exit code is 0 for a completed run, 1 for a failed one, 130 for an interrupted
+one and 2 for a usage error. Without `CFDAGENT_STORAGE_ACCOUNT_URL` the upload is skipped and the
+run directory under `CFDAGENT_RUNS_DIR` holds everything.
+
+A long run can go to the background and be followed from another terminal or after logging out:
+
+```bash
+cfdagent run task.md --detach         # prints the run id and returns
+cfdagent status <run-id>              # state, stage, cost; a dead run shows as "interrupted"
+cfdagent logs <run-id> --follow       # stage events, until the run has ended
+cfdagent list                         # recent runs with status and cost (--limit N)
+```
+
+Local copies: after a run that was uploaded, only the newest 10 run directories stay under
+`CFDAGENT_RUNS_DIR`. A run whose upload failed, was skipped or was incomplete is never deleted, so
+nothing is lost before it reached Blob Storage.
 
 ## Validation
 

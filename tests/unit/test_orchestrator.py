@@ -1116,3 +1116,55 @@ def test_a_comparison_that_cannot_be_recorded_becomes_a_problem_comparison(tmp_p
     result = go(tmp_path, analyst, config=bench_config(), benchmarks_root=root)
     assert result.status == "completed"
     assert result.comparison["passed"] is False and result.comparison["problem"]
+
+
+# ------------------------------------------------------------------ a run id chosen by the caller
+
+
+def test_new_run_id_is_built_from_the_first_line_of_the_task():
+    moment = datetime(2026, 11, 12, 14, 30, 5, tzinfo=UTC)
+    assert (
+        orchestrator.new_run_id("\n# Simulate  a *heated* plate!\nmore", moment)
+        == "20261112-143005-simulate-a-heated-plate"
+    )
+    assert orchestrator.new_run_id("   \n", moment) == "20261112-143005-run"
+
+
+def test_new_run_id_defaults_to_the_current_utc_time():
+    assert re.fullmatch(r"\d{8}-\d{6}-a-task", orchestrator.new_run_id("A task"))
+
+
+def test_a_run_id_given_by_the_caller_names_the_run_directory(tmp_path):
+    run_id = orchestrator.new_run_id(TASK, NOW)
+    result = go(tmp_path, FakeStep("one"), run_id=run_id)
+    assert result.run_id == run_id
+    assert result.run_dir == tmp_path / "runs" / run_id
+    assert read_record(RunDir(result.run_dir)).run_id == run_id
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "../escape",
+        "20261112-143005-ok/../x",
+        "20261112-143005-Upper",
+        "20261112-143005-",
+        "20261112-143005-ok\n",
+        "run-1",
+        "20261112-143005-a b",
+    ],
+)
+def test_a_malformed_run_id_is_refused_before_anything_is_created(tmp_path, bad):
+    with pytest.raises(ValueError, match="run id"):
+        go(tmp_path, FakeStep("one"), run_id=bad)
+    assert not (tmp_path / "runs").exists()
+    assert not active_run(tmp_path).exists()
+
+
+def test_a_given_run_id_that_exists_is_refused(tmp_path):
+    run_id = "20261112-143005-taken"
+    (tmp_path / "runs" / run_id).mkdir(parents=True)
+    with pytest.raises(RunExistsError):
+        go(tmp_path, FakeStep("one"), run_id=run_id)
+    assert list((tmp_path / "runs" / run_id).iterdir()) == []

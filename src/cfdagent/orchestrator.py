@@ -79,7 +79,7 @@ from cfdagent.agents.stage import Stage, StageContext
 from cfdagent.agents.transcript import TranscriptWriter
 from cfdagent.bench.registry import Benchmark, load_registry
 from cfdagent.bench.scoring import score
-from cfdagent.config import RunConfig, make_run_id, slugify
+from cfdagent.config import RunConfig, is_run_id, make_run_id, slugify
 from cfdagent.llm.client import ChatBackend, LLMClient
 from cfdagent.llm.cost import PRICING, CostLimitExceeded, CostTracker, Pricing
 from cfdagent.prompts import load_prompt
@@ -244,6 +244,15 @@ def _slug_source(task_text: str) -> str:
         if line.strip():
             return line
     return "run"
+
+
+def new_run_id(task_text: str, now: datetime | None = None) -> str:
+    """The run id ``run_task`` gives a task: ``YYYYMMDD-HHMMSS-<slug of the first line>``.
+
+    The command line uses it to name a detached run before the run directory exists.
+    """
+    moment = now if now is not None else datetime.now(UTC)
+    return make_run_id(slugify(_slug_source(task_text)), moment)
 
 
 def _exception_text(exc: BaseException) -> str:
@@ -765,6 +774,7 @@ def run_task(
     watchdog_interval_s: float = WATCHDOG_INTERVAL_S,
     max_run_dir_bytes: int = MAX_RUN_DIR_BYTES,
     dir_size: Callable[[Path], int] = directory_size,
+    run_id: str | None = None,
 ) -> RunResult:
     """Run ``task`` through the pipeline; see the module docstring.
 
@@ -774,9 +784,15 @@ def run_task(
     root ``~/runs``). Raises before creating anything for an unknown benchmark, an unpriced model,
     an invalid configuration or an existing run directory (``RunExistsError``).
 
+    ``run_id`` lets the caller choose the id (shape ``YYYYMMDD-HHMMSS-<slug>``, see
+    ``new_run_id``); ``None`` derives it from the task and the start time. A malformed id is a
+    ``ValueError``.
+
     ``pipeline``, ``uploader``, ``sandbox_factory``, ``benchmarks_root``, ``state_dir``, ``now``,
     ``clock``, ``watchdog_interval_s``, ``max_run_dir_bytes`` and ``dir_size`` are seams for tests.
     """
+    if run_id is not None and not is_run_id(run_id):
+        raise ValueError("invalid run id: expected YYYYMMDD-HHMMSS-<slug> in [a-z0-9-]")
     now = now or (lambda: datetime.now(UTC))
     clock = clock or time.monotonic
 
@@ -796,7 +812,8 @@ def run_task(
         backend = LLMClient(RunConfig.llm_settings_from_env())
 
     started = now()
-    run_id = make_run_id(slugify(_slug_source(task_text)), started)
+    if run_id is None:
+        run_id = new_run_id(task_text, started)
     record = RunRecord(
         run_id=run_id,
         task_set=config.task_set,
