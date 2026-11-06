@@ -104,6 +104,27 @@ class Stage(ABC):
         """Run the deterministic checks on the files in ``attempt_dir``. Errors the agent can
         fix come back as a failed ``GateResult``; anything else propagates."""
 
+    def diagnosis_request(self, ctx: StageContext, errors: list[str]) -> str | None:
+        """Ask the agent for the cause of a failed attempt. Called by the loop after every failed
+        gate, the last attempt's included; ``errors`` are the gate's errors. Return the question
+        for the agent (one extra model turn without tools, whose text is stored as the attempt's
+        ``diagnosis``) or ``None`` for no question. The default asks nothing."""
+        return None
+
+    def retry_after_failure(self, errors: list[str]) -> bool:
+        """Whether another attempt can fix a failure (``errors`` are the gate's). A stage whose
+        failures are deterministic and outside the agent's reach returns ``False``: the loop then
+        ends the stage after the diagnosis. The default is ``True``."""
+        return True
+
+    def retry_text(self, previous: str) -> str:
+        """What the agent is told about the fresh attempt directory after a failed gate
+        (``previous`` is the failed attempt's directory, relative to the run directory)."""
+        return (
+            "Write the corrected files there; the files of the previous attempt stay readable in "
+            f"{previous}. Call check_stage again when done."
+        )
+
     @abstractmethod
     def promote(self, ctx: StageContext, attempt_dir: Path) -> None:
         """Copy the accepted attempt to its canonical place in the run directory."""

@@ -13,6 +13,7 @@ from cfdagent.record import (
     AttemptRecord,
     RunRecord,
     StageRecord,
+    _shrunk,
     read_record,
     write_record,
     write_summary,
@@ -293,3 +294,52 @@ def test_summary_escapes_markdown_in_identifiers(run):
     text = run.read_text("summary.md")
     assert "[x]" not in text and "*bold*" not in text
     assert "mesh\\_stage" in text
+
+
+# ---------------------------------------------------- the diagnosis of a failed attempt
+
+
+def test_an_attempt_has_no_diagnosis_by_default(run):
+    attempt = AttemptRecord(n=1, ok=False, errors=["x"], seconds=1)
+    assert attempt.diagnosis is None
+    record = make_record(
+        status="failed",
+        finished_at=NOW,
+        stages=[StageRecord(name="solver_runner", attempts=[attempt], ok=False)],
+    )
+    write_record(run, record)
+    assert on_disk(run)["stages"][0]["attempts"][0]["diagnosis"] is None
+    assert read_record(run).stages[0].attempts[0].diagnosis is None
+
+
+def test_a_diagnosis_is_stored_bounded_and_cleaned(run):
+    text = f"the solver stopped at {IP1} see http://example.test/x " + "y" * 5000
+    attempt = AttemptRecord(n=1, ok=False, errors=[], seconds=1, diagnosis=text)
+    assert attempt.diagnosis is not None and len(attempt.diagnosis) <= 1500
+    assert IP1 not in attempt.diagnosis and "http://" not in attempt.diagnosis
+    again = AttemptRecord.model_validate(attempt.model_dump())  # idempotent
+    assert again.diagnosis == attempt.diagnosis
+    attempt.diagnosis = "z" * 9000  # an assignment is cleaned too
+    assert len(attempt.diagnosis) <= 1500
+
+
+def test_a_diagnosis_survives_the_round_trip_and_shrinks_with_the_record(run):
+    attempt = AttemptRecord(n=1, ok=False, errors=["e"], seconds=1, diagnosis="Courant too high")
+    record = make_record(
+        status="failed",
+        finished_at=NOW,
+        stages=[StageRecord(name="solver_runner", attempts=[attempt], ok=False)],
+    )
+    write_record(run, record)
+    assert read_record(run).stages[0].attempts[0].diagnosis == "Courant too high"
+    shrunk = _shrunk(record)
+    assert shrunk.stages[0].attempts[0].diagnosis == "Courant too high"
+    long = AttemptRecord(n=1, ok=False, errors=["e"], seconds=1, diagnosis="d" * 9000)
+    shrunk = _shrunk(
+        make_record(
+            status="failed",
+            finished_at=NOW,
+            stages=[StageRecord(name="solver_runner", attempts=[long], ok=False)],
+        )
+    )
+    assert len(shrunk.stages[0].attempts[0].diagnosis) <= 200

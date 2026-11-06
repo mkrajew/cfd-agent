@@ -289,6 +289,10 @@ def test_solver_run_is_returned_as_plain_data(run, monkeypatch, tmp_path):
         end_time=0.25,
         final_residuals={"Ux": 1e-6, "p": math.nan},
         max_courant=0.4,
+        initial_residuals={"Ux": 3e-5, "p": 2e-4},
+        first_initial_residuals={"Ux": 1.0, "p": 1.0},
+        max_linear_iterations=7,
+        bounding_count=3,
     )
     tool = process.ToolResult(True, 0, False, log, "End\n")
     fake = foam.SolverRun(tool, log, summary, case_end_time=0.25, delta_t=0.005)

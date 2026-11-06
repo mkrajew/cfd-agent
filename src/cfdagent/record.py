@@ -50,6 +50,7 @@ NO_CRITIC_LINE = "No Critic reviewed this run (the Critic agent is not part of M
 MAX_TEXT_CHARS = 4000  # failure reason
 MAX_ERROR_CHARS = 500  # one attempt error
 MAX_ERRORS_PER_ATTEMPT = 50
+MAX_DIAGNOSIS_CHARS = 1500  # the agent's own account of why an attempt failed
 SOFT_RECORD_BYTES = 1_500_000  # above this the attempt errors are cut down (limit is 2 MB)
 SHRUNK_ERRORS = 5
 SHRUNK_ERROR_CHARS = 200
@@ -111,7 +112,9 @@ class AttemptRecord(BaseModel):
 
     ``seconds`` is the wall time from the moment the attempt's directory was prepared until its
     gate finished. It therefore includes the agent's model calls and tool use during that
-    attempt, not only the gate's own run time.
+    attempt, not only the gate's own run time. ``diagnosis`` is the short account of the cause of
+    a failed attempt that a stage asked its agent for (``None`` for a stage that does not ask, an
+    attempt that passed, or a reply that gave none); it is bounded and cleaned like ``errors``.
     """
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
@@ -120,11 +123,17 @@ class AttemptRecord(BaseModel):
     ok: bool
     errors: list[str] = Field(default_factory=list)
     seconds: float = Field(ge=0)
+    diagnosis: str | None = None
 
     @field_validator("errors")
     @classmethod
     def _clean_errors(cls, value: list[str]) -> list[str]:
         return _cap_errors(value, MAX_ERRORS_PER_ATTEMPT, MAX_ERROR_CHARS)
+
+    @field_validator("diagnosis")
+    @classmethod
+    def _clean_diagnosis(cls, value: str | None) -> str | None:
+        return None if value is None else redact(value, MAX_DIAGNOSIS_CHARS)
 
 
 class StageRecord(BaseModel):
@@ -203,6 +212,8 @@ def _shrunk(record: RunRecord) -> RunRecord:
     for stage in data["stages"]:
         for attempt in stage["attempts"]:
             attempt["errors"] = _cap_errors(attempt["errors"], SHRUNK_ERRORS, SHRUNK_ERROR_CHARS)
+            if attempt.get("diagnosis") is not None:
+                attempt["diagnosis"] = redact(attempt["diagnosis"], SHRUNK_ERROR_CHARS)
     return RunRecord.model_validate(data)
 
 

@@ -25,7 +25,7 @@ import shutil
 import stat
 import tempfile
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from cfdagent.errors import AgentInputError, ToolFailure
@@ -80,7 +80,10 @@ _TIME_RE = re.compile(r"^Time = ([-+0-9.eE]+)s?\s*$")
 _CONVERGED_RE = re.compile(r"^SIMPLE solution converged in ([-+0-9.eE]+) iterations\s*$")
 _RESIDUAL_RE = re.compile(
     r"Solving for (\S+?), Initial residual = (\S+?), Final residual = (\S+?), No Iterations"
+    r"(?: (\d+))?"
 )
+# OpenFOAM prints "bounding <field>, min: ... max: ... average: ..." when it clips a field.
+_BOUNDING_RE = re.compile(r"^bounding \S+?, min: ")
 _COURANT_RE = re.compile(r"Courant Number mean: (\S+) max: (\S+)")
 # nan / -nan / inf / -inf as whole tokens (not part of a field name).
 _NON_FINITE_RE = re.compile(r"(?<![A-Za-z0-9_])[-+]?(?:nan|inf(?:inity)?)(?![A-Za-z0-9_])", re.I)
@@ -105,6 +108,13 @@ class SolverLogSummary:
     the steady solvers' ``SIMPLE solution converged in N iterations`` line, None if absent.
     ``first_time`` / ``last_step``: the first ``Time = ...`` value and the difference between the
     last two (None when the log has fewer than one / two of them).
+
+    ``initial_residuals`` / ``first_initial_residuals``: per field component the ``Initial
+    residual`` of the last / the first solve in the log. The initial residual is what a steady
+    solver's ``residualControl`` compares and what shows how far the equations are from satisfied;
+    the final residual above is bounded by the linear solver's tolerance and is no measure of
+    convergence. ``max_linear_iterations``: the largest ``No Iterations`` of any linear solve
+    (None when there is none). ``bounding_count``: the number of ``bounding <field>`` messages.
     """
 
     completed: bool
@@ -116,6 +126,10 @@ class SolverLogSummary:
     converged_at: float | None = None
     first_time: float | None = None
     last_step: float | None = None
+    initial_residuals: dict[str, float] = field(default_factory=dict)
+    first_initial_residuals: dict[str, float] = field(default_factory=dict)
+    max_linear_iterations: int | None = None
+    bounding_count: int = 0
 
     @property
     def failure_reason(self) -> str | None:
@@ -247,6 +261,10 @@ class _LogScanner:
         self.last_step: float | None = None
         self.converged_at: float | None = None
         self.final_residuals: dict[str, float] = {}
+        self.initial_residuals: dict[str, float] = {}
+        self.first_initial_residuals: dict[str, float] = {}
+        self.max_linear_iterations: int | None = None
+        self.bounding_count = 0
         self.max_courant: float | None = None
         self._fatal: list[str] | None = None  # message lines of the first fatal error
         self._collecting = False
@@ -279,7 +297,16 @@ class _LogScanner:
                 self.diverged = True
             if final is not None:
                 self.final_residuals[m.group(1)] = final  # later solves overwrite earlier ones
+            if initial is not None:
+                self.initial_residuals[m.group(1)] = initial
+                self.first_initial_residuals.setdefault(m.group(1), initial)
+            if m.group(4) is not None:
+                count = int(m.group(4))
+                if self.max_linear_iterations is None or count > self.max_linear_iterations:
+                    self.max_linear_iterations = count
             return
+        if _BOUNDING_RE.match(line):
+            self.bounding_count += 1
         m = _COURANT_RE.search(line)
         if m:
             mean, cmax = _parse_float(m.group(1)), _parse_float(m.group(2))
@@ -329,6 +356,10 @@ class _LogScanner:
             converged_at=self.converged_at,
             first_time=self.first_time,
             last_step=self.last_step,
+            initial_residuals=dict(self.initial_residuals),
+            first_initial_residuals=dict(self.first_initial_residuals),
+            max_linear_iterations=self.max_linear_iterations,
+            bounding_count=self.bounding_count,
         )
 
 
@@ -372,16 +403,17 @@ def _prepare_decomposition(case_dir: Path, n_procs: int) -> None:
 
     A missing dictionary is created with ``numberOfSubdomains n_procs`` and method ``scotch``
     (needs no further coefficients). An existing dictionary is never rewritten; if it asks for a
-    different number of subdomains a ValueError is raised, because the run would use the wrong
-    number of ranks.
+    different number of subdomains an ``AgentInputError`` is raised (the caller can choose another
+    ``n_procs``), because the run would use the wrong number of ranks.
     """
     path = case_dir / "system" / "decomposeParDict"
     if path.exists():
         text = re.sub(r"//.*", "", path.read_text(encoding="utf-8", errors="replace"))
         m = re.search(r"\bnumberOfSubdomains\s+(\d+)\s*;", text)
         if m and int(m.group(1)) != n_procs:
-            raise ValueError(
-                f"{path} has numberOfSubdomains {m.group(1)} but n_procs={n_procs}; make them equal"
+            raise AgentInputError(
+                f"system/decomposeParDict has numberOfSubdomains {m.group(1)} but n_procs="
+                f"{n_procs}; call run_solver with n_procs={m.group(1)}, or make them equal"
             )
         return
     path.parent.mkdir(parents=True, exist_ok=True)
