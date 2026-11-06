@@ -1,4 +1,7 @@
-"""Hand-written post-processing for the lid-driven cavity: ``post.py <case_dir> <quantities.json>``.
+"""Hand-written post-processing for the lid-driven cavity: ``post.py [<case_dir> <out.json>]``.
+
+Without arguments it reads ``case`` and writes ``quantities.json`` in the working directory, which
+is how the Analyst stage runs a post-processing script.
 
 Reads the ``sets`` function-object output of the finished run (the latest time directory under
 ``postProcessing/centrelines``) and writes the two profiles the benchmark asks for:
@@ -20,6 +23,7 @@ from cfdagent.tools.post import latest_time_dir, read_line_sample, write_quantit
 LENGTH = 1.0  # side of the cavity [m]
 LID_SPEED = 1.0  # speed of the moving wall [m/s]
 FUNCTION_OBJECT = "centrelines"  # name of the sets function object in system/controlDict
+DEFAULT_PATHS = (Path("case"), Path("quantities.json"))  # relative to the working directory
 
 
 def centreline_profile(
@@ -36,10 +40,10 @@ def centreline_profile(
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
-        print("usage: post.py <case_dir> <quantities.json>", file=sys.stderr)
+    if len(argv) not in (1, 3):
+        print("usage: post.py [<case_dir> <quantities.json>]", file=sys.stderr)
         return 2
-    case_dir, out_path = Path(argv[1]), Path(argv[2])
+    case_dir, out_path = (Path(argv[1]), Path(argv[2])) if len(argv) == 3 else DEFAULT_PATHS
     quantities = {
         "u_vertical_centreline": centreline_profile(case_dir, "verticalCentreline", "y", "Ux"),
         "v_horizontal_centreline": centreline_profile(case_dir, "horizontalCentreline", "x", "Uy"),
