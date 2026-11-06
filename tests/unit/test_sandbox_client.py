@@ -444,3 +444,71 @@ def test_unwritable_request_reports_the_class_not_the_path(tmp_path, monkeypatch
     response = client.call("run_solver", SOLVE_ARGS, timeout_s=30)
     assert response.ok is False and response.internal is True
     assert str(tmp_path) not in response.error and "PermissionError" in response.error
+
+
+class _BlockingProcess(FakeProcess):
+    """Its ``wait`` really blocks until the container is killed, like ``docker run`` does."""
+
+    def wait(self, timeout=None):
+        if not self.fake.released.wait(timeout):
+            raise subprocess.TimeoutExpired(self.argv, timeout)
+        self.returncode = 137
+        return self.returncode
+
+
+class _BlockingRunner(FakeRunner):
+    def __init__(self):
+        super().__init__()
+        import threading
+
+        self.released = threading.Event()
+
+    def popen(self, argv, **kwargs):
+        self.popen_calls.append(list(argv))
+        proc = _BlockingProcess(self, argv, kwargs)
+        self.processes.append(proc)
+        return proc
+
+    def run(self, argv, **kwargs):
+        if argv[:2] == ["docker", "kill"]:
+            self.released.set()
+        return super().run(argv, **kwargs)
+
+
+def test_kill_active_stops_the_running_container_and_the_call_returns(tmp_path):
+    """The disk-growth watchdog of the orchestrator stops a call from another thread."""
+    import threading
+
+    runner = _BlockingRunner()
+    client, _ = _client(tmp_path, runner)
+    result: list = []
+    thread = threading.Thread(
+        target=lambda: result.append(client.call("run_solver", SOLVE_ARGS, timeout_s=60))
+    )
+    thread.start()
+    deadline = time.monotonic() + 10
+    while not runner.processes and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert runner.processes, "the call never started its process"
+    assert thread.is_alive()  # blocked in wait()
+    client.kill_active()
+    thread.join(timeout=20)
+    assert not thread.is_alive()
+    name = f"cfd-{RUN_ID}-1"
+    assert ["docker", "kill", name] in runner.run_calls
+    assert result and result[0].ok is False
+    runner.run_calls.clear()
+    client.kill_active()  # nothing is active any more: harmless, no command
+    assert runner.run_calls == []
+
+
+def test_a_killed_client_refuses_later_calls(tmp_path):
+    """The watchdog may fire while no call is waiting; the next call must not run unwatched."""
+    from cfdagent.errors import ToolFailure
+
+    runner = FakeRunner(response=OpResponse(ok=True, data={"v": 1}))
+    client, _ = _client(tmp_path, runner)
+    client.kill_active()  # nothing is running: nothing to kill, but the client is closed now
+    with pytest.raises(ToolFailure, match="closed"):
+        client.call("run_solver", SOLVE_ARGS, timeout_s=30)
+    assert runner.popen_calls == []

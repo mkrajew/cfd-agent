@@ -39,6 +39,7 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 import cfdagent
+from cfdagent.errors import ToolFailure
 from cfdagent.executor import protocol
 from cfdagent.executor.protocol import OpRequest, OpResponse
 from cfdagent.rundir import RunDir, RunDirError
@@ -174,6 +175,9 @@ class SandboxClient:
         self._run = run
         self._counter = itertools.count(1)
         self._lock = threading.Lock()
+        # container name -> the client process of a call that is waiting for it
+        self._active: dict[str, Any] = {}
+        self._closed = False  # set by kill_active: no executor may start afterwards
 
     # ------------------------------------------------------------------ internals
 
@@ -235,6 +239,23 @@ class SandboxClient:
 
     # ------------------------------------------------------------------ public
 
+    def kill_active(self) -> None:
+        """Stop every executor that a call is waiting for (callable from another thread).
+
+        The waiting calls then return failed responses, and the client is closed: every later
+        ``call`` raises ``ToolFailure`` (an executor must not start unwatched after the
+        watchdog has fired). Used by the orchestrator when the run directory grows beyond its
+        cap. Never raises.
+        """
+        with self._lock:
+            self._closed = True
+            running = list(self._active.items())
+        for name, proc in running:
+            try:
+                self._stop(proc, name)
+            except Exception:  # best effort: the caller is a watchdog
+                pass
+
     def call(self, op: str, args: BaseModel | dict[str, Any], timeout_s: float) -> OpResponse:
         """Run ``op`` in a fresh executor and return its response; see the module docstring.
 
@@ -242,6 +263,10 @@ class SandboxClient:
         does not start, no or bad response, timeout); those are failed responses. A
         ``KeyboardInterrupt`` kills the container and propagates.
         """
+        if self._closed:
+            raise ToolFailure(
+                "the sandbox client is closed (the run was stopped): no executor starts"
+            )
         timeout_s = _check_timeout(timeout_s)
         raw_args = args.model_dump(mode="json") if isinstance(args, BaseModel) else args
         try:
@@ -289,6 +314,11 @@ class SandboxClient:
 
             timed_out = False
             code: int | None = None
+            with self._lock:
+                self._active[name] = proc
+                closed = self._closed
+            if closed:  # closed between the check above and the start of this process
+                self._stop(proc, name)
             try:
                 code = proc.wait(timeout=timeout_s)
             except subprocess.TimeoutExpired:
@@ -297,6 +327,9 @@ class SandboxClient:
             except BaseException:  # KeyboardInterrupt included: never leave the container behind
                 self._stop(proc, name)
                 raise
+            finally:
+                with self._lock:
+                    self._active.pop(name, None)
             tail = self._scrub(_tail(output))
 
         if timed_out:
