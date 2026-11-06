@@ -28,6 +28,7 @@ This module is host-side: it imports no tool, CAD, mesh or knowledge code.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -71,6 +72,12 @@ PLOT_MAX_BYTES = 20 * 1024 * 1024
 TAIL_BYTES = 3000  # the loop shows the model at most 4096 bytes of all errors together
 UTILITY_TAIL_BYTES = 3000
 _ECHO_CHARS = 80
+MAX_WARNINGS = 20  # of the solver summary shown in the opening message
+WARNING_CHARS = 200
+SUMMARY_SHOWN_CHARS = 8000
+SNAPSHOT_DIRS = ("logs", CASE_NAME)  # what the post-processing script must only read
+HASH_MAX_BYTES = 16 * 1024 * 1024  # a larger file is compared by size only
+MAX_CHANGES_SHOWN = 10
 # OpenFOAM utilities the agent may run with ``run_utility``: a subset of the executor's own
 # allowlist (``executor.ops.UTILITIES``, which the executor enforces again). ``foamDictionary`` and
 # ``changeDictionary`` can edit files and ``checkMesh`` belongs to the Mesh stage.
@@ -135,6 +142,32 @@ def _first_unsorted(x: list[float]) -> int | None:
     return None
 
 
+def _snapshot(root: Path) -> dict[str, str]:
+    """``{relative path: sha256 of the content}`` of every file below ``logs/`` and ``case/`` of
+    the run directory (a file above ``HASH_MAX_BYTES`` is compared by its size, a link by its
+    kind). Used to see that the post-processing script left the solved case and the logs as they
+    were."""
+    found: dict[str, str] = {}
+    for top in SNAPSHOT_DIRS:
+        for directory, subdirs, files in os.walk(root / top, followlinks=False):
+            base = Path(directory)
+            for name in subdirs + files:
+                path = base / name
+                rel = path.relative_to(root).as_posix()
+                try:
+                    if path.is_symlink():
+                        found[rel] = "link"
+                    elif path.is_file():
+                        size = path.stat().st_size
+                        if size > HASH_MAX_BYTES:
+                            found[rel] = f"size:{size}"
+                            continue
+                        found[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+                except OSError:
+                    found[rel] = "unreadable"
+    return found
+
+
 class AnalystStage(Stage):
     """Stage 6: post-process the solved case with a script; gate the quantities and the analysis."""
 
@@ -196,7 +229,18 @@ class AnalystStage(Stage):
         if not isinstance(data, dict):
             return f"({SOLVER_SUMMARY} could not be read as an object; read it with read_file.)"
         shown = {key: data[key] for key in _SUMMARY_KEYS if key in data}
-        return json.dumps(shown, indent=2)
+        warnings = shown.get("warnings")
+        if isinstance(warnings, list):
+            kept = [_clip(str(w), WARNING_CHARS) for w in warnings[:MAX_WARNINGS]]
+            if len(warnings) > MAX_WARNINGS:
+                kept.append(f"... and {len(warnings) - MAX_WARNINGS} more")
+            shown["warnings"] = kept
+        if isinstance(shown.get("fatal_error"), str):
+            shown["fatal_error"] = _clip(shown["fatal_error"], 500)
+        text = json.dumps(shown, indent=2)
+        if len(text) > SUMMARY_SHOWN_CHARS:
+            text = text[:SUMMARY_SHOWN_CHARS] + "\n[cut; read the file for the rest]"
+        return text
 
     # ------------------------------------------------------------------ attempts
 
@@ -271,23 +315,21 @@ class AnalystStage(Stage):
     def execute_and_gate(self, ctx: StageContext, attempt_dir: Path) -> GateResult:
         spec = self._spec(ctx)
         rel = ctx.run.relative(attempt_dir)
-        errors = self._analysis_problems(ctx, rel)
         if not ctx.run.path(f"{rel}/{SCRIPT_NAME}").is_file():
-            errors.insert(
-                0,
+            errors = [
                 f"{SCRIPT_NAME} does not exist in {rel}/. Write it there with write_file (path "
                 f"{rel}/{SCRIPT_NAME}); it reads {CASE_NAME}/ and writes {QUANTITIES_NAME} into "
-                "its working directory",
-            )
-            return GateResult(False, errors)
-        quantities_path = ctx.run.path(f"{rel}/{QUANTITIES_NAME}")
+                "its working directory"
+            ]
+            return GateResult(False, [*errors, *self._analysis_problems(ctx, rel)])
         try:
-            _remove(quantities_path)  # an old file must not pass for this run's result
+            _remove(ctx.run.path(f"{rel}/{QUANTITIES_NAME}"))  # an old file is not this run's
         except OSError as exc:
             raise ToolFailure(
                 f"could not clear {rel}/{QUANTITIES_NAME}: {type(exc).__name__}"
             ) from exc
 
+        before = _snapshot(ctx.run.root)
         script_s = ctx.inner_timeout(SCRIPT_TIMEOUT_S)
         run = ctx.sandbox.call(
             "run_script",
@@ -296,10 +338,35 @@ class AnalystStage(Stage):
         )
         if run.internal:
             raise _internal(run, "running the post-processing script")
+        errors = []
         if not run.ok:
-            return GateResult(False, [self._script_failure(run), *errors])
-        errors = [*self._quantity_problems(ctx, spec, rel), *errors]
+            errors.append(self._script_failure(run))
+        # The script ran with write access to the run directory. Everything the later stages
+        # rely on is judged after it: the solved case and logs as they were, and the files that
+        # ``promote`` copies (it re-reads quantities.json and analysis.md).
+        errors += self._changed_problems(before, _snapshot(ctx.run.root))
+        if run.ok:
+            errors += self._quantity_problems(ctx, spec, rel)
+        errors += self._analysis_problems(ctx, rel)
         return GateResult(not errors, errors)
+
+    @staticmethod
+    def _changed_problems(before: dict[str, str], after: dict[str, str]) -> list[str]:
+        changed = sorted(p for p in before.keys() | after.keys() if before.get(p) != after.get(p))
+        if not changed:
+            return []
+        shown = ", ".join(_clip(p, 120) for p in changed[:MAX_CHANGES_SHOWN])
+        more = (
+            f" and {len(changed) - MAX_CHANGES_SHOWN} more"
+            if len(changed) > MAX_CHANGES_SHOWN
+            else ""
+        )
+        return [
+            f"{SCRIPT_NAME} modified the solved case or the logs: {shown}{more}. It must only read "
+            f"them: the files of {CASE_NAME}/ and logs/ in the run directory are what the later "
+            f"stages rely on. Work on {CASE_NAME}/ in your attempt directory, and write only to "
+            f"your attempt directory"
+        ]
 
     @staticmethod
     def _script_failure(run: OpResponse) -> str:

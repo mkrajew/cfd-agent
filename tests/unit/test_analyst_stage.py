@@ -49,8 +49,11 @@ class Setup:
     """A context whose run directory holds the solved case, and a fake sandbox whose
     ``run_script`` plays ``post.py`` by writing ``quantities`` (a dict, a string, or None)."""
 
-    def __init__(self, tmp_path, quantities=GOOD, run=RUN_OK, with_case=True, spec=None):
+    def __init__(
+        self, tmp_path, quantities=GOOD, run=RUN_OK, with_case=True, spec=None, effect=None
+    ):
         self.quantities = quantities
+        self.effect = effect  # called with the run directory root while "post.py" runs
         self.run = run
         self.sandbox = FakeSandbox({"run_script": self._run_script, "run_utility": UTILITY_OK})
         tmp_path.mkdir(parents=True, exist_ok=True)
@@ -63,6 +66,8 @@ class Setup:
 
     def _run_script(self, args):
         directory = self.ctx.run.path(args.cwd)
+        if self.effect is not None:
+            self.effect(self.ctx.run.root)
         if self.quantities is not None:
             text = (
                 self.quantities if isinstance(self.quantities, str) else json.dumps(self.quantities)
@@ -305,6 +310,103 @@ def test_gate_ignores_the_plots_but_promote_keeps_them(tmp_path):
     assert not (root / "results" / "plots" / "notes.txt").exists()
 
 
+# ------------------------------------------------------------------ what the script may change
+
+
+def rewrite_analysis(text):
+    def effect(root):
+        (root / ATTEMPT / "analysis.md").write_text(text, encoding="utf-8")
+
+    return effect
+
+
+def delete_analysis(root):
+    (root / ATTEMPT / "analysis.md").unlink()
+
+
+def test_a_script_that_rewrites_analysis_md_without_convergence_fails_the_gate(tmp_path):
+    setup = prepared(tmp_path, effect=rewrite_analysis("# Report\n\nAll fine.\n"))
+    result = setup.gate()  # checked after the script, because promote copies the file it leaves
+    assert not result.ok and "converge" in "\n".join(result.errors).lower()
+
+
+def test_a_script_that_empties_analysis_md_fails_the_gate(tmp_path):
+    result = prepared(tmp_path, effect=rewrite_analysis("")).gate()
+    assert not result.ok and "empty" in "\n".join(result.errors)
+
+
+def test_a_script_that_deletes_analysis_md_is_a_gate_failure_not_a_tool_failure(tmp_path):
+    setup = prepared(tmp_path, effect=delete_analysis)
+    result = setup.gate()
+    assert not result.ok and "analysis.md does not exist" in "\n".join(result.errors)
+
+
+def test_a_failing_script_that_deletes_analysis_md_reports_both(tmp_path):
+    failed = OpResponse(ok=False, data={"tail": "boom", "returncode": 1}, error="exited with 1")
+    setup = prepared(tmp_path, run=failed, effect=delete_analysis, quantities=None)
+    text = "\n".join(setup.gate().errors)
+    assert "did not run successfully" in text and "analysis.md does not exist" in text
+
+
+def test_a_script_that_writes_a_good_analysis_md_passes(tmp_path):
+    setup = prepared(tmp_path, analysis=None, effect=rewrite_analysis(GOOD_ANALYSIS))
+    assert setup.gate().ok  # the script may produce the report; the gate looks after the run
+
+
+def edit(rel, text):
+    def effect(root):
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text, encoding="utf-8")
+
+    return effect
+
+
+def remove(rel):
+    def effect(root):
+        (root / rel).unlink()
+
+    return effect
+
+
+@pytest.mark.parametrize(
+    ("effect", "path"),
+    [
+        (edit("case/system/controlDict", "application icoFoam;\n"), "case/system/controlDict"),
+        (edit("case/0/U", "internalField uniform (9 9 9);\n"), "case/0/U"),
+        (edit("case/100/U", "internalField uniform (0 0 0);\n"), "case/100/U"),
+        (edit("logs/solver_run.json", json.dumps({"ok": True})), "logs/solver_run.json"),
+        (edit("logs/log.simpleFoam", "End\nedited\n"), "logs/log.simpleFoam"),
+        (remove("case/100/U"), "case/100/U"),
+        (edit("case/200/U", "x\n"), "case/200/U"),  # a new file in the solved case
+    ],
+)
+def test_a_script_that_changes_the_solved_case_or_the_logs_fails_the_gate(tmp_path, effect, path):
+    setup = prepared(tmp_path, effect=effect)
+    result = setup.gate()
+    assert not result.ok
+    text = "\n".join(result.errors)
+    assert "modified" in text and path in text and "only read" in text
+
+
+def test_a_script_may_write_in_its_attempt_directory_including_the_case_copy(tmp_path):
+    def effect(root):
+        (root / ATTEMPT / "case" / "case.foam").write_text("", encoding="utf-8")
+        (root / ATTEMPT / "case" / "100" / "U").write_text("changed\n", encoding="utf-8")
+        (root / ATTEMPT / "plots").mkdir(exist_ok=True)
+
+    assert prepared(tmp_path, effect=effect).gate().ok
+
+
+def test_the_opening_message_clips_a_long_warning_list(tmp_path):
+    setup = prepared(tmp_path)
+    summary = {**SOLVER_RUN, "warnings": [f"warning {i} " + "x" * 3000 for i in range(60)]}
+    setup.ctx.run.write_text("logs/solver_run.json", json.dumps(summary))
+    text = setup.stage.opening_message(setup.ctx)
+    assert "warning 0 " in text and "warning 59" not in text
+    assert "and 40 more" in text
+    assert len(text) < 20_000
+
+
 # ------------------------------------------------------------------ promote
 
 
@@ -530,6 +632,29 @@ def test_the_prompt_states_the_rules_of_the_stage():
     # The blind-evaluation rule: no tutorial or knowledge tool, and no reference data.
     assert "read_knowledge" not in text and "search_knowledge" not in text
     assert "benchmarks/" not in text
+
+
+def test_the_prompt_names_only_postprocess_functions_that_exist():
+    text = load_prompt("analyst").text
+    assert "flowRatePatch" in text and "patchFlowRate" not in text
+
+
+def test_the_prompt_does_not_claim_a_maximum_principle_for_velocity():
+    text = load_prompt("analyst").text
+    assert "within the range that the boundary conditions allow" not in text
+    assert "order of magnitude" in text and "bulk speed" in text
+
+
+def test_the_prompt_scales_integrated_quantities_of_reduced_geometries():
+    text = load_prompt("analyst").text
+    assert "360 / wedge angle" in text and "mesh thickness" in text and "state the factor" in text
+
+
+def test_the_prompt_qualifies_the_steadiness_check_and_the_pressure_level():
+    text = load_prompt("analyst").text
+    assert "spacing" in text and "does not apply" in text
+    assert "arbitrary" in text
+    assert "add it from the patch field" in text
 
 
 def test_the_prompt_tells_to_take_end_points_from_the_mesh():
