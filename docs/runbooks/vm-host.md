@@ -48,9 +48,9 @@ runs (about 0.5 h for the setup and the checks, about $0.10).
 
 ## 2. Run the setup script
 
-Which form was verified: **none yet.** Both forms below are untested on the real VM; the script itself is tested
-offline (stubs and a local git repository) in `tests/unit/test_vm_host_setup.py`. Record in the pull request which
-form was used and its output.
+Which form was verified: **2.2 (run-command)**, on 2026-11-08 at commit `c6e9b78`: first attempt, exit status 0, about
+1 min 35 s including the image pull (see `docs/runbooks/m1-first-run.md`). Form 2.1 (SSH) is untested on the real VM;
+the script itself is tested offline (stubs and a local git repository) in `tests/unit/test_vm_host_setup.py`.
 
 ### 2.1 Over SSH (primary path for a person with the SSH key)
 
@@ -241,6 +241,10 @@ On the VM (identity token, no keys): a `gpt-oss-120b` call through `cfdagent`'s 
 still works; a blob upload to `runs` works; a write to any other container is denied
 (`AuthorizationPermissionMismatch`). Create no test container just for this: use an existing one, or leave the
 denial check to the first run that touches only `runs`.
+
+Step 5 was done on 2026-11-08 with the owner's approval: only the `runs` container assignment remains, and a scripted
+replay uploaded 253 files afterwards (a few minutes after the deletion; role changes can take up to about 10 minutes
+to propagate, so the first live run is the stronger confirmation).
 
 Step 5 (after approval): delete the assignment whose scope is the storage account and whose role is
 `Storage Blob Data Contributor` for the VM principal: `az role assignment delete --assignee <vm-principal-id>
