@@ -48,9 +48,9 @@ runs (about 0.5 h for the setup and the checks, about $0.10).
 
 ## 2. Run the setup script
 
-Which form was verified: **none yet.** Both forms below are untested on the real VM; the script itself is tested
-offline (stubs and a local git repository) in `tests/unit/test_vm_host_setup.py`. Record in the pull request which
-form was used and its output.
+Which form was verified: **2.2 (run-command)**, on 2026-11-08 at commit `c6e9b78`: first attempt, exit status 0, about
+1 min 35 s including the image pull (see `docs/runbooks/m1-first-run.md`). Form 2.1 (SSH) is untested on the real VM;
+the script itself is tested offline (stubs and a local git repository) in `tests/unit/test_vm_host_setup.py`.
 
 ### 2.1 Over SSH (primary path for a person with the SSH key)
 
