@@ -1,7 +1,7 @@
 # Runbook: M1 dry run and first live run on the VM
 
 Status: the dry run (sections 1-4) was executed on 2026-11-08 at commit `c6e9b78`; the observed numbers are in
-each section. The first live run (section 5) is Task 23. Read
+each section. The first live runs (section 5, Task 23) were executed the same day at commit `ec6e075`. Read
 `infra/CLAUDE.md` and `docs/runbooks/vm-host.md` first. Nothing here creates, changes or deletes an Azure
 resource. Starting and deallocating the VM are inside the approved M0-M2 envelope (the VM bills about
 $0.208/h while it runs). The dry run calls no model (scripted conversation): its cost is VM time only.
@@ -135,6 +135,22 @@ cfdagent logs <run-id> --follow
 
 `/usr/local/bin/cfdagent` loads `/etc/cfdagent/env` itself. The cost cap per run is $1.00 by default; a live
 run needs the owner's go-ahead for any campaign above $5.
+
+Observed (2026-11-08, Task 23, commit `ec6e075`, image `sha-ec6e075`; host setup exit 0, `verify_sandbox.py` 7/7 PASS):
+
+- Run 1 (`20261108-214047-...`) failed after 37 s in the geometry stage with `docker: No such image:
+  cfdagent:runtime`. Cause: `cfdagent run` ignored `CFDAGENT_IMAGE` from the environment file and used the
+  default tag. Fixed in the CLI (`fix: read the sandbox image from CFDAGENT_IMAGE`); on the VM the
+  run was repeated after `docker tag <pulled image> cfdagent:runtime`, a local alias that creates no Azure
+  resource. After the fix is on `main` and the host is set up at that commit, no alias is needed.
+  The first run still proved three things: the Planner's real model call through Entra ID works from the VM
+  (2 attempts, $0.0074), the upload with the container-scoped Blob role works (9 files), and the active-run
+  marker was written and removed.
+- Run 2 (`20261108-214751-...`): status `failed` in `case_setup` after 3 attempts, 154 s, $0.0287, 106,219 tokens
+  in, 21,238 out. Planner ok after 2 attempts, geometry ok after 1, mesh ok after 3, case setup failed 3 of 3.
+  No Scorer comparison exists (the run ended before the Solver Runner). The upload reported 98 files and the
+  blobs were confirmed read-only from the laptop. Details and the triage are in the journal entry
+  `docs/journal/2026-11-08-m1-task-23-first-live-run.md`.
 
 ## 6. Deallocate
 
