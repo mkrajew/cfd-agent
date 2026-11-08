@@ -437,6 +437,7 @@ class _StageRun(ModelConversation):
                 self.messages.append({"role": "user", "content": self._blank_reply_nudge()})
                 continue
             if not result.tool_calls:
+                self.blank_replies = 0  # the gate runs now; a blank reply after it is nudged again
                 text = self._check()
                 ended = self.passed or self.exhausted or self.abort is not None
                 if self.diagnosis_due is not None and self.abort is None:

@@ -302,6 +302,19 @@ def test_a_tool_call_resets_the_count_of_blank_replies(tmp_path):
     stage = ToyStage([GateResult(True, [])])
     outcome = run_stage(stage, ctx)
     assert outcome.ok and outcome.attempts == 1 and len(stage.gate_dirs) == 1
+    # A gate run before the model asked for it would end the stage early, leaving steps unused.
+    assert len(backend.calls) == len(steps)
+
+
+def test_the_count_of_blank_replies_starts_again_after_the_gate_ran_for_the_model(tmp_path):
+    n = loop.MAX_BLANK_NUDGES
+    steps = [reply(None) for _ in range(n + 1)]  # n nudges, then the gate runs for the model
+    steps += [reply(None) for _ in range(n)]  # nudged again in attempt 2
+    steps += [reply(None, check("k1"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    stage = ToyStage([GateResult(False, ["x"]), GateResult(True, [])])
+    outcome = run_stage(stage, ctx)
+    assert outcome.ok and outcome.attempts == 2 and len(backend.calls) == len(steps)
 
 
 def test_a_reply_with_text_and_no_tool_call_still_runs_the_gate(tmp_path):
