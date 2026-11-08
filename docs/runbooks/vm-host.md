@@ -242,6 +242,10 @@ still works; a blob upload to `runs` works; a write to any other container is de
 (`AuthorizationPermissionMismatch`). Create no test container just for this: use an existing one, or leave the
 denial check to the first run that touches only `runs`.
 
+Step 5 was done on 2026-11-08 with the owner's approval: only the `runs` container assignment remains, and a scripted
+replay uploaded 253 files afterwards (a few minutes after the deletion; role changes can take up to about 10 minutes
+to propagate, so the first live run is the stronger confirmation).
+
 Step 5 (after approval): delete the assignment whose scope is the storage account and whose role is
 `Storage Blob Data Contributor` for the VM principal: `az role assignment delete --assignee <vm-principal-id>
 --role "Storage Blob Data Contributor" --scope <storage-account-resource-id>`. Check with the list command
