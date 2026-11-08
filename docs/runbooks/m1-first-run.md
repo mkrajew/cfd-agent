@@ -1,6 +1,7 @@
-# Runbook: M1 dry run and first live run on the VM (DRAFT)
+# Runbook: M1 dry run and first live run on the VM
 
-Status: **draft.** Commands are exact; every `TODO(observed)` is filled in after the first VM session. Read
+Status: the dry run (sections 1-4) was executed on 2026-11-08 at commit `c6e9b78`; the observed numbers are in
+each section. The first live run (section 5) is Task 23. Read
 `infra/CLAUDE.md` and `docs/runbooks/vm-host.md` first. Nothing here creates, changes or deletes an Azure
 resource. Starting and deallocating the VM are inside the approved M0-M2 envelope (the VM bills about
 $0.208/h while it runs). The dry run calls no model (scripted conversation): its cost is VM time only.
@@ -17,7 +18,12 @@ infra/scripts/vm-up.ps1
 ssh cfdagent true        # repeat until it answers
 ```
 
-TODO(observed): time from `vm-up` to a working SSH session.
+Observed (2026-11-08): the VM was started with `az vm start`. The session was driven without SSH
+through `az vm run-command invoke` (the laptop SSH key has a passphrase and no agent was running): each
+script was written to a local file outside the repository and passed with `--scripts "@<file>"`. Run-command
+sessions do **not** count for the 30-minute idle shutdown, so do not leave the VM waiting between steps.
+On the Windows laptop `az` is `az.cmd`: a `--query` with brackets or quotes breaks in `cmd`; fetch `-o json`
+and filter in PowerShell instead.
 
 ## 2. Host setup at the merged commit
 
@@ -35,7 +41,11 @@ docker image ls ghcr.io/mkrajew/cfd-agent
 cfdagent --help
 ```
 
-TODO(observed): form used, `vm-host-setup.sh` exit status, image tag, image size (`docker image ls`).
+Observed: form 2.2 of `docs/runbooks/vm-host.md` (run-command wrapper, full 40-character commit id), first
+attempt, exit status 0, 1 min 35 s including the image pull. Image `ghcr.io/mkrajew/cfd-agent:sha-c6e9b78`:
+5.33 GB (`docker image ls`; `docker image inspect` reports 1.16 GB, probably the compressed size, not checked). The host has
+4 vCPU, 15 GB RAM and 48 GB free disk; metadata firewall rules present; `cfdagent-idle-shutdown --check` ok;
+`/var/lib/cfdagent` and `~/runs` belong to the admin user. `cfdagent --help` lists run, status, logs, list.
 
 ## 3. Verify the sandbox
 
@@ -57,7 +67,22 @@ blocks Task 23**; fix it in a `fix:` pull request.
 On the Windows laptop with Docker Desktop and the local image the same script printed 7/7 PASS
 (`--image cfdagent:dev` and `--image cfdagent:runtime`).
 
-TODO(observed): the table printed on the VM and its duration.
+Observed on the VM (28 s, exit 0):
+
+```
+CHECK                              RESULT  EVIDENCE
+no network                         PASS    public IP:443, metadata:80, wireserver:80 and DNS blocked; only lo present
+no credentials in the environment  PASS    planted secrets absent from the 43 environment variables and PID 1
+read-only root filesystem          PASS    root ro; /tmp rw,noexec,nosuid,nodev; /job rw; no capabilities; no_new_privs=1
+#codeStream refused                PASS    refused with the general hint; control case accepted; no marker, no compiled code
+mpirun -np 4 --use-hwthread-cpus   PASS    4 ranks started and finished under --cap-drop ALL
+timeout leaves no container        PASS    killed after 20 s; script had started; no container left
+run directory is the only mount    PASS    only /job comes from the host (the run directory); 27 mounts in all
+7/7 checks passed
+```
+
+The scripts were copied to `/opt/cfdagent-src/scripts/` (untracked) because the commit that adds them was not yet
+on `main`; after the pull request is merged and the host is set up at that commit they are part of the checkout.
 
 ## 4. Dry run with the scripted backend
 
@@ -71,8 +96,13 @@ The run uses the docker sandbox and the real upload. Expected: status `completed
 the last upload line `upload: done, <N> file(s)`, exit status 0. The summary shows the run id, the wall time
 per stage, the per-criterion errors, the run directory size and the blob-listing command.
 
-TODO(observed): run id, per-stage wall times, total wall time, Scorer errors per criterion, run directory
-size, number of uploaded files.
+Observed on the VM (62 s including start-up, exit 0): run `20261108-195840-lid-driven-cavity-flow-at-re-100`,
+status `completed`, wall time 58.2 s, cost $0.0076 (scripted token counts priced as the primary model).
+Stages: planner 0.0 s, geometry 6.0 s, mesh 4.0 s, case_setup 3.3 s, solver_runner 42.3 s, analyst 2.4 s
+(one attempt each). Scorer passed: `u_vertical_centreline` error 0.0049, `v_horizontal_centreline` error
+0.0087, both within the thresholds. Run directory 35.4 MiB on disk (28.3 MB uploaded); upload line
+`upload: done, 253 file(s)`. Afterwards `cfdagent list` and `cfdagent status <run-id>` on the VM report the run
+as `completed`, and `/var/lib/cfdagent` holds no `active-run` marker.
 
 ### Check the Blob contents (read-only)
 
@@ -85,7 +115,10 @@ az storage blob list --auth-mode login --account-name <account> --container-name
 The folder `<run-id>/` must hold `summary.md`, `run_record.json`, `results/comparison.json`, `casespec.json`,
 `analysis.md` and the logs. The `az` call is read-only; every `az` call still triggers a permission prompt.
 
-TODO(observed): the listing (names and count).
+Observed (read-only, from the laptop): 253 blobs under the run prefix, matching the 253 uploaded files. Top-level
+entries include `summary.md`, `run_record.json`, `run.log`, `status.json`, `task.md`, `casespec.json`,
+`analysis.md`, `llm_transcript.jsonl`, `case.tar.zst`, `results/comparison.json`, `results/quantities.json`,
+`logs/solver_run.json`, `geometry/`, `mesh/` and `sandbox/`.
 
 ## 5. First live run (Task 23)
 
@@ -112,4 +145,7 @@ infra/scripts/vm-down.ps1
 Skip this only if Task 23 continues immediately. The idle shutdown (30 minutes) and the daily shutdown
 (23:00 Europe/Warsaw) are the safety net, not the plan.
 
-TODO(observed): total VM uptime of the session and its cost (uptime x $0.208/h).
+Observed: the VM ran about 20 minutes in the session (start to deallocate), about $0.07; no LLM cost. The
+benchmark lookup was checked from the VM: `cfdagent run --benchmark <unknown-id>` run from `/opt/cfdagent-src`
+lists the five known benchmarks, and from any other directory it fails with `benchmark root benchmarks does
+not exist`.
