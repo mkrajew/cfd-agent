@@ -6,8 +6,8 @@ files the orchestrator writes into a run directory (``status.json``, ``run_recor
 and the task set never reach a file an agent can read).
 
 Environment: ``CFDAGENT_RUNS_DIR`` is the directory that holds the run directories (default
-``~/runs``). The model endpoint and the storage account are read by the orchestrator (see its
-module docstring).
+``~/runs``); ``CFDAGENT_IMAGE`` names the sandbox image (default ``cfdagent:runtime``). The model
+endpoint and the storage account are read by the orchestrator (see its module docstring).
 
 ``run`` exits with 0 (completed), 1 (failed), 130 (interrupted) or 2 (usage error: no message
 about the run is printed then, only what was wrong, and no traceback).
@@ -65,6 +65,7 @@ from cfdagent.record import RECORD_FILE, read_record
 from cfdagent.rundir import RunDir, RunDirError, _remove_tree
 
 RUNS_DIR_ENV = "CFDAGENT_RUNS_DIR"
+IMAGE_ENV = "CFDAGENT_IMAGE"
 STATUS_FILE = "status.json"
 LOG_FILE = "run.log"
 LAUNCHER_PREFIX = ".launch-"
@@ -444,7 +445,9 @@ def _build_config(model: str | None, effort: Effort | None, benchmark_id: str | 
     from cfdagent.config import DEFAULT_DEPLOYMENT, RunConfig
     from cfdagent.llm.cost import PRICING
 
-    config = RunConfig.default()
+    # The host environment file names the image it pulled; without it the default local tag is used.
+    image = os.environ.get(IMAGE_ENV, "").strip()
+    config = RunConfig.default(image=image) if image else RunConfig.default()
     if model is not None and model not in PRICING:
         _usage_error(
             f"no price is known for the model {model!r}; known models: {', '.join(PRICING)}"

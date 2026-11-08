@@ -254,6 +254,26 @@ def test_the_default_model_keeps_the_default_effort(runner, root, fake_run_task,
     assert fake_run_task.calls[0]["config"].models == default.models
 
 
+def test_the_sandbox_image_comes_from_the_environment(
+    runner, root, monkeypatch, fake_run_task, task_file
+):
+    monkeypatch.setenv("CFDAGENT_IMAGE", "registry.example/cfd:sha-abc1234")
+    assert invoke(runner, "run", str(task_file)).exit_code == 0
+    assert fake_run_task.calls[0]["config"].sandbox.image == "registry.example/cfd:sha-abc1234"
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_without_an_image_in_the_environment_the_default_image_is_used(
+    runner, root, monkeypatch, fake_run_task, task_file, value
+):
+    if value is None:
+        monkeypatch.delenv("CFDAGENT_IMAGE", raising=False)
+    else:
+        monkeypatch.setenv("CFDAGENT_IMAGE", value)
+    assert invoke(runner, "run", str(task_file)).exit_code == 0
+    assert fake_run_task.calls[0]["config"].sandbox.image == RunConfig.default().sandbox.image
+
+
 def test_an_unpriced_model_is_a_usage_error(runner, root, fake_run_task, task_file):
     result = invoke(runner, "run", str(task_file), "--model", "mystery-model")
     assert result.exit_code == 2
