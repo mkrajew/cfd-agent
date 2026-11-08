@@ -2,6 +2,7 @@
 
 import ast
 import importlib.util
+import io
 import json
 import re
 import sys
@@ -240,6 +241,69 @@ def test_a_writable_docker_init_or_another_file_mount_fails_the_mount_row(tmp_pa
     probes = json.loads(json.dumps(GOOD_PROBES))
     probes["mounts.py"]["mounts"][-2][0] = "/usr/sbin/something-else"
     assert not run_one("run directory is the only mount", make(tmp_path, probes)).passed
+
+
+@pytest.mark.parametrize(
+    ("label", "entry"),
+    [
+        ("ext4 under /dev", ["/dev/host-disk", "ext4", "/home/admin/data", ["rw"]]),
+        ("ext4 under /proc", ["/proc/stolen", "ext4", "/home/admin/data", ["rw"]]),
+        ("ext4 under /sys", ["/sys/stolen", "overlay", "/", ["rw"]]),
+        ("docker-init below /job", ["/job/docker-init", "ext4", "/usr/bin/docker-init", ["ro"]]),
+        ("docker-init at another path", ["/usr/bin/docker-init", "ext4", "/x/docker-init", ["ro"]]),
+        ("docker-init from another source", ["/sbin/docker-init", "ext4", "/x/evil", ["ro"]]),
+        ("docker-init writable", ["/sbin/docker-init", "ext4", "/x/docker-init", ["rw"]]),
+    ],
+)
+def test_tightened_mount_rules_reject_lookalikes(tmp_path, label, entry):
+    probes = json.loads(json.dumps(GOOD_PROBES))
+    probes["mounts.py"]["mounts"].insert(-1, entry)
+    row = run_one("run directory is the only mount", make(tmp_path, probes))
+    assert not row.passed and entry[0] in row.evidence, label
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        ["/sbin/docker-init", "overlay", "/usr/libexec/docker/docker-init", ["ro", "relatime"]],
+        ["/usr/sbin/docker-init", "ext4", "/usr/bin/docker-init", ["ro"]],
+        ["/dev/pts", "devpts", "/", ["rw"]],
+        ["/dev/mqueue", "mqueue", "/", ["rw"]],
+        ["/proc/bus", "proc", "/bus", ["ro"]],
+        ["/sys/firmware", "tmpfs", "/", ["ro"]],
+    ],
+)
+def test_what_a_hardened_container_really_has_is_accepted(tmp_path, entry):
+    probes = json.loads(json.dumps(GOOD_PROBES))
+    probes["mounts.py"]["mounts"].insert(-1, entry)
+    assert run_one("run directory is the only mount", make(tmp_path, probes)).passed
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        ["/tmp", "ext4", "/home/admin/tmp", ["rw"]],  # --tmpfs makes /tmp a tmpfs, nothing else
+        ["/etc/hosts", "ext4", "/home/admin/secrets", ["ro"]],  # Docker's own file is named hosts
+    ],
+)
+def test_tmp_and_docker_managed_files_must_look_like_docker_made_them(tmp_path, entry):
+    probes = json.loads(json.dumps(GOOD_PROBES))
+    mounts = probes["mounts.py"]["mounts"]
+    mounts[:] = [m for m in mounts if m[0] != entry[0]]
+    mounts.insert(-1, entry)
+    row = run_one("run directory is the only mount", make(tmp_path, probes))
+    assert not row.passed and entry[0] in row.evidence
+
+
+def test_leftover_run_directory_is_warned_about(tmp_path):
+    left = tmp_path / "verify-left"
+    left.mkdir()
+    err = io.StringIO()
+    assert vs.remove_run_dir(left, remove=lambda path, **kw: None, err=err) is False
+    assert "verify-left" in err.getvalue() and "warning" in err.getvalue()
+    err = io.StringIO()
+    assert vs.remove_run_dir(left, err=err) is True and not left.exists()
+    assert err.getvalue() == ""
 
 
 def test_a_missing_job_mount_or_another_source_fails_the_mount_row(tmp_path):

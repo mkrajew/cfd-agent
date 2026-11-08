@@ -10,7 +10,10 @@ under ``$CFDAGENT_RUNS_DIR`` (or the system temporary directory) that is removed
 
 One row per check, mirroring the real-Docker tests in ``tests/sandbox/test_docker_mode.py``: no
 network, no credentials in the environment, read-only root, case-supplied code refused, four MPI
-ranks, a timeout leaves no container, the run directory is the only mount. The exit status is 0
+ranks, a timeout leaves no container, the run directory is the only mount. The rows are smoke
+checks on the target machine, not a replacement for those tests: the ``#codeStream`` row tries one
+variant through ``check_dictionaries`` (the full set of hostile cases lives in ``tests/sandbox``)
+and the MPI row starts four ranks of a trivial program, not a solver. The exit status is 0
 only when every row passes. The probes are short scripts that the executor runs in the container
 (``run_script``); the host side only judges what they print. The cost is a few minutes of VM time.
 """
@@ -50,10 +53,14 @@ SECRET_MARKERS = {
     "AZURE_CLIENT_SECRET": "s3cret-azure-value",
     "CFDAGENT_LLM_API_KEY": "s3cret-llm-value",
 }
-# Mount points a hardened container has besides the run directory (Docker's own files and the
-# virtual file systems). ``--init`` also bind-mounts the host's ``docker-init`` binary read-only.
-ALLOWED_MOUNTS = {"/", "/job", "/tmp", "/etc/hosts", "/etc/hostname", "/etc/resolv.conf"}
-ALLOWED_MOUNT_PREFIXES = ("/proc", "/sys", "/dev")
+# What a hardened container has besides the run directory (checked against ``docker run`` on
+# Docker Desktop and on the VM): the root, the run directory (judged separately), the ``--tmpfs``
+# /tmp, Docker's own hosts/hostname/resolv.conf files, the host's ``docker-init`` binary that
+# ``--init`` bind-mounts read-only, and virtual file systems under /proc, /sys and /dev.
+VIRTUAL_FS = {"proc", "sysfs", "tmpfs", "devpts", "mqueue", "cgroup", "cgroup2"}
+VIRTUAL_PREFIXES = ("/proc", "/sys", "/dev")
+DOCKER_FILES = {"/etc/hosts", "/etc/hostname", "/etc/resolv.conf"}  # source has the same name
+DOCKER_INIT_POINTS = {"/sbin/docker-init", "/usr/sbin/docker-init"}
 
 PROBES = {
     "network.py": """
@@ -231,6 +238,12 @@ def _case_files(h: Harness, case: str, with_code: bool) -> None:
 
 
 def check_code_stream_refused(h: Harness) -> Verdict:
+    """Smoke check: one ``#codeStream`` variant is refused by ``check_dictionaries``.
+
+    The full set of hostile cases (``#calc``, coded patches, info switches, solver ops) is in
+    ``tests/sandbox``. A control case without code must be accepted, so a syntax error is not
+    mistaken for a refusal.
+    """
     _case_files(h, "case", with_code=True)
     _case_files(h, "control", with_code=False)
     refused = h.call("check_dictionaries", {"case_dir": "case"}, timeout_s=CODE_CHECK_TIMEOUT_S)
@@ -254,6 +267,7 @@ def check_code_stream_refused(h: Harness) -> Verdict:
 
 
 def check_mpi(h: Harness) -> Verdict:
+    """Four MPI ranks of a trivial program start and finish inside the container (no solver)."""
     r = _probe(h, "mpi.py")
     if r.get("returncode") != 0 or r.get("lines") != ["rank"] * 4:
         return (
@@ -277,18 +291,22 @@ def check_timeout_leaves_no_container(h: Harness) -> Verdict:
     return True, f"killed after {CONTAINER_TIMEOUT_S:g} s; script had started; no container left"
 
 
-def _is_docker_init(mount: Sequence[Any]) -> bool:
-    options = mount[3] if len(mount) > 3 else []
-    return Path(mount[0]).name == "docker-init" and "ro" in options
+def _is_docker_init(point: str, root: str, options: Sequence[str]) -> bool:
+    return point in DOCKER_INIT_POINTS and Path(root).name == "docker-init" and "ro" in options
 
 
 def _is_expected_mount(mount: Sequence[Any]) -> bool:
-    point = mount[0]
-    return (
-        point in ALLOWED_MOUNTS
-        or any(point == p or point.startswith(p + "/") for p in ALLOWED_MOUNT_PREFIXES)
-        or _is_docker_init(mount)
-    )
+    point, fstype, root = mount[0], mount[1], mount[2]
+    options = mount[3] if len(mount) > 3 else []
+    if point in ("/", "/job"):  # /job is judged on its own
+        return True
+    if point == "/tmp":
+        return fstype == "tmpfs"
+    if point in DOCKER_FILES:
+        return Path(root).name == Path(point).name
+    if any(point == p or point.startswith(p + "/") for p in VIRTUAL_PREFIXES):
+        return fstype in VIRTUAL_FS
+    return _is_docker_init(point, root, options)
 
 
 def check_only_mount(h: Harness) -> Verdict:
@@ -394,6 +412,17 @@ class DockerHarness:
         return listed.stdout.strip()
 
 
+def remove_run_dir(
+    root: Path, *, remove: Callable[..., Any] = shutil.rmtree, err: TextIO | None = None
+) -> bool:
+    """Remove the temporary run directory; warn on ``err`` and return False if it is still there."""
+    remove(root, ignore_errors=True)
+    if not root.exists():
+        return True
+    print(f"warning: could not remove the temporary run directory {root}", file=err or sys.stderr)
+    return False
+
+
 @contextlib.contextmanager
 def docker_harness(image: str, runs_dir: Path | None) -> Iterator[DockerHarness]:
     if shutil.which("docker") is None:
@@ -411,7 +440,7 @@ def docker_harness(image: str, runs_dir: Path | None) -> Iterator[DockerHarness]
     try:
         yield DockerHarness(root, image)
     finally:
-        shutil.rmtree(root, ignore_errors=True)
+        remove_run_dir(root)
 
 
 # ---------------------------------------------------------------------------------- entry point

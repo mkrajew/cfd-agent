@@ -43,7 +43,7 @@ cfdagent --help
 
 Observed: form 2.2 of `docs/runbooks/vm-host.md` (run-command wrapper, full 40-character commit id), first
 attempt, exit status 0, 1 min 35 s including the image pull. Image `ghcr.io/mkrajew/cfd-agent:sha-c6e9b78`:
-5.33 GB (`docker image ls`; `docker image inspect` reports 1.16 GB, probably the compressed size, not checked). The host has
+5.33 GB (`docker image ls`; `docker image inspect` reports 1.16 GB). The host has
 4 vCPU, 15 GB RAM and 48 GB free disk; metadata firewall rules present; `cfdagent-idle-shutdown --check` ok;
 `/var/lib/cfdagent` and `~/runs` belong to the admin user. `cfdagent --help` lists run, status, logs, list.
 
