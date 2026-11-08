@@ -72,6 +72,10 @@ CHECK_ERROR_BYTES = 4096  # gate errors returned to the model
 TRANSPORT_RETRIES = 2
 BACKOFF_S = (2.0, 8.0)  # pause before the first and the second retry
 CHECK_TOOL = "check_stage"
+# A reply with no text and no tool call is not a "done": some models end a turn like that in the
+# middle of their work. It is answered with a nudge, at most this many times in a row; the next
+# blank reply is read as "done" and the checks are run, as for any reply without a tool call.
+MAX_BLANK_NUDGES = 2
 CUT_OFF_ADVICE = (
     "Reason briefly, then call tools with SMALLER arguments: split the work into several "
     "smaller files; do not put everything into one huge file."
@@ -320,6 +324,7 @@ class _StageRun(ModelConversation):
         self.exhausted = False
         self.no_retry = False  # the stage ended because the stage said a retry cannot help
         self.diagnosis_due: tuple[AttemptRecord, str] | None = None  # failed attempt, question
+        self.blank_replies = 0  # blank replies in a row, answered with a nudge
         self.attempt_dir = Path()
         self.attempt_started = 0.0
 
@@ -425,7 +430,14 @@ class _StageRun(ModelConversation):
                 return self._fail(self.abort)
             if result is None:
                 continue
+            if result.tool_calls or (result.content or "").strip():
+                self.blank_replies = 0
+            elif self.blank_replies < MAX_BLANK_NUDGES:
+                self.blank_replies += 1
+                self.messages.append({"role": "user", "content": self._blank_reply_nudge()})
+                continue
             if not result.tool_calls:
+                self.blank_replies = 0  # the gate runs now; a blank reply after it is nudged again
                 text = self._check()
                 ended = self.passed or self.exhausted or self.abort is not None
                 if self.diagnosis_due is not None and self.abort is None:
@@ -462,6 +474,13 @@ class _StageRun(ModelConversation):
             )
         return self._fail(
             f"stage {self.stage.name!r} failed after {self.attempts} attempts; last errors: {shown}"
+        )
+
+    def _blank_reply_nudge(self) -> str:
+        return (
+            "Your last reply had no text and no tool call, so nothing was done and no checks were "
+            "run. If the files for this stage are not all written yet, continue by calling a "
+            f"tool. If they are complete, call {CHECK_TOOL} to have them checked."
         )
 
     def _tell_gate_ran_for_the_model(self, text: str) -> None:

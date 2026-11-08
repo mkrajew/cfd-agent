@@ -265,6 +265,66 @@ def test_one_turn_reply_without_tools_then_exhausted_attempts_end_the_stage(tmp_
     assert not outcome.ok and outcome.attempts == 3 and len(backend.calls) == 3
 
 
+@pytest.mark.parametrize("blank", [None, "", " \n "], ids=["none", "empty", "whitespace"])
+def test_a_blank_reply_without_tool_calls_is_nudged_not_checked(tmp_path, blank):
+    steps = [reply(blank), reply(None, check("k1"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    stage = ToyStage([GateResult(True, [])])
+    outcome = run_stage(stage, ctx)
+    assert outcome.ok and outcome.attempts == 1  # the nudge used no attempt
+    assert len(stage.gate_dirs) == 1  # the gate ran once, when the model asked for it
+    nudge = backend.calls[1].messages[-1]
+    assert nudge["role"] == "user"
+    assert "no text and no tool call" in nudge["content"] and "check_stage" in nudge["content"]
+    assert "checks were run for you" not in nudge["content"]
+
+
+def test_blank_replies_beyond_the_nudge_limit_fall_back_to_running_the_gate(tmp_path):
+    n = loop.MAX_BLANK_NUDGES
+    steps = [reply(None) for _ in range(n + 1)] + [reply(None, check("k1"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    stage = ToyStage([GateResult(False, ["nothing written"]), GateResult(True, [])])
+    outcome = run_stage(stage, ctx)
+    assert outcome.ok and outcome.attempts == 2
+    # n nudges, then the next blank reply is treated as "done": the gate ran for the model
+    ran_for_model = backend.calls[n + 1].messages[-1]
+    assert "checks were run for you" in ran_for_model["content"]
+    assert "nothing written" in ran_for_model["content"]
+
+
+def test_a_tool_call_resets_the_count_of_blank_replies(tmp_path):
+    n = loop.MAX_BLANK_NUDGES
+    steps = [reply(None) for _ in range(n)]
+    steps += [reply(None, tc("calculator", "c1", expression="1+1"))]
+    steps += [reply(None) for _ in range(n)]
+    steps += [reply(None, check("k1"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    stage = ToyStage([GateResult(True, [])])
+    outcome = run_stage(stage, ctx)
+    assert outcome.ok and outcome.attempts == 1 and len(stage.gate_dirs) == 1
+    # A gate run before the model asked for it would end the stage early, leaving steps unused.
+    assert len(backend.calls) == len(steps)
+
+
+def test_the_count_of_blank_replies_starts_again_after_the_gate_ran_for_the_model(tmp_path):
+    n = loop.MAX_BLANK_NUDGES
+    steps = [reply(None) for _ in range(n + 1)]  # n nudges, then the gate runs for the model
+    steps += [reply(None) for _ in range(n)]  # nudged again in attempt 2
+    steps += [reply(None, check("k1"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    stage = ToyStage([GateResult(False, ["x"]), GateResult(True, [])])
+    outcome = run_stage(stage, ctx)
+    assert outcome.ok and outcome.attempts == 2 and len(backend.calls) == len(steps)
+
+
+def test_a_reply_with_text_and_no_tool_call_still_runs_the_gate(tmp_path):
+    ctx, backend = make_ctx(tmp_path, [reply("All done."), reply(None, check("k1"))])
+    stage = ToyStage([GateResult(False, ["e"]), GateResult(True, [])])
+    outcome = run_stage(stage, ctx)
+    assert outcome.ok and outcome.attempts == 2
+    assert "checks were run for you" in backend.calls[1].messages[-1]["content"]
+
+
 def test_loop_stops_at_turn_limit(tmp_path):
     steps = [reply(None, tc("calculator", f"c{i}", expression="1+1")) for i in range(6)]
     ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_turns_per_attempt=3))
