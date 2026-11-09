@@ -292,3 +292,15 @@ def test_a_macro_in_place_of_a_value_is_not_judged(tmp_path):
         )
 
     assert errors_of(write_case(tmp_path, "icoFoam", mutate), "icoFoam") == []
+
+
+def test_nested_relaxation_in_a_dictionary_the_solver_does_not_read_is_not_judged(tmp_path):
+    def mutate(files):  # a PISO dictionary in a simpleFoam case is never read
+        with_nested_relaxation()(files)
+        text = files["system/fvSolution"]
+        files["system/fvSolution"] = (
+            text.replace("SIMPLE\n{", "PISO\n{", 1)
+            + "SIMPLE\n{\n    consistent yes;\n    pRefCell 0;\n    pRefValue 0;\n}\n"
+        )
+
+    assert errors_of(write_case(tmp_path, "simpleFoam", mutate), "simpleFoam") == []

@@ -275,41 +275,38 @@ def _solution_problems(case_dir: Path, needs: _Needs, skipped: list[str]) -> lis
             )
     if _pressure_needs_reference(case_dir, skipped):
         problems += _reference_problems(rel, solution, needs.algorithm)
-    problems += _relaxation_problems(rel, solution)
+    problems += _relaxation_problems(rel, solution, needs.algorithm)
     return problems
 
 
-ALGORITHM_DICTIONARIES = ("SIMPLE", "PISO", "PIMPLE")
 RELAXATION = "relaxationFactors"
 
 
-def _relaxation_problems(rel: str, solution: Dictionary) -> list[str]:
-    """``relaxationFactors`` written inside an algorithm dictionary (SIMPLE, PISO, PIMPLE).
+def _relaxation_problems(rel: str, solution: Dictionary, algorithm: str) -> list[str]:
+    """``relaxationFactors`` written inside the solver's algorithm dictionary (SIMPLE, PISO or
+    PIMPLE, ``algorithm``).
 
     OpenFOAM reads the relaxation factors only from the top-level ``relaxationFactors`` dictionary
-    of fvSolution; inside the algorithm dictionary the entry is silently ignored, the factors stay
-    at their defaults and a steady solver may diverge without any message. Reported only when no
+    of fvSolution; inside the algorithm dictionary the entry is silently ignored, no relaxation is
+    applied and a steady solver may diverge without any message. Reported only when no
     top-level dictionary exists (then the nested one is the only attempt to set the factors) and
     when no directive in the file or in the algorithm dictionary could supply or move entries.
     """
     if RELAXATION in solution or cc.DIRECTIVES in solution:
         return []
-    problems = []
-    for algorithm in ALGORITHM_DICTIONARIES:
-        block = solution.get(algorithm)
-        if not isinstance(block, dict) or cc.DIRECTIVES in block or RELAXATION not in block:
-            continue
-        value = block[RELAXATION]
-        if isinstance(value, list) and cc._macro(cc._word(value)):
-            continue
-        problems.append(
-            f"{rel}: `{RELAXATION}` is written inside the `{algorithm}` dictionary, where "
-            "OpenFOAM ignores it, so the relaxation stays at its defaults. It must be a "
-            f"top-level dictionary of {rel}, after `{algorithm}`, not inside it: "
-            f"`{RELAXATION} {{ fields {{ p 0.3; }} equations {{ U 0.7; }} }}` (a steady solver "
-            "under-relaxes with it; the values are examples, choose them for the case)"
-        )
-    return problems
+    block = solution.get(algorithm)
+    if not isinstance(block, dict) or cc.DIRECTIVES in block or RELAXATION not in block:
+        return []
+    value = block[RELAXATION]
+    if isinstance(value, list) and cc._macro(cc._word(value)):
+        return []
+    return [
+        f"{rel}: `{RELAXATION}` is written inside the `{algorithm}` dictionary, where "
+        "OpenFOAM ignores it, so no under-relaxation is applied. It must be a top-level "
+        f"dictionary of {rel}, beside `{algorithm}` and not inside it: "
+        f"`{RELAXATION} {{ fields {{ p 0.3; }} equations {{ U 0.7; }} }}` (a steady solver "
+        "under-relaxes with it; the values are examples, choose them for the case)"
+    ]
 
 
 def _final_hint(missing: list[str]) -> str:
