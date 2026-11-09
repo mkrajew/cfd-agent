@@ -23,6 +23,16 @@ A stage ends, with a reason, when: the gate passes; ``max_attempts_per_stage`` g
 the cost limit is exceeded; or the model service fails for good. A ``SchemaError`` is a
 programming error and propagates, as does any exception from the gate itself.
 
+Blank replies
+-------------
+A reply with no text and no tool call is answered with a nudge (``MAX_BLANK_NUDGES`` times in a
+row, each firmer than the last). If the model is still blank, a reply is read as "done" and the gate
+runs, unless the attempt has seen no work at all (only blank replies): then the conversation is
+rolled back to where the blank streak began and asked again, without using one of the stage's
+attempts, at most ``MAX_FREE_RESTARTS`` times per stage. Each such restart is counted in
+``StageRecord.free_restarts``; the attempt numbers stay the numbers of gate runs. The wall-clock
+limit, the cost limit and the caps above still bound the total.
+
 Model errors
 ------------
 A reply that arrives but is unusable (cut off, no choices, malformed, failing a schema) costs one
@@ -76,7 +86,15 @@ CHECK_TOOL = "check_stage"
 # middle of their work. It is answered with a nudge, at most this many times in a row; the next
 # blank reply is read as "done" and the checks are run, as for any reply without a tool call.
 # A nudged blank reply does not count against ``max_turns_per_attempt`` (it is still billed).
-MAX_BLANK_NUDGES = 2
+# Live runs showed streaks of three blank replies, so two nudges were too few; each further blank
+# reply costs few completion tokens, and a stuck model is still stopped after this many.
+MAX_BLANK_NUDGES = 4
+# An attempt in which the model sent nothing but blank replies (no tool call, no text) did no work
+# the gate could judge. Instead of being run through the gate and spent, the conversation goes
+# back to where the blank streak began, at most this many times per stage. The total number of
+# blank replies a stage can cost is therefore bounded:
+# (MAX_BLANK_NUDGES + 1) * (MAX_FREE_RESTARTS + max_attempts_per_stage).
+MAX_FREE_RESTARTS = 2
 CUT_OFF_ADVICE = (
     "Reason briefly, then call tools with SMALLER arguments: split the work into several "
     "smaller files; do not put everything into one huge file."
@@ -326,6 +344,9 @@ class _StageRun(ModelConversation):
         self.no_retry = False  # the stage ended because the stage said a retry cannot help
         self.diagnosis_due: tuple[AttemptRecord, str] | None = None  # failed attempt, question
         self.blank_replies = 0  # blank replies in a row, answered with a nudge
+        self.blank_streak_start = 0  # index of the first blank reply of the current streak
+        self.did_work = False  # the model has sent a tool call or text in this attempt
+        self.free_restarts = 0  # restarts after a blank-only attempt, for the whole stage
         self.attempt_dir = Path()
         self.attempt_started = 0.0
 
@@ -341,6 +362,7 @@ class _StageRun(ModelConversation):
             self.stage.prepare_attempt(self.ctx, self.attempt_dir)
         self.attempt_started = self.ctx.clock()
         self.turns = 0
+        self.did_work = False
         registry = ToolRegistry()
         for tool in builtin_tools(self.ctx.run, self.stage.scope):
             registry.add(tool)
@@ -431,14 +453,21 @@ class _StageRun(ModelConversation):
                 return self._fail(self.abort)
             if result is None:
                 continue
-            if result.tool_calls or (result.content or "").strip():
+            blank = not result.tool_calls and not (result.content or "").strip()
+            if not blank:
                 self.blank_replies = 0
+                self.did_work = True
             elif self.blank_replies < MAX_BLANK_NUDGES:
+                if self.blank_replies == 0:
+                    self.blank_streak_start = len(self.messages) - 1  # the reply just echoed
                 self.blank_replies += 1
                 # A nudged blank reply is not work the model did: it is refunded, so the turn
                 # budget measures real steps. The nudge cap above still ends a stuck model.
                 self.turns -= 1
                 self.messages.append({"role": "user", "content": self._blank_reply_nudge()})
+                continue
+            elif not self.did_work and self.free_restarts < MAX_FREE_RESTARTS:
+                self._restart_conversation()
                 continue
             if not result.tool_calls:
                 self.blank_replies = 0  # the gate runs now; a blank reply after it is nudged again
@@ -480,11 +509,34 @@ class _StageRun(ModelConversation):
             f"stage {self.stage.name!r} failed after {self.attempts} attempts; last errors: {shown}"
         )
 
+    def _restart_conversation(self) -> None:
+        """Go back to where the blank streak began, without a gate run: the attempt did nothing
+        the gate could judge, so it is not spent. The blank replies and nudges leave the history
+        (they stay in the transcript), so the model is asked again from the same state."""
+        del self.messages[self.blank_streak_start :]
+        self.logged = min(self.logged, len(self.messages))
+        self.blank_replies = 0
+        self.turns = 0  # every turn of this attempt was a blank reply
+        self.free_restarts += 1
+        self.record.free_restarts = self.free_restarts
+        self._progress()
+
     def _blank_reply_nudge(self) -> str:
-        return (
+        """The nudge after the ``self.blank_replies``-th blank reply in a row; it gets firmer."""
+        core = (
             "Your last reply had no text and no tool call, so nothing was done and no checks were "
             "run. If the files for this stage are not all written yet, continue by calling a "
             f"tool. If they are complete, call {CHECK_TOOL} to have them checked."
+        )
+        if self.blank_replies <= 1:
+            return core
+        if self.blank_replies == 2:
+            return "You sent an empty reply again. " + core
+        return (
+            f"You have now sent {self.blank_replies} empty replies in a row. Do not reply with "
+            "an empty message: your next reply must be a tool call (for example read an input "
+            "file, or write the next output file) or, if the work is complete, a call to "
+            f"{CHECK_TOOL}. " + core
         )
 
     def _tell_gate_ran_for_the_model(self, text: str) -> None:

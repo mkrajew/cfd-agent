@@ -141,6 +141,30 @@ def test_summary_contains_no_reference_sentence_for_ad_hoc_run(run):
     assert "completed" in text
 
 
+def test_free_restarts_are_in_the_summary_and_old_records_still_load(run):
+    attempt = AttemptRecord(n=1, ok=True, seconds=1)
+    record = make_record(
+        status="completed",
+        finished_at=NOW,
+        stages=[
+            StageRecord(name="analyst", attempts=[attempt], ok=True, free_restarts=2),
+            StageRecord(name="mesh", attempts=[attempt], ok=True),
+        ],
+    )
+    write_summary(run, record, None)
+    text = run.read_text("summary.md")
+    assert "| analyst | 1 | ok |" in text  # the attempts column stays the number of gate runs
+    assert "Stage analyst: 2 free restart(s)" in text
+    assert "Stage mesh" not in text
+    write_record(run, record)
+    assert read_record(run).stages[0].free_restarts == 2
+    old = run.read_json("run_record.json")
+    del old["stages"][0]["free_restarts"]
+    assert RunRecord.model_validate(old).stages[0].free_restarts == 0
+    with pytest.raises(ValidationError):
+        StageRecord(name="x", ok=True, free_restarts=-1)
+
+
 def test_summary_contains_comparison_for_benchmark_run(run):
     comparison = {
         "passed": False,

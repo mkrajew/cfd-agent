@@ -7,8 +7,9 @@ five attempts. This check lists every missing item at once, before the solver ru
 The rules below come from running ``icoFoam``, ``simpleFoam`` and ``pimpleFoam`` of the image on a
 small laminar case with one item removed at a time; the test module
 ``tests/integration/test_solver_requirements.py`` repeats that experiment, so the rules cannot
-drift away from OpenFOAM. Only what OpenFOAM refuses
-is reported: ``interpolationSchemes``, ``snGradSchemes`` and the correctors of the algorithm
+drift away from OpenFOAM. Only what OpenFOAM refuses is reported, with one quality rule: a
+``relaxationFactors`` entry inside the algorithm dictionary, which OpenFOAM silently ignores.
+``interpolationSchemes``, ``snGradSchemes`` and the correctors of the algorithm
 dictionary have defaults and are not required. The check covers this laminar core and the pressure
 reference. What a turbulence model adds (its fields in ``0/``, their solvers and schemes, the
 model entries) is not listed up front and is left to the trial run.
@@ -274,7 +275,38 @@ def _solution_problems(case_dir: Path, needs: _Needs, skipped: list[str]) -> lis
             )
     if _pressure_needs_reference(case_dir, skipped):
         problems += _reference_problems(rel, solution, needs.algorithm)
+    problems += _relaxation_problems(rel, solution, needs.algorithm)
     return problems
+
+
+RELAXATION = "relaxationFactors"
+
+
+def _relaxation_problems(rel: str, solution: Dictionary, algorithm: str) -> list[str]:
+    """``relaxationFactors`` written inside the solver's algorithm dictionary (SIMPLE, PISO or
+    PIMPLE, ``algorithm``).
+
+    OpenFOAM reads the relaxation factors only from the top-level ``relaxationFactors`` dictionary
+    of fvSolution; inside the algorithm dictionary the entry is silently ignored, no relaxation is
+    applied and a steady solver may diverge without any message. Reported only when no
+    top-level dictionary exists (then the nested one is the only attempt to set the factors) and
+    when no directive in the file or in the algorithm dictionary could supply or move entries.
+    """
+    if RELAXATION in solution or cc.DIRECTIVES in solution:
+        return []
+    block = solution.get(algorithm)
+    if not isinstance(block, dict) or cc.DIRECTIVES in block or RELAXATION not in block:
+        return []
+    value = block[RELAXATION]
+    if isinstance(value, list) and cc._macro(cc._word(value)):
+        return []
+    return [
+        f"{rel}: `{RELAXATION}` is written inside the `{algorithm}` dictionary, where "
+        "OpenFOAM ignores it, so no under-relaxation is applied. It must be a top-level "
+        f"dictionary of {rel}, beside `{algorithm}` and not inside it: "
+        f"`{RELAXATION} {{ fields {{ p 0.3; }} equations {{ U 0.7; }} }}` (a steady solver "
+        "under-relaxes with it; the values are examples, choose them for the case)"
+    ]
 
 
 def _final_hint(missing: list[str]) -> str:
