@@ -148,3 +148,20 @@ REMOVALS = [
     ("pRefCell missing", "system/fvSolution", remove_lines("pRefCell"), ALL),
     ("pRefValue missing", "system/fvSolution", remove_lines("pRefValue"), ALL),
 ]
+
+
+def _no_momentum_solvers(text: str) -> str:
+    """Switch the momentum predictor off and drop the linear solvers of the velocity."""
+    text = remove_block("U", "    ")(text)
+    text = remove_block("UFinal", "    ")(text)
+    return text.replace(
+        "    nNonOrthogonalCorrectors 0;\n",
+        "    nNonOrthogonalCorrectors 0;\n    momentumPredictor no;\n",
+        1,
+    )
+
+
+# The solver runs these cases although an item is missing: the check must stay silent.
+REMOVALS.append(
+    ("no momentum predictor, no U solvers", "system/fvSolution", _no_momentum_solvers, frozenset())
+)

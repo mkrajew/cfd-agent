@@ -45,6 +45,20 @@ DIRECTIVES = "#"  # key under which a dictionary records the ``#...`` directives
 _TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|//[^\n]*|/\*.*?\*/|[{};()]|[^\s{};()"]+', re.DOTALL)
 _PUNCTUATION = frozenset("{};()")
 _NESTED_QUANTIFIER = re.compile(r"[)\]][*+{]")  # a repeated group: a regex that can blow up
+_QUANTIFIER = re.compile(r"[*+?{]")
+MAX_QUANTIFIERS = 2  # chained quantifiers (``.*.*.*``) take polynomial time on a long name
+
+
+def pattern_too_complex(pattern: str) -> bool:
+    """True for a regular expression not safe to try on a name: long, a repeated group, or many
+    quantifiers. The caller then treats the pattern as matching (reports nothing)."""
+    return (
+        len(pattern) > MAX_REGEX_CHARS
+        or "[:" in pattern  # a POSIX class: OpenFOAM's dialect, not Python's
+        or _NESTED_QUANTIFIER.search(pattern) is not None
+        or len(_QUANTIFIER.findall(pattern)) > MAX_QUANTIFIERS
+    )
+
 
 Dictionary = dict[str, Any]  # values: ``list[str]`` (the tokens of an entry) or a sub-dictionary
 
@@ -66,7 +80,13 @@ def _parse_block(tokens: list[str], i: int, depth: int, top: bool) -> tuple[Dict
             return out, i + 1
         if token == "{":
             key = statement[-1] if statement else ""
-            out[key], i = _parse_block(tokens, i + 1, depth + 1, top=False)
+            block, i = _parse_block(tokens, i + 1, depth + 1, top=False)
+            if key.startswith("#") or key == ")":
+                # ``nu #eval{...}``, ``div(phi,k) {...}``: not a plain ``name { ... }`` block, so
+                # the entry cannot be read here. Record it as a directive: nothing is judged.
+                out.setdefault(DIRECTIVES, []).append(key)
+            else:
+                out[key] = block
             statement = []
             continue
         if token == ";":
@@ -180,7 +200,7 @@ def _find_entry(
         if not key.startswith('"'):
             continue
         pattern = _unquote(key)
-        if len(pattern) > MAX_REGEX_CHARS or _NESTED_QUANTIFIER.search(pattern):
+        if pattern_too_complex(pattern):
             too_complex = True
             continue
         try:

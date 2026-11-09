@@ -99,17 +99,17 @@ def test_items_a_solver_does_not_read_are_not_demanded(tmp_path):
 def test_all_missing_items_are_reported_together(tmp_path):
     def mutate(files):
         del files["constant/turbulenceProperties"]
-        files["constant/transportProperties"] = files["constant/transportProperties"].replace(
-            "transportModel Newtonian;\n", ""
-        )
-        files["system/fvSchemes"] = files["system/fvSchemes"].replace(
-            "    div((nuEff*dev2(T(grad(U))))) Gauss linear;\n", ""
-        )
-        files["system/fvSolution"] = files["system/fvSolution"].replace("    pRefCell 0;\n", "")
+        transport = files["constant/transportProperties"]
+        files["constant/transportProperties"] = transport.replace("transportModel Newtonian;\n", "")
+        schemes = files["system/fvSchemes"]
+        divergence = "    div(phi,U) bounded Gauss linearUpwind grad(U);\n"
+        files["system/fvSchemes"] = schemes.replace(divergence, "")
+        solution = files["system/fvSolution"]
+        files["system/fvSolution"] = solution.replace("    pRefCell 0;\n", "")
 
     errors = errors_of(write_case(tmp_path, "simpleFoam", mutate), "simpleFoam")
     joined = "\n".join(errors)
-    for word in ("turbulenceProperties", "transportModel", "nuEff", "pRefCell"):
+    for word in ("turbulenceProperties", "transportModel", "div(phi,U)", "pRefCell"):
         assert word in joined, (word, errors)
 
 

@@ -5,15 +5,22 @@ time (a missing file, then a missing entry, then the next), so a case that lacks
 five attempts. This check lists every missing item at once, before the solver runs.
 
 The rules below come from running ``icoFoam``, ``simpleFoam`` and ``pimpleFoam`` of the image on a
-small case with one item removed at a time; ``tests/integration/test_solver_requirements.py``
-repeats that experiment, so the rules cannot drift away from OpenFOAM. Only what OpenFOAM refuses
+small laminar case with one item removed at a time; the test module
+``tests/integration/test_solver_requirements.py`` repeats that experiment, so the rules cannot
+drift away from OpenFOAM. Only what OpenFOAM refuses
 is reported: ``interpolationSchemes``, ``snGradSchemes`` and the correctors of the algorithm
-dictionary have defaults and are not required, ``ddtSchemes`` is not read by the steady solver.
+dictionary have defaults and are not required. The check covers this laminar core and the pressure
+reference. What a turbulence model adds (its fields in ``0/``, their solvers and schemes, the
+model entries) is not listed up front and is left to the trial run.
 
-The check is conservative. It never reports an item that an ``#include`` or a ``#calc`` may supply,
-a ``default`` scheme stands in for a missing scheme name, a quoted regular expression key covers the
-solver names it matches, and a pressure whose level is fixed by a boundary condition needs no
-reference cell. Anything it cannot read is left to ``check_dictionaries`` and the trial run.
+The check is conservative: a false report would reject a valid case, so it stays silent whenever
+it cannot be sure. It never reports an item that an ``#include``, a ``#calc`` or an ``#eval`` may
+supply; a ``default`` scheme stands in for a missing scheme name; a quoted regular expression key
+covers the solver names it matches (and a key too complex to try is taken to cover them); a
+pressure whose level is fixed by a boundary condition needs no reference cell; the momentum
+solvers are not demanded when ``momentumPredictor`` is off; the viscous stress term is demanded
+only for the laminar models that certainly have it. Anything it cannot read is left to
+``check_dictionaries`` and the trial run.
 
 Container-side module (``case_check`` calls it); host-side code does not import it.
 """
@@ -46,6 +53,9 @@ FREE_LEVEL_TYPES = frozenset(
         "processor",
     }
 )
+# Laminar models whose momentum equation has the linear viscous stress term (the default model
+# when none is named). Others (Maxwell, ...) have their own terms.
+LINEAR_VISCOUS_LAMINAR = frozenset({"Stokes", "generalisedNewtonian"})
 _COMMENT = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
 VISCOUS_DIV = "div((nuEff*dev2(T(grad(U)))))"
 MOMENTUM_DIV = "div(phi,U)"
@@ -55,7 +65,7 @@ MOMENTUM_DIV = "div(phi,U)"
 class _Needs:
     algorithm: str  # the dictionary of fvSolution that carries pRefCell and pRefValue
     solvers: tuple[str, ...]  # solver entries of fvSolution
-    ddt_schemes: bool
+    ddt_schemes: bool  # read by the laminar case (a steady turbulent case reads it too)
     transport_model: bool  # `transportModel` and `constant/turbulenceProperties`
     viscous_div: bool
 
@@ -81,9 +91,9 @@ def _transport_problems(
     rel = "constant/transportProperties"
     transport, exists = _load(case_dir, rel, skipped)
     kinematic = (
-        "`nu` (kinematic viscosity, `nu [0 2 -1 0 0 0 0] <value>;`)"
-        if not needs.transport_model
-        else "`transportModel Newtonian;` and `nu [0 2 -1 0 0 0 0] <value>;`"
+        "`transportModel Newtonian;` and `nu [0 2 -1 0 0 0 0] <value>;`"
+        if needs.transport_model
+        else "`nu [0 2 -1 0 0 0 0] <value>;` (kinematic viscosity)"
     )
     if not exists:
         return [f"{rel} does not exist; {solver} reads it. Write it with {kinematic}"]
@@ -95,14 +105,15 @@ def _transport_problems(
         problems.append(
             f"{rel} has no `transportModel`; {solver} reads it. Add `transportModel Newtonian;`"
         )
-    if "nu" not in transport and (model is None or cc._macro(model) or model == "Newtonian"):
+    # icoFoam always reads `nu`; the others read it for the Newtonian model (the default here)
+    reads_nu = not needs.transport_model or (not cc._macro(model) and model in (None, "Newtonian"))
+    if "nu" not in transport and reads_nu:
         problems.append(f"{rel} has no `nu`; add `nu [0 2 -1 0 0 0 0] <value>;` (m^2/s)")
     return problems
 
 
-def _turbulence_problems(case_dir: Path, solver: str, skipped: list[str]) -> list[str]:
+def _turbulence_problems(turbulence: Dictionary | None, exists: bool, solver: str) -> list[str]:
     rel = "constant/turbulenceProperties"
-    turbulence, exists = _load(case_dir, rel, skipped)
     if not exists:
         return [
             f"{rel} does not exist; {solver} reads it even for a laminar flow. Write it with "
@@ -111,6 +122,27 @@ def _turbulence_problems(case_dir: Path, solver: str, skipped: list[str]) -> lis
     if turbulence is None or cc.DIRECTIVES in turbulence or "simulationType" in turbulence:
         return []
     return [f"{rel} has no `simulationType`; add `simulationType laminar;` or `RAS`/`LES`"]
+
+
+def _simulation_type(turbulence: Dictionary | None) -> str | None:
+    if turbulence is None or cc.DIRECTIVES in turbulence:
+        return None
+    word = cc._word(turbulence.get("simulationType"))
+    return None if cc._macro(word) else word
+
+
+def _linear_viscous(turbulence: Dictionary | None) -> bool:
+    """True when the flow is laminar with a model that certainly has the linear viscous stress
+    term ``div((nuEff*dev2(T(grad(U)))))`` (no ``laminar`` dictionary means the default model)."""
+    if _simulation_type(turbulence) != "laminar" or turbulence is None:
+        return False
+    laminar = turbulence.get("laminar")
+    if laminar is None:
+        return True
+    if not isinstance(laminar, dict) or cc.DIRECTIVES in laminar:
+        return False
+    model = cc._word(laminar.get("model")) or cc._word(laminar.get("laminarModel"))
+    return model in LINEAR_VISCOUS_LAMINAR
 
 
 def _scheme_names(text: str) -> str | None:
@@ -123,18 +155,20 @@ def _has_scheme(body: str, name: str) -> bool:
     return re.search(r"(?:^|[\s;{])" + re.escape(name) + r"\s", body) is not None
 
 
-def _schemes_problems(case_dir: Path, needs: _Needs, skipped: list[str]) -> list[str]:
+def _schemes_problems(
+    case_dir: Path, needs: _Needs, ddt: bool, viscous: bool, skipped: list[str]
+) -> list[str]:
     rel = "system/fvSchemes"
     schemes, exists = _load(case_dir, rel, skipped)
     if not exists:
         return [
             f"{rel} does not exist; write it with the scheme dictionaries gradSchemes, "
-            "divSchemes and laplacianSchemes" + (" and ddtSchemes" if needs.ddt_schemes else "")
+            "divSchemes and laplacianSchemes" + (" and ddtSchemes" if ddt else "")
         ]
     if schemes is None or cc.DIRECTIVES in schemes:
         return []
     required = ["gradSchemes", "divSchemes", "laplacianSchemes"]
-    if needs.ddt_schemes:
+    if ddt:
         required.insert(0, "ddtSchemes")
     problems = [
         f"{rel} has no `{name}` dictionary; add `{name} {{ default ...; }}`"
@@ -154,7 +188,7 @@ def _schemes_problems(case_dir: Path, needs: _Needs, skipped: list[str]) -> list
     body = _scheme_names(text)
     if body is None:
         return problems
-    wanted = [MOMENTUM_DIV] + ([VISCOUS_DIV] if needs.viscous_div else [])
+    wanted = [MOMENTUM_DIV] + ([VISCOUS_DIV] if viscous else [])
     for name in wanted:
         if not _has_scheme(body, name):
             problems.append(
@@ -166,19 +200,20 @@ def _schemes_problems(case_dir: Path, needs: _Needs, skipped: list[str]) -> list
 
 def _covers(keys: list[str], name: str) -> bool:
     """True if a key of the solvers dictionary names ``name``: the word itself or a quoted
-    regular expression that matches it (OpenFOAM's rule)."""
+    regular expression that matches it (OpenFOAM's rule). A pattern that is too complex to try
+    safely, or that Python cannot read, is taken to cover the name: nothing is reported."""
     for key in keys:
         if key == name:
             return True
         if key.startswith('"'):
             pattern = cc._unquote(key)
-            if len(pattern) > cc.MAX_REGEX_CHARS or cc._NESTED_QUANTIFIER.search(pattern):
-                return True  # too complex to try: do not report
+            if cc.pattern_too_complex(pattern):
+                return True
             try:
                 if re.fullmatch(pattern, name):
                     return True
             except re.error:
-                continue
+                return True  # OpenFOAM's regular expression dialect differs from Python's
     return False
 
 
@@ -195,6 +230,22 @@ def _pressure_needs_reference(case_dir: Path, skipped: list[str]) -> bool:
     return all(kind in FREE_LEVEL_TYPES for kind in kinds)
 
 
+def _momentum_solved(solution: Dictionary, algorithm: str) -> bool:
+    """False when ``momentumPredictor`` is off (the velocity equation is then not solved and has
+    no linear solver entry) or when the setting cannot be judged; True for the default."""
+    block = solution.get(algorithm)
+    if not isinstance(block, dict):
+        return True
+    if cc.DIRECTIVES in block:
+        return False
+    word = cc._word(block.get("momentumPredictor"))
+    if word is None:
+        return True
+    if cc._macro(word):
+        return False
+    return word.lower() not in cc._OFF
+
+
 def _solution_problems(case_dir: Path, needs: _Needs, skipped: list[str]) -> list[str]:
     rel = "system/fvSolution"
     solution, exists = _load(case_dir, rel, skipped)
@@ -206,15 +257,17 @@ def _solution_problems(case_dir: Path, needs: _Needs, skipped: list[str]) -> lis
     if solution is None or cc.DIRECTIVES in solution:
         return []
     problems = []
+    wanted = needs.solvers
+    if not _momentum_solved(solution, needs.algorithm):
+        wanted = tuple(name for name in wanted if not name.startswith("U"))
     solvers = solution.get("solvers")
     if not isinstance(solvers, dict):
         problems.append(
-            f"{rel} has no `solvers` dictionary; add an entry for each of "
-            f"{', '.join(needs.solvers)}"
+            f"{rel} has no `solvers` dictionary; add an entry for each of {', '.join(wanted)}"
         )
     elif cc.DIRECTIVES not in solvers:
         keys = [key for key in solvers if key != cc.DIRECTIVES]
-        missing = [name for name in needs.solvers if not _covers(keys, name)]
+        missing = [name for name in wanted if not _covers(keys, name)]
         if missing:
             problems.append(
                 f"{rel}: `solvers` has no entry for: {', '.join(missing)}. {_final_hint(missing)}"
@@ -260,8 +313,14 @@ def solver_problems(case_dir: Path, solver: str, skipped: list[str]) -> list[str
         return []
     case_dir = Path(case_dir)
     problems = _transport_problems(case_dir, needs, solver, skipped)
+    turbulence: Dictionary | None = None
+    ddt, viscous = needs.ddt_schemes, False
     if needs.transport_model:
-        problems += _turbulence_problems(case_dir, solver, skipped)
-    problems += _schemes_problems(case_dir, needs, skipped)
+        turbulence, exists = _load(case_dir, "constant/turbulenceProperties", skipped)
+        problems += _turbulence_problems(turbulence, exists, solver)
+        # a steady turbulent case reads ddtSchemes too (the turbulence equations have a time term)
+        ddt = ddt or _simulation_type(turbulence) in ("RAS", "LES")
+        viscous = needs.viscous_div and _linear_viscous(turbulence)
+    problems += _schemes_problems(case_dir, needs, ddt, viscous, skipped)
     problems += _solution_problems(case_dir, needs, skipped)
     return problems
