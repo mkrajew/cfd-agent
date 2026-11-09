@@ -195,6 +195,64 @@ def test_a_solver_outside_the_known_three_gets_no_completeness_demands(tmp_path)
     assert not any("fvSchemes" in e for e in errors)  # only the `application` mismatch remains
 
 
+# ------------------------------------------------------------------ relaxationFactors placement
+
+NESTED = (
+    "    relaxationFactors\n    {\n        fields { p 0.3; }\n        equations { U 0.7; }\n    }\n"
+)
+ALGORITHM = {"icoFoam": "PISO", "simpleFoam": "SIMPLE", "pimpleFoam": "PIMPLE"}
+
+
+def with_nested_relaxation(*, keep_top_level=False, extra=""):
+    """Put ``relaxationFactors`` inside the algorithm dictionary (and drop the top-level one)."""
+
+    def mutate(files):
+        text = files["system/fvSolution"]
+        if not keep_top_level and "\nrelaxationFactors" in text:
+            text = text[: text.index("\nrelaxationFactors") + 1]
+        text = text.replace("    pRefValue 0;\n}\n", f"    pRefValue 0;\n{NESTED}{extra}}}\n", 1)
+        assert NESTED in text
+        files["system/fvSolution"] = text
+
+    return mutate
+
+
+@pytest.mark.parametrize("solver", SOLVERS)
+def test_relaxation_factors_inside_the_algorithm_dictionary_are_reported(tmp_path, solver):
+    root = write_case(tmp_path, solver, with_nested_relaxation())
+    (message,) = errors_of(root, solver)
+    assert "system/fvSolution" in message and f"`{ALGORITHM[solver]}`" in message
+    assert "relaxationFactors" in message and "top-level" in message
+    assert "equations" in message and "ignores" in message  # the shape and why it matters
+
+
+def test_nested_relaxation_factors_are_harmless_when_a_top_level_dictionary_exists(tmp_path):
+    mutate = with_nested_relaxation(keep_top_level=True)
+    assert errors_of(write_case(tmp_path, "simpleFoam", mutate), "simpleFoam") == []
+
+
+def test_a_directive_in_the_algorithm_dictionary_silences_the_relaxation_check(tmp_path):
+    mutate = with_nested_relaxation(extra='    #include "more"\n')
+    assert errors_of(write_case(tmp_path, "simpleFoam", mutate), "simpleFoam") == []
+
+
+def test_a_top_level_directive_silences_the_relaxation_check(tmp_path):
+    def mutate(files):
+        with_nested_relaxation()(files)
+        files["system/fvSolution"] += '#include "relaxation"\n'
+
+    assert errors_of(write_case(tmp_path, "simpleFoam", mutate), "simpleFoam") == []
+
+
+def test_a_relaxation_factors_entry_outside_the_algorithm_dictionary_is_not_judged(tmp_path):
+    def mutate(files):  # only the algorithm dictionary of the solver is looked at
+        files["system/fvSolution"] = files["system/fvSolution"].replace(
+            "    U\n    {\n", "    U\n    {\n        relaxationFactors { x 1; }\n", 1
+        )
+
+    assert errors_of(write_case(tmp_path, "icoFoam", mutate), "icoFoam") == []
+
+
 # ------------------------------------------------------------------ the shape of a uniform value
 
 

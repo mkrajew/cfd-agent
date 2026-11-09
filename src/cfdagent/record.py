@@ -139,11 +139,19 @@ class AttemptRecord(BaseModel):
 
 
 class StageRecord(BaseModel):
+    """One stage: its gate runs (``attempts``) and its verdict.
+
+    ``free_restarts`` counts the times the stage's conversation was restarted because the model
+    answered with nothing but blank replies; such a restart is not a gate run and does not use
+    one of the stage's attempts, so ``attempts`` and their numbers are unchanged by it.
+    """
+
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     name: str
     attempts: list[AttemptRecord] = Field(default_factory=list)
     ok: bool
+    free_restarts: int = Field(default=0, ge=0)
 
 
 class RunRecord(BaseModel):
@@ -331,6 +339,14 @@ def write_summary(
         for stage in record.stages:
             result = "ok" if stage.ok else "failed"
             lines.append(f"| {_md(stage.name)} | {len(stage.attempts)} | {result} |")
+        for stage in record.stages:
+            if stage.free_restarts:
+                lines += [
+                    "",
+                    f"Stage {_md(stage.name)}: {stage.free_restarts} free restart(s) after "
+                    "attempts in which the model sent only blank replies (not counted as "
+                    "attempts).",
+                ]
     else:
         lines.append("No stage was completed.")
     lines += ["", "## Assessment", ""]

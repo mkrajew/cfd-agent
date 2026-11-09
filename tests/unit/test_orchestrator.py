@@ -49,9 +49,10 @@ TICKER = Ticker()  # shared, so that two runs of one test never get the same run
 class FakeStep(Step):
     """A pipeline step that records a stage and returns what it was told to."""
 
-    def __init__(self, name, *, ok=True, reason=None, action=None, reads=()):
+    def __init__(self, name, *, ok=True, reason=None, action=None, reads=(), free_restarts=0):
         self.name = name
         self.ok, self.reason, self.action, self.reads = ok, reason, action, list(reads)
+        self.free_restarts = free_restarts
         self.calls = 0
         self.task_text = None
 
@@ -61,7 +62,14 @@ class FakeStep(Step):
         if self.action is not None:
             self.action(ctx)
         attempt = AttemptRecord(n=1, ok=self.ok, errors=[], seconds=0.0)
-        ctx.record.stages.append(StageRecord(name=self.name, attempts=[attempt], ok=self.ok))
+        ctx.record.stages.append(
+            StageRecord(
+                name=self.name,
+                attempts=[attempt],
+                ok=self.ok,
+                free_restarts=self.free_restarts,
+            )
+        )
         return StageOutcome(ok=self.ok, attempts=1, errors=[], reason=self.reason)
 
     def knowledge_reads(self):
@@ -512,6 +520,15 @@ def test_run_log_has_stage_start_and_end_events(tmp_path):
     assert re.search(r"stage two: start", text) and re.search(r"stage two: failed", text)
     assert text.index("stage one: ok") < text.index("stage two: start")
     assert re.search(r"run: (completed|failed)", text)
+
+
+def test_free_restarts_of_a_stage_reach_the_log_the_record_and_the_summary(tmp_path):
+    result = go(tmp_path, FakeStep("one", free_restarts=2), FakeStep("two"))
+    assert "stage one: 2 free restart(s)" in log_text(result)
+    assert log_text(result).count("free restart") == 1  # a stage without restarts logs nothing
+    assert read_record(RunDir(result.run_dir)).stages[0].free_restarts == 2
+    summary = (result.run_dir / "summary.md").read_text(encoding="utf-8")
+    assert "2 free restart(s)" in summary
 
 
 def test_the_record_is_saved_after_every_step_even_without_progress_callbacks(tmp_path):

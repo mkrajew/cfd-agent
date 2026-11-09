@@ -279,17 +279,23 @@ def test_a_blank_reply_without_tool_calls_is_nudged_not_checked(tmp_path, blank)
     assert "checks were run for you" not in nudge["content"]
 
 
+def work(call_id: str = "w1") -> ChatResult:
+    """A reply with a harmless tool call: the attempt has then started real work."""
+    return reply(None, tc("calculator", call_id, expression="1+1"))
+
+
 def test_blank_replies_beyond_the_nudge_limit_fall_back_to_running_the_gate(tmp_path):
     n = loop.MAX_BLANK_NUDGES
-    steps = [reply(None) for _ in range(n + 1)] + [reply(None, check("k1"))]
+    steps = [work()] + [reply(None) for _ in range(n + 1)] + [reply(None, check("k1"))]
     ctx, backend = make_ctx(tmp_path, steps)
     stage = ToyStage([GateResult(False, ["nothing written"]), GateResult(True, [])])
     outcome = run_stage(stage, ctx)
     assert outcome.ok and outcome.attempts == 2
     # n nudges, then the next blank reply is treated as "done": the gate ran for the model
-    ran_for_model = backend.calls[n + 1].messages[-1]
+    ran_for_model = backend.calls[n + 2].messages[-1]
     assert "checks were run for you" in ran_for_model["content"]
     assert "nothing written" in ran_for_model["content"]
+    assert ctx.record.stages[0].free_restarts == 0  # the attempt had done work: no free restart
 
 
 def test_a_tool_call_resets_the_count_of_blank_replies(tmp_path):
@@ -308,7 +314,8 @@ def test_a_tool_call_resets_the_count_of_blank_replies(tmp_path):
 
 def test_the_count_of_blank_replies_starts_again_after_the_gate_ran_for_the_model(tmp_path):
     n = loop.MAX_BLANK_NUDGES
-    steps = [reply(None) for _ in range(n + 1)]  # n nudges, then the gate runs for the model
+    steps = [work()]
+    steps += [reply(None) for _ in range(n + 1)]  # n nudges, then the gate runs for the model
     steps += [reply(None) for _ in range(n)]  # nudged again in attempt 2
     steps += [reply(None, check("k1"))]
     ctx, backend = make_ctx(tmp_path, steps)
@@ -358,14 +365,93 @@ def test_blank_replies_between_tool_calls_never_extend_the_tool_turn_limit(tmp_p
 
 
 def test_a_model_that_only_replies_blank_still_ends_the_stage(tmp_path):
-    n = loop.MAX_BLANK_NUDGES
-    attempts = 3
-    steps = [reply(None) for _ in range(attempts * (n + 1) + 5)]
+    n, free, attempts = loop.MAX_BLANK_NUDGES, loop.MAX_FREE_RESTARTS, 3
+    expected = (n + 1) * (free + attempts)  # every free restart is one more full blank streak
+    steps = [reply(None) for _ in range(expected + 5)]
     ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_turns_per_attempt=1))
     stage = ToyStage([GateResult(False, [f"e{i}"]) for i in range(attempts)])
     outcome = run_stage(stage, ctx)
     assert not outcome.ok and outcome.attempts == attempts
-    assert len(backend.calls) == attempts * (n + 1)  # the nudge cap, not the turn limit, ends it
+    assert len(backend.calls) == expected  # the caps, not the turn limit, end it
+    assert ctx.record.stages[0].free_restarts == free
+
+
+def test_successive_blank_nudges_are_not_all_the_same_text(tmp_path):
+    n = loop.MAX_BLANK_NUDGES
+    steps = [work()] + [reply(None) for _ in range(n)] + [reply(None, check("k1"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    run_stage(ToyStage([GateResult(True, [])]), ctx)
+    nudges = [backend.calls[i].messages[-1]["content"] for i in range(2, n + 2)]
+    assert len(set(nudges)) > 1 and nudges[0] != nudges[-1]
+    for text in nudges:  # every nudge says what to do, whatever its wording
+        assert "no text and no tool call" in text and "check_stage" in text
+
+
+def test_an_attempt_of_only_blank_replies_is_restarted_without_using_an_attempt(tmp_path):
+    n = loop.MAX_BLANK_NUDGES
+    steps = [reply(None) for _ in range(n + 1)] + [work(), reply(None, check("k1"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    stage = ToyStage([GateResult(True, [])])
+    outcome = run_stage(stage, ctx)
+    assert outcome.ok and outcome.attempts == 1  # no attempt was used up by the blank streak
+    assert len(stage.gate_dirs) == 1 and [d.name for d in stage.gate_dirs] == ["toy-1"]
+    (stage_record,) = ctx.record.stages
+    assert stage_record.free_restarts == 1
+    assert [(a.n, a.ok) for a in stage_record.attempts] == [(1, True)]
+    # The restarted conversation is the original one: the blank replies and nudges are gone.
+    assert backend.calls[n + 1].messages == backend.calls[0].messages
+    assert {line["attempt"] for line in read_transcript(ctx)} == {1}
+
+
+def test_a_free_restart_in_a_later_attempt_keeps_the_history_of_the_earlier_one(tmp_path):
+    n = loop.MAX_BLANK_NUDGES
+    steps = [reply(None, check("k1"))]  # attempt 1 fails at once
+    steps += [reply(None) for _ in range(n + 1)]  # attempt 2 starts with a blank streak
+    steps += [reply(None, check("k2"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    stage = ToyStage([GateResult(False, ["first failure"]), GateResult(True, [])])
+    outcome = run_stage(stage, ctx)
+    assert outcome.ok and outcome.attempts == 2
+    assert backend.calls[n + 2].messages == backend.calls[1].messages
+    assert "first failure" in json.dumps(backend.calls[n + 2].messages)
+    assert ctx.record.stages[0].free_restarts == 1
+
+
+def test_free_restarts_are_a_budget_of_the_stage_not_of_each_attempt(tmp_path):
+    n, free = loop.MAX_BLANK_NUDGES, loop.MAX_FREE_RESTARTS
+    steps = [reply(None) for _ in range((n + 1) * (free + 1))]  # attempt 1 spends the whole budget
+    steps += [reply(None) for _ in range(n + 1)]  # attempt 2: no restart left, the gate runs
+    steps += [work(), reply(None, check("k1"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    stage = ToyStage([GateResult(False, ["a"]), GateResult(False, ["b"]), GateResult(True, [])])
+    outcome = run_stage(stage, ctx)
+    assert outcome.ok and outcome.attempts == 3
+    assert ctx.record.stages[0].free_restarts == free
+
+
+def test_blank_replies_do_not_get_round_the_wall_clock_limit(tmp_path):
+    clock = FakeClock()
+
+    class TickingBackend(ScriptedBackend):
+        def chat(self, messages, model, *, tools=None, response_schema=None):
+            clock.now += 40
+            return super().chat(messages, model, tools=tools, response_schema=response_schema)
+
+    ctx, _ = make_ctx(tmp_path, [], limits=RunLimits(wall_clock_s=100), clock=clock, sleeps=[])
+    backend = TickingBackend([reply(None) for _ in range(50)])
+    ctx.backend = backend
+    outcome = run_stage(ToyStage([GateResult(False, ["x"])] * 3), ctx)
+    assert not outcome.ok and "wall-clock" in outcome.reason
+    assert len(backend.calls) == 3  # the restarts do not extend the deadline
+
+
+def test_blank_replies_do_not_get_round_the_cost_limit(tmp_path):
+    big = Usage(1_000_000, 100_000, None)  # about 0.21 USD per call
+    steps = [reply(None, usage=big) for _ in range(50)]
+    ctx, backend = make_ctx(tmp_path, steps, cost_limit=0.5)
+    outcome = run_stage(ToyStage([GateResult(False, ["x"])] * 3), ctx)
+    assert not outcome.ok and "cost limit" in outcome.reason
+    assert len(backend.calls) == 3
 
 
 def test_turn_counter_restarts_with_each_attempt(tmp_path):

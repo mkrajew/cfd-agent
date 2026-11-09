@@ -572,6 +572,12 @@ class _Session:
             self.write_status("running", name)
             outcome = step.run(self.ctx, self.task_text)
             self.save_record()
+            for stage_record in self.ctx.record.stages:
+                if stage_record.name == name and stage_record.free_restarts:
+                    self.log(
+                        f"stage {name}: {stage_record.free_restarts} free restart(s) after "
+                        "attempts of blank model replies (not counted as attempts)"
+                    )
             if self.monitor is not None and self.monitor.exceeded:
                 self.log(f"stage {name}: stopped, the run directory grew beyond its cap")
                 return self.fail(name, f"run directory exceeded {_format_bytes(self.cap)}")

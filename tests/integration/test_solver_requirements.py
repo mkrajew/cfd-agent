@@ -94,3 +94,47 @@ def test_solvers_run_without_velocity_solvers_when_the_momentum_predictor_is_off
     assert build(tmp_path, solver, row[1], row[2]), "the edit changed nothing"
     assert solver_runs(tmp_path, solver)
     assert check_case_consistency(tmp_path, solver).ok
+
+
+END_OF_SIMPLE = "    pRefValue 0;\n}\n"
+
+
+def residual_lines(root: Path) -> list[str]:
+    """The linear-solver lines of the first run of simpleFoam (they carry the residuals)."""
+    done = subprocess.run(["simpleFoam", "-case", str(root)], capture_output=True, text=True)
+    assert done.returncode == 0, done.stdout[-500:]
+    return [line for line in done.stdout.splitlines() if "Initial residual" in line]
+
+
+def test_relaxation_factors_inside_the_algorithm_dictionary_are_accepted_but_ignored(tmp_path):
+    """OpenFOAM does not refuse the case and does not use the nested factors (the run is the same
+    as without them), while the same factors at the top level change the run. The check reports
+    the placement because the solver then runs with other relaxation than the case asked for."""
+    top = "relaxationFactors\n{\n    fields { p 0.1; }\n    equations { U 0.1; }\n}\n"
+    nested = (
+        "    relaxationFactors\n    {\n        fields { p 0.1; }\n"
+        "        equations { U 0.1; }\n    }\n"
+    )
+
+    def case(name, edit):
+        root = tmp_path / name
+        root.mkdir()
+        build(root, "simpleFoam", "system/fvSolution", edit)
+        return root
+
+    def without_top_level(text):
+        return text[: text.index("relaxationFactors")]
+
+    def with_nested(text):
+        return text.replace(END_OF_SIMPLE, END_OF_SIMPLE[:-2] + nested + "}\n", 1)
+
+    base = case("base", lambda text: text)
+    ignored = case("ignored", lambda text: with_nested(text))
+    strong = case("strong", lambda text: without_top_level(text) + top)
+    reference = residual_lines(base)
+    assert reference and residual_lines(ignored) == reference  # the nested factors change nothing
+    assert residual_lines(strong) != reference  # the same factors at the top level do
+    assert check_case_consistency(base, "simpleFoam").ok
+    misplaced = case("misplaced", lambda text: with_nested(without_top_level(text)))
+    reported = check_case_consistency(misplaced, "simpleFoam").errors
+    assert len(reported) == 1 and "relaxationFactors" in reported[0]
