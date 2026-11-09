@@ -666,6 +666,7 @@ def test_the_knowledge_ops_without_a_tutorial_directory_are_an_internal_failure(
 
 
 def _boundary_case(run, kind="empty"):
+    from solver_cases import complete_case
     from test_mesh_stage import boundary_text
 
     run.write_text("case/constant/polyMesh/boundary", boundary_text({"side": (kind, 4)}))
@@ -676,6 +677,8 @@ def _boundary_case(run, kind="empty"):
     )
     field = "boundaryField { side { type %s; } }\n"
     run.write_text("case/0/p", field % kind)
+    for rel in ("system/fvSchemes", "system/fvSolution", "constant/transportProperties"):
+        run.write_text(f"case/{rel}", complete_case("icoFoam")[rel])  # what icoFoam reads
 
 
 def test_check_case_consistency_op_reports_problems_as_a_gate_failure(run):
@@ -689,8 +692,10 @@ def test_check_case_consistency_op_reports_problems_as_a_gate_failure(run):
         run, "check_case_consistency", {"case_dir": "case", "solver": "pimpleFoam"}
     )
     assert answer.ok is False and answer.internal is False
-    assert len(answer.data["errors"]) == 2  # the constraint type and the application
-    assert "0/p" in answer.error and "pimpleFoam" in answer.error
+    errors = answer.data["errors"]
+    assert any("0/p" in e and "empty" in e for e in errors)  # the constraint type
+    assert any("application" in e and "pimpleFoam" in e for e in errors)
+    assert any("turbulenceProperties" in e for e in errors)  # pimpleFoam reads more than icoFoam
 
 
 def test_check_case_consistency_op_refuses_other_solvers_and_bad_directories(run):

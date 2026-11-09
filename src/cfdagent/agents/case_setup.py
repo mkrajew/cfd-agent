@@ -18,7 +18,8 @@ The gate runs, in this order, and stops at the first step that makes the later o
 2. op ``check_dictionaries``: every dictionary of ``0/``, ``constant/`` and ``system/`` parses;
 3. op ``check_case_consistency``: every patch of the mesh has an entry in every field file,
    constraint patch types match, ``application`` is the plan's solver and ``endTime`` is above
-   ``startTime``; all problems are reported together;
+   ``startTime``, every file and entry the solver reads exists, and uniform values have the shape
+   of their field; all problems are reported together;
 4. op ``trial_run``: ``TRIAL_STEPS`` time steps of the plan's solver in a scratch copy.
 
 The solver is the CaseSpec's ``solver.suggested_solver``; one outside the solvers that the

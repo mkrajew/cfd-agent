@@ -10,7 +10,10 @@ OpenFOAM:
   ``symmetryPlane`` or ``symmetry`` needs a field entry of that same type, and a field entry of
   such a type needs a mesh patch of that type (OpenFOAM refuses an inconsistent pair);
 * ``system/controlDict`` has an ``application`` equal to the solver that will run, and an
-  ``endTime`` above ``startTime``.
+  ``endTime`` above ``startTime``;
+* the files and entries the solver reads exist (``case_requirements``: transport and turbulence
+  properties, scheme dictionaries, linear solvers, pressure reference), all missing ones at once;
+* a uniform value has the shape of its field (a vector in a vector field, a number in a scalar one).
 
 All problems are collected and returned together. The parser is a small, tolerant reader of the
 OpenFOAM dictionary syntax, not a replacement for ``foamDictionary``: ``check_dictionaries``
@@ -42,6 +45,20 @@ DIRECTIVES = "#"  # key under which a dictionary records the ``#...`` directives
 _TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|//[^\n]*|/\*.*?\*/|[{};()]|[^\s{};()"]+', re.DOTALL)
 _PUNCTUATION = frozenset("{};()")
 _NESTED_QUANTIFIER = re.compile(r"[)\]][*+{]")  # a repeated group: a regex that can blow up
+_QUANTIFIER = re.compile(r"[*+?{]")
+MAX_QUANTIFIERS = 2  # chained quantifiers (``.*.*.*``) take polynomial time on a long name
+
+
+def pattern_too_complex(pattern: str) -> bool:
+    """True for a regular expression not safe to try on a name: long, a repeated group, or many
+    quantifiers. The caller then treats the pattern as matching (reports nothing)."""
+    return (
+        len(pattern) > MAX_REGEX_CHARS
+        or "[:" in pattern  # a POSIX class: OpenFOAM's dialect, not Python's
+        or _NESTED_QUANTIFIER.search(pattern) is not None
+        or len(_QUANTIFIER.findall(pattern)) > MAX_QUANTIFIERS
+    )
+
 
 Dictionary = dict[str, Any]  # values: ``list[str]`` (the tokens of an entry) or a sub-dictionary
 
@@ -63,7 +80,13 @@ def _parse_block(tokens: list[str], i: int, depth: int, top: bool) -> tuple[Dict
             return out, i + 1
         if token == "{":
             key = statement[-1] if statement else ""
-            out[key], i = _parse_block(tokens, i + 1, depth + 1, top=False)
+            block, i = _parse_block(tokens, i + 1, depth + 1, top=False)
+            if key.startswith("#") or key == ")":
+                # ``nu #eval{...}``, ``div(phi,k) {...}``: not a plain ``name { ... }`` block, so
+                # the entry cannot be read here. Record it as a directive: nothing is judged.
+                out.setdefault(DIRECTIVES, []).append(key)
+            else:
+                out[key] = block
             statement = []
             continue
         if token == ";":
@@ -177,7 +200,7 @@ def _find_entry(
         if not key.startswith('"'):
             continue
         pattern = _unquote(key)
-        if len(pattern) > MAX_REGEX_CHARS or _NESTED_QUANTIFIER.search(pattern):
+        if pattern_too_complex(pattern):
             too_complex = True
             continue
         try:
@@ -186,6 +209,40 @@ def _find_entry(
         except re.error:
             continue
     return None, None, too_complex
+
+
+def _shape_problems(name: str, parsed: Dictionary, boundary_field: Dictionary) -> list[str]:
+    """A uniform value of the wrong shape: a number in a vector field or a vector in a scalar
+    field (``internalField`` and the ``value`` of each patch). OpenFOAM stops with a parse error
+    that does not say which entry is wrong."""
+    header = parsed.get("FoamFile")
+    kind = _word(header.get("class")) if isinstance(header, dict) else None
+    if kind not in ("volVectorField", "volScalarField"):
+        return []
+    vector = kind == "volVectorField"
+    places = [("internalField", parsed.get("internalField"))]
+    places += [
+        (f"`value` of patch `{patch}`", entry.get("value"))
+        for patch, entry in boundary_field.items()
+        if isinstance(entry, dict)
+    ]
+    problems = []
+    for where, tokens in places:
+        if not isinstance(tokens, list) or len(tokens) < 2 or tokens[0] != "uniform":
+            continue
+        if _macro(tokens[1]):
+            continue
+        if vector and tokens[1] != "(":
+            problems.append(
+                f"0/{name}: {where} is `uniform {tokens[1]}` but {name} is a vector field; write "
+                "`uniform (x y z)`"
+            )
+        elif not vector and tokens[1] == "(":
+            problems.append(
+                f"0/{name}: {where} is a vector but {name} is a scalar field; write "
+                "`uniform <number>`"
+            )
+    return problems
 
 
 def _field_problems(
@@ -390,6 +447,9 @@ def check_case_consistency(case_dir: Path, solver: str) -> GateResult:
         problems += _field_files(case_dir, patches, fields, skipped)
     control_problems, settings = _control_problems(case_dir, solver, skipped)
     problems += control_problems
+    from cfdagent.tools import case_requirements  # imported here: it imports this module
+
+    problems += case_requirements.solver_problems(case_dir, solver, skipped)
     data = {
         "patches": {name: kind for name, (kind, _groups_) in patches.items()},
         "fields": fields,
@@ -430,6 +490,7 @@ def _field_files(
             continue  # a point field has its own patch rules; the volume rules do not apply
         fields.append(entry.name)
         problems += _field_problems(entry.name, boundary_field, patches)
+        problems += _shape_problems(entry.name, parsed, boundary_field)
     if not fields and not skipped:
         problems.append(
             "0/ holds no field file with a boundaryField; write the fields the solver needs"

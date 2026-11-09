@@ -184,8 +184,9 @@ def test_an_include_in_the_boundary_field_means_the_entries_are_not_judged_missi
 def test_solver_must_match_the_application_of_the_control_dict(tmp_path):
     case = make_case(tmp_path)
     errors = errors_of(case, solver="pimpleFoam")
-    assert len(errors) == 1
-    assert "application" in errors[0] and "icoFoam" in errors[0] and "pimpleFoam" in errors[0]
+    mismatch = [e for e in errors if "application" in e]  # the other solver also reads more files
+    assert len(mismatch) == 1
+    assert "icoFoam" in mismatch[0] and "pimpleFoam" in mismatch[0]
     edit(case, "system/controlDict", "application     icoFoam;\n", "")
     errors = errors_of(case)
     assert len(errors) == 1 and "application" in errors[0]
