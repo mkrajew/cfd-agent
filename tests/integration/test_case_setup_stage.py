@@ -118,12 +118,14 @@ def test_case_setup_rejects_missing_controldict(tmp_path):
 def test_trial_run_failure_reaches_the_agent(tmp_path):
     ctx = pipeline(tmp_path)
 
-    def drop_convection_scheme(text):
-        broken = text.replace("    div(phi,U)      Gauss linear;\n", "")
+    def unknown_convection_scheme(text):
+        # complete as far as the static check can tell; only the solver finds the bad name
+        old = "    div(phi,U)      Gauss linear;"
+        broken = text.replace(old, "    div(phi,U)      Gauss nosuchscheme;")
         assert broken != text
         return broken
 
-    broken = {"system/fvSchemes": drop_convection_scheme}
+    broken = {"system/fvSchemes": unknown_convection_scheme}
     backend = ScriptedBackend(
         [
             write_case_step(1, broken),
@@ -137,10 +139,10 @@ def test_trial_run_failure_reaches_the_agent(tmp_path):
     assert outcome.ok and outcome.attempts == 2
     errors = "\n".join(ctx.record.stages[2].attempts[0].errors)
     assert "trial run" in errors and "fatal error" in errors.lower()
-    assert "div(phi,U)" in errors and "not found" in errors
+    assert "nosuchscheme" in errors
     # The model saw it, in the result of its first check, together with the fresh attempt.
     feedback = tool_results(backend)["k1"]
-    assert "fatal error" in feedback.lower() and "div(phi,U)" in feedback
+    assert "fatal error" in feedback.lower() and "nosuchscheme" in feedback
     assert "attempt 2" in feedback
 
 
