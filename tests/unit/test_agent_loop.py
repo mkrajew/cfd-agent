@@ -336,6 +336,38 @@ def test_loop_stops_at_turn_limit(tmp_path):
     assert stage.gate_dirs == []
 
 
+def test_nudged_blank_replies_do_not_use_up_the_turn_limit(tmp_path):
+    # Without the refund the two blank replies would take 2 of the 3 turns and the check would
+    # never be reached.
+    steps = [reply(None), reply(None)]
+    steps += [reply(None, tc("calculator", f"c{i}", expression="1+1")) for i in range(2)]
+    steps += [reply(None, check("k1"))]
+    ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_turns_per_attempt=3))
+    outcome = run_stage(ToyStage([GateResult(True, [])]), ctx)
+    assert outcome.ok and len(backend.calls) == 5
+
+
+def test_blank_replies_between_tool_calls_never_extend_the_tool_turn_limit(tmp_path):
+    steps = []
+    for i in range(6):
+        steps += [reply(None), reply(None, tc("calculator", f"c{i}", expression="1+1"))]
+    ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_turns_per_attempt=3))
+    outcome = run_stage(ToyStage([]), ctx)
+    assert not outcome.ok and "max_turns_per_attempt" in outcome.reason
+    assert len(backend.calls) == 6  # three tool turns, each preceded by a nudged blank reply
+
+
+def test_a_model_that_only_replies_blank_still_ends_the_stage(tmp_path):
+    n = loop.MAX_BLANK_NUDGES
+    attempts = 3
+    steps = [reply(None) for _ in range(attempts * (n + 1) + 5)]
+    ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_turns_per_attempt=1))
+    stage = ToyStage([GateResult(False, [f"e{i}"]) for i in range(attempts)])
+    outcome = run_stage(stage, ctx)
+    assert not outcome.ok and outcome.attempts == attempts
+    assert len(backend.calls) == attempts * (n + 1)  # the nudge cap, not the turn limit, ends it
+
+
 def test_turn_counter_restarts_with_each_attempt(tmp_path):
     steps = [
         reply(None, tc("calculator", "c1", expression="1")),

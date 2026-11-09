@@ -439,6 +439,33 @@ def test_trial_run_failure_reaches_the_agent_in_a_unit_run(tmp_path):
     assert setup.calls()[-1] == "trial_run"
 
 
+def test_a_trial_failure_names_the_file_the_solver_output_points_to(tmp_path):
+    tail = "x" * 6000  # the file line is far from the end of the output the model sees
+    trial = OpResponse(
+        ok=False,
+        data={
+            "tail": tail,
+            "fatal_error": "Unknown patchField type movingWall for patch type wall",
+            "fatal_file": "/tmp/cfdagent-trial-ab12/case/0/phi/boundaryField/movingWall at line 9",
+            "completed": False,
+        },
+        error="FOAM fatal error: Unknown patchField type movingWall for patch type wall",
+    )
+    text = "\n".join(Setup(tmp_path, trial=trial).gate().errors)
+    assert "0/phi/boundaryField/movingWall at line 9" in text
+    assert "cfdagent-trial" not in text  # the scratch directory is not the agent's business
+
+
+def test_a_trial_failure_without_a_file_has_no_file_line(tmp_path):
+    trial = OpResponse(
+        ok=False,
+        data={"tail": "", "fatal_error": "boom", "fatal_file": None},
+        error="FOAM fatal error: boom",
+    )
+    text = "\n".join(Setup(tmp_path, trial=trial).gate().errors)
+    assert "boom" in text and "located the error" not in text
+
+
 def test_a_trial_run_failure_without_output_still_says_what_failed(tmp_path):
     trial = OpResponse(ok=False, data={"tail": ""}, error="trial run impossible: no startTime")
     result = Setup(tmp_path, trial=trial).gate()
@@ -894,6 +921,84 @@ def test_point_fields_are_not_judged_with_the_volume_field_rules(tmp_path):
     result = check_case_consistency(case, "icoFoam")
     assert result.ok, result.errors
     assert "pointDisplacement" not in result.data["fields"]
+
+
+SURFACE_BAD = (
+    "internalField uniform 0;\nboundaryField\n{\n"
+    "    movingWall { type movingWall; value uniform 0; }\n"
+    "    fixedWalls { type zeroGradient; }\n"
+    "    frontAndBack { type empty; }\n}\n"
+)
+SURFACE_OK = (
+    "internalField uniform 0;\nboundaryField\n{\n"
+    "    movingWall { type calculated; value uniform 0; }\n"
+    "    fixedWalls { type calculated; value uniform 0; }\n"
+    "    frontAndBack { type empty; }\n}\n"
+)
+
+
+def test_a_surface_field_with_volume_patch_types_is_reported_as_a_flux_the_solver_creates(
+    tmp_path,
+):
+    case = make_case(tmp_path)
+    write_field(case, "0/phi", SURFACE_BAD, kind="surfaceScalarField")
+    (message,) = errors_of(case)
+    assert "0/phi" in message and "surfaceScalarField" in message
+    assert "movingWall" in message and "zeroGradient" in message  # the types it cannot have
+    assert "created by the solver" in message
+    assert "calculated" in message  # what a surface field may use if the file must stay
+
+
+def test_the_advice_for_a_flux_file_keeps_the_type_of_constraint_patches(tmp_path):
+    case = make_case(tmp_path)
+    write_field(case, "0/phi", SURFACE_BAD, kind="surfaceScalarField")
+    (message,) = errors_of(case)
+    # `calculated` on a wedge or symmetry patch is refused by OpenFOAM: the advice must say so.
+    assert "except the constraint patches" in message
+    for kind in ("empty", "wedge", "symmetryPlane"):
+        assert kind in message
+
+
+def test_a_surface_field_with_only_surface_patch_types_is_valid_and_not_reported(tmp_path):
+    case = make_case(tmp_path)
+    write_field(case, "0/phi", SURFACE_OK, kind="surfaceScalarField")
+    result = check_case_consistency(case, "icoFoam")
+    assert result.ok, result.errors
+
+
+@pytest.mark.parametrize("kind", ["surfaceVectorField", "surfaceScalarField"])
+def test_every_surface_class_is_judged_and_a_volume_field_with_the_same_types_is_not(
+    tmp_path, kind
+):
+    case = make_case(tmp_path)
+    write_field(case, "0/flux", SURFACE_BAD, kind=kind)
+    assert any("0/flux" in e and "surface field" in e for e in errors_of(case))
+    write_field(case, "0/flux", SURFACE_BAD, kind="volScalarField")
+    assert errors_of(case) == []
+
+
+def test_a_surface_field_is_judged_by_the_types_also_in_wildcard_entries(tmp_path):
+    case = make_case(tmp_path)
+    body = 'internalField uniform 0;\nboundaryField\n{\n    ".*" { type fixedGradient; }\n}\n'
+    write_field(case, "0/phi", body, kind="surfaceScalarField")
+    assert any("fixedGradient" in e for e in errors_of(case))
+
+
+def test_a_surface_field_with_a_macro_type_is_not_judged(tmp_path):
+    case = make_case(tmp_path)
+    body = (
+        "internalField uniform 0;\nboundaryField\n{\n"
+        "    movingWall { type $kind; }\n    fixedWalls { type $kind; }\n"
+        "    frontAndBack { type empty; }\n}\n"
+    )
+    write_field(case, "0/phi", body, kind="surfaceScalarField")
+    assert errors_of(case) == []
+
+
+def test_a_surface_field_with_bad_types_gets_one_message_not_one_per_patch(tmp_path):
+    case = make_case(tmp_path)
+    write_field(case, "0/phi", SURFACE_BAD, kind="surfaceScalarField")
+    assert len(errors_of(case)) == 1  # not "no entry" noise on top of the real cause
 
 
 CONTROL_BASE = "endTime         40;"

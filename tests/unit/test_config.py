@@ -40,7 +40,7 @@ def test_default_config_models_and_limits():
     assert limits.wall_clock_s == 7200
     assert limits.max_cost_usd == 1.0
     assert limits.max_ranks == 4
-    assert limits.max_turns_per_attempt == 30
+    assert limits.max_turns_per_attempt == 40
     assert limits.max_cells == 2_000_000
     assert limits.max_runtime_minutes == 90
     assert limits.max_memory_gb == 12

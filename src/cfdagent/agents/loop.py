@@ -75,6 +75,7 @@ CHECK_TOOL = "check_stage"
 # A reply with no text and no tool call is not a "done": some models end a turn like that in the
 # middle of their work. It is answered with a nudge, at most this many times in a row; the next
 # blank reply is read as "done" and the checks are run, as for any reply without a tool call.
+# A nudged blank reply does not count against ``max_turns_per_attempt`` (it is still billed).
 MAX_BLANK_NUDGES = 2
 CUT_OFF_ADVICE = (
     "Reason briefly, then call tools with SMALLER arguments: split the work into several "
@@ -434,6 +435,9 @@ class _StageRun(ModelConversation):
                 self.blank_replies = 0
             elif self.blank_replies < MAX_BLANK_NUDGES:
                 self.blank_replies += 1
+                # A nudged blank reply is not work the model did: it is refunded, so the turn
+                # budget measures real steps. The nudge cap above still ends a stuck model.
+                self.turns -= 1
                 self.messages.append({"role": "user", "content": self._blank_reply_nudge()})
                 continue
             if not result.tool_calls:

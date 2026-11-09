@@ -13,6 +13,7 @@ import pytest
 from foam_cases import build_case, needs_4_threads
 
 from cfdagent.errors import AgentInputError
+from cfdagent.tools.case_check import SURFACE_PATCH_TYPES, check_case_consistency
 from cfdagent.tools.foam import SolverRun, parse_solver_log, run_solver, trial_run
 from cfdagent.tools.process import run_tool
 
@@ -147,6 +148,52 @@ def test_trial_run_reports_fatal_error(tmp_path):
     assert "noSlipp" in result.summary.fatal_error
     assert "noSlipp" in result.tool.tail
     assert _snapshot(case) == before
+
+
+def _write_phi(case: Path, wall_type: str) -> None:
+    (case / "0" / "phi").write_text(
+        "FoamFile\n{\n    version 2.0;\n    format ascii;\n    class surfaceScalarField;\n"
+        "    object phi;\n}\n"
+        "dimensions [0 3 -1 0 0 0 0];\ninternalField uniform 0;\nboundaryField\n{\n"
+        f"    movingWall {{ type {wall_type}; value uniform 0; }}\n"
+        f"    fixedWalls {{ type {wall_type}; value uniform 0; }}\n"
+        "    frontAndBack { type empty; }\n}\n",
+        encoding="utf-8",
+    )
+
+
+def test_a_flux_file_with_volume_patch_types_is_caught_before_the_solver_and_named_by_it(tmp_path):
+    case = build_case(tmp_path)
+    _write_phi(case, "zeroGradient")
+    # The static check names the file and what to do ...
+    checked = check_case_consistency(case, "icoFoam")
+    assert not checked.ok
+    assert any("0/phi" in e and "created by the solver" in e for e in checked.errors)
+    # ... and, if it were missed, the real solver's error carries the file too.
+    result = trial_run(case, "icoFoam", steps=3, timeout_s=120)
+    assert not result.ok
+    assert "Unknown patchField type" in (result.summary.fatal_error or "")
+    assert result.summary.fatal_file is not None and "0/phi" in result.summary.fatal_file
+
+
+def test_a_flux_file_with_surface_patch_types_is_valid_for_the_check_and_the_solver(tmp_path):
+    case = build_case(tmp_path)
+    _write_phi(case, "calculated")
+    checked = check_case_consistency(case, "icoFoam")
+    assert checked.ok, checked.errors
+    result = trial_run(case, "icoFoam", steps=3, timeout_s=120)
+    assert result.ok, result.tool.tail
+
+
+def test_every_surface_patch_type_the_check_accepts_is_known_to_the_solver(tmp_path):
+    """The accepted list is OpenFOAM's own list of ``fvsPatchField`` types: nothing the check
+    lets through may be reported by OpenFOAM as unknown, and the solver lists nothing else."""
+    case = build_case(tmp_path)
+    _write_phi(case, "noSuchPatchFieldType")
+    result = trial_run(case, "icoFoam", steps=3, timeout_s=120)
+    assert "Valid patchField types" in result.tool.tail
+    after = result.tool.tail.split("Valid patchField types")[1]
+    assert set(re.findall(r"^([A-Za-z]\w*)$", after, re.M)) == SURFACE_PATCH_TYPES
 
 
 def test_trial_run_without_control_dict_is_the_agents_fault(tmp_path):

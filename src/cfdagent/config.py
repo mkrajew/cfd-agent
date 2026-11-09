@@ -37,7 +37,7 @@ class RunLimits(BaseModel):
     wall_clock_s: float = 7200
     max_cost_usd: float = 1.0
     max_ranks: int = Field(default=MAX_RANKS_LIMIT, ge=1, le=MAX_RANKS_LIMIT)
-    max_turns_per_attempt: int = Field(default=30, ge=1, le=1000)
+    max_turns_per_attempt: int = Field(default=40, ge=1, le=1000)
     max_cells: int = Field(default=2_000_000, ge=1)
     max_runtime_minutes: float = 90
     max_memory_gb: float = 12
