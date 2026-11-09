@@ -37,6 +37,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 
@@ -220,6 +221,9 @@ def _clip(text: str, limit: int = HEADLINE_CHARS) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+_SCRATCH_PREFIX = re.compile(r"^.*?/cfdagent-trial-[^/]+/case/")
+
+
 def _trial_failure(response: OpResponse, solver: str) -> str:
     """The message for a trial run that failed: the headline, what OpenFOAM reported and the end
     of the solver output, where the cause is."""
@@ -230,6 +234,12 @@ def _trial_failure(response: OpResponse, solver: str) -> str:
     fatal = data.get("fatal_error")
     if isinstance(fatal, str) and fatal.strip() and fatal not in headline:
         message += f"\nOpenFOAM reported: {_clip(fatal.strip())}"
+    located = data.get("fatal_file")
+    if isinstance(located, str) and located.strip():
+        # The error text does not say which file is wrong; the scratch directory is not the
+        # agent's, so the path starts at the case.
+        located = _SCRATCH_PREFIX.sub("", located.strip())
+        message += f"\nOpenFOAM located the error in: {_clip(located)}"
     tail = data.get("tail")
     if not isinstance(tail, str) or not tail.strip():
         tail = rest

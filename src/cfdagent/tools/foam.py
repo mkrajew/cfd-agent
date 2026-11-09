@@ -70,6 +70,11 @@ NON_SOLVERS: frozenset[str] = frozenset(
 )
 
 _FATAL_RE = re.compile(r"^\s*(?:\[\d+\]\s*)?-->\s*FOAM FATAL (?:IO )?ERROR\b(.*)$")
+# "file: 0/U/boundaryField/wall at line 31." (or ".../0/U.boundaryField.wall from line 20 to 22."):
+# OpenFOAM's location of an IO error, which the message of the error does not contain.
+_FATAL_FILE_RE = re.compile(r"^file:\s*(\S.*)$")
+_EXITING_RE = re.compile(r"^FOAM (?:parallel run )?exiting\b")
+MAX_FATAL_FILE_CHARS = 300
 _VERSION_TAG_RE = re.compile(r"\(\s*openfoam-[^)]*\)", re.IGNORECASE)
 _RANK_PREFIX_RE = re.compile(r"^\s*\[\d+\]\s?")
 _FROM_RE = re.compile(r"^\s*From\b")
@@ -99,7 +104,8 @@ class SolverLogSummary:
     ``completed``: the final ``End`` line is present and there is no fatal error and no divergence.
     ``diverged``: a NaN/Inf residual, continuity error or Courant number, a residual or Courant
     number above ``DIVERGENCE_LIMIT``, or a floating point exception. ``fatal_error``: the message
-    after ``--> FOAM FATAL (IO) ERROR`` (first one).
+    after ``--> FOAM FATAL (IO) ERROR`` (first one). ``fatal_file``: where OpenFOAM located that
+    error (the text after ``file:``, e.g. ``0/U/boundaryField/wall at line 31``), else None.
     ``end_time``: the last ``Time = ...`` value. ``final_residuals``: per field component the
     ``Final residual`` of the last solve of that field in the log, so when a field is solved
     several times per step (PISO/PIMPLE correctors) the last solve of the last step wins; a
@@ -130,6 +136,7 @@ class SolverLogSummary:
     first_initial_residuals: dict[str, float] = field(default_factory=dict)
     max_linear_iterations: int | None = None
     bounding_count: int = 0
+    fatal_file: str | None = None
 
     @property
     def failure_reason(self) -> str | None:
@@ -268,9 +275,26 @@ class _LogScanner:
         self.max_courant: float | None = None
         self._fatal: list[str] | None = None  # message lines of the first fatal error
         self._collecting = False
+        self._awaiting_file = False  # the first fatal error has started; its file is not seen yet
+        self.fatal_file: str | None = None
+
+    def _feed_fatal_file(self, line: str) -> None:
+        """Find the ``file: ...`` line OpenFOAM prints after the message of an IO error. It comes
+        after the message (and, for a bad patch type, after the list of valid types), so it is
+        looked for until the process says it exits or another fatal error starts."""
+        text = _RANK_PREFIX_RE.sub("", line).strip()
+        if _FATAL_RE.match(line) or _EXITING_RE.match(text):
+            self._awaiting_file = False
+            return
+        m = _FATAL_FILE_RE.match(text)
+        if m is not None:
+            self.fatal_file = m.group(1).rstrip(". ")[:MAX_FATAL_FILE_CHARS] or None
+            self._awaiting_file = False
 
     def feed(self, line: str) -> None:
         line = line.rstrip("\r\n")
+        if self._awaiting_file:
+            self._feed_fatal_file(line)
         self._feed_fatal(line)
         if _SIGFPE_RE.search(line):
             self.diverged = True
@@ -338,6 +362,7 @@ class _LogScanner:
         if m is None:
             return
         self._collecting = True
+        self._awaiting_file = True
         first = _VERSION_TAG_RE.sub("", m.group(1)).lstrip(" :").strip()
         self._fatal = [first] if first else []
 
@@ -350,6 +375,7 @@ class _LogScanner:
             completed=completed,
             diverged=self.diverged,
             fatal_error=fatal_error,
+            fatal_file=self.fatal_file,
             end_time=self.end_time,
             final_residuals=dict(self.final_residuals),
             max_courant=self.max_courant,

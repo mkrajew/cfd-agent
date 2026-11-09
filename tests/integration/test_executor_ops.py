@@ -65,6 +65,15 @@ def test_trial_run_and_serial_solve_through_the_executor(job):
     assert solved.data["solver_log"] == "case/log.icoFoam"
 
 
+def test_trial_run_failure_carries_the_file_the_solver_names(job):
+    client, run_dir = job
+    u_file = run_dir.root / "case" / "0" / "U"
+    u_file.write_text(u_file.read_text().replace("noSlip", "noSlipp"), encoding="utf-8")
+    trial = client.call("trial_run", {"case_dir": "case", "solver": "icoFoam"}, timeout_s=300)
+    assert trial.ok is False and trial.internal is False
+    assert "0/U" in trial.data["fatal_file"]
+
+
 def test_solver_failure_is_a_gate_style_failure_not_an_internal_error(job):
     client, run_dir = job
     (run_dir.root / "case" / "system" / "fvSolution").unlink()

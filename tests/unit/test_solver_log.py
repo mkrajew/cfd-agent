@@ -90,6 +90,39 @@ def test_parse_solver_log_fatal_error():
     assert "noSlipp" in summary.failure_reason
 
 
+def test_parse_solver_log_names_the_file_of_a_fatal_io_error():
+    summary = parse_solver_log(_read("icoFoam_fatal.log"))
+    assert summary.fatal_file == "0/U/boundaryField/fixedWalls at line 31"
+
+
+def test_the_file_of_a_fatal_error_is_read_across_the_message_and_the_rank_prefix():
+    log = (
+        "[1] --> FOAM FATAL IO ERROR: (openfoam-2512)\n"
+        "[1] Unknown patchField type x for patch type wall\n"
+        "[1] \n"
+        "[1] file: /case/0/phi.boundaryField.inlet from line 20 to line 22.\n"
+        "[1] \n"
+        "[1]     From static Foam::tmp<Foam::fvsPatchField<Type> > f()\n"
+        "[1] FOAM parallel run exiting\n"
+    )
+    expected = "/case/0/phi.boundaryField.inlet from line 20 to line 22"
+    assert parse_solver_log(log).fatal_file == expected
+
+
+def test_a_file_line_before_the_fatal_error_or_after_the_first_one_is_not_its_file():
+    before = "file: 0/p/boundaryField/a at line 3.\n--> FOAM FATAL ERROR:\nboom\n\nFOAM exiting\n"
+    assert parse_solver_log(before).fatal_file is None
+    after = (
+        "--> FOAM FATAL IO ERROR:\nboom\n\nfile: 0/U at line 3.\n\n"
+        "--> FOAM FATAL IO ERROR:\nlater\n\nfile: 0/p at line 9.\n"
+    )
+    assert parse_solver_log(after).fatal_file == "0/U at line 3"
+
+
+def test_a_fatal_error_without_a_file_line_has_no_fatal_file():
+    assert parse_solver_log("--> FOAM FATAL ERROR:\nboom\n\nFOAM exiting\n").fatal_file is None
+
+
 def test_parse_solver_log_fatal_error_plain_variant():
     log = (
         "Time = 3\n\n"

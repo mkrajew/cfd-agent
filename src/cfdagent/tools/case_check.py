@@ -40,6 +40,28 @@ MAX_FIELD_FILES = 100
 MAX_NESTING = 50
 MAX_REGEX_CHARS = 100
 CONSTRAINT_TYPES = frozenset({"empty", "wedge", "symmetryPlane", "symmetry"})
+# The patch field types a surface (face) field accepts: the list OpenFOAM ESI prints for
+# ``fvsPatchField`` (the pinned version in the Dockerfile; checked by an integration test). A case
+# that loads further types through ``libs`` is not supported by this list.
+SURFACE_PATCH_TYPES = frozenset(
+    {
+        "calculated",
+        "cyclic",
+        "cyclicACMI",
+        "cyclicAMI",
+        "cyclicSlip",
+        "empty",
+        "fixedValue",
+        "nonuniformTransformCyclic",
+        "processor",
+        "processorCyclic",
+        "sliced",
+        "symmetry",
+        "symmetryPlane",
+        "wedge",
+        "zeroValue",
+    }
+)
 DIRECTIVES = "#"  # key under which a dictionary records the ``#...`` directives it contains
 
 _TOKEN = re.compile(r'"(?:[^"\\]|\\.)*"|//[^\n]*|/\*.*?\*/|[{};()]|[^\s{};()"]+', re.DOTALL)
@@ -243,6 +265,39 @@ def _shape_problems(name: str, parsed: Dictionary, boundary_field: Dictionary) -
                 "`uniform <number>`"
             )
     return problems
+
+
+def _surface_problem(name: str, kind: str, boundary_field: Dictionary) -> str | None:
+    """A surface field (a face flux such as ``phi``) whose patches have a type that only volume
+    fields have, or ``None``.
+
+    The solver creates its fluxes from the velocity, so such a file is never needed, and with a
+    volume-field type (``zeroGradient``, a wall velocity type, ...) OpenFOAM stops with
+    ``Unknown patchField type X for patch type wall`` without saying which file is wrong. A surface
+    field that uses only surface patch types is valid (the solver reads it as the initial flux),
+    so it is not reported. A type that is a macro or is missing cannot be judged.
+    """
+    bad = [
+        (patch, found)
+        for patch, patch_entry in boundary_field.items()
+        if isinstance(patch_entry, dict)
+        for found in [_entry_type(patch_entry)]
+        if found is not None and not _macro(found) and found not in SURFACE_PATCH_TYPES
+    ]
+    if not bad:
+        return None
+    shown = ", ".join(f"`{patch}`: {found}" for patch, found in bad[:4])
+    more = f" (and {len(bad) - 4} more)" if len(bad) > 4 else ""
+    return (
+        f"0/{name} is a surface field (class {kind}), but patch types of volume fields are used "
+        f"in it ({shown}{more}); OpenFOAM stops with `Unknown patchField type` for it. A flux "
+        f"such as {name} is created by the solver, so 0/{name} should not be written at all: "
+        "leave it out. You cannot delete a file: if it already exists in the attempt you are "
+        "working in, rewrite it with `type calculated; value uniform 0;` on every patch except "
+        "the constraint patches (empty, wedge, symmetry, symmetryPlane, cyclic), which keep their "
+        "own type, for example `type empty;` (the flux then starts at zero). A fresh attempt "
+        "starts without it: do not write it again"
+    )
 
 
 def _field_problems(
@@ -486,8 +541,14 @@ def _field_files(
         if not isinstance(boundary_field, dict):
             continue  # not a field file (or not readable: already in ``skipped``)
         header = parsed.get("FoamFile") if parsed is not None else None
-        if isinstance(header, dict) and (_word(header.get("class")) or "").startswith("point"):
+        kind = (_word(header.get("class")) if isinstance(header, dict) else None) or ""
+        if kind.startswith("point"):
             continue  # a point field has its own patch rules; the volume rules do not apply
+        if kind.startswith("surface"):
+            surface = _surface_problem(entry.name, kind, boundary_field)
+            if surface:
+                problems.append(surface)
+                continue  # the file is to go; its missing entries are not the point
         fields.append(entry.name)
         problems += _field_problems(entry.name, boundary_field, patches)
         problems += _shape_problems(entry.name, parsed, boundary_field)

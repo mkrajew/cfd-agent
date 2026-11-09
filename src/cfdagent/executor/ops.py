@@ -203,6 +203,7 @@ def _solver_data(jail: RunDir, run: foam_tools.SolverRun, *, logs: bool) -> dict
         "completed": summary.completed,
         "diverged": summary.diverged,
         "fatal_error": summary.fatal_error,
+        "fatal_file": summary.fatal_file,
         "end_time": summary.end_time,
         "first_time": summary.first_time,
         "last_step": summary.last_step,
