@@ -1,0 +1,208 @@
+{
+  "id": "chatcmpl-fixture-dropped",
+  "object": "chat.completion",
+  "created": 1790000002,
+  "model": "fixture-deployment",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": null,
+        "reasoning_content": "We need to inspect the directory."
+      },
+      "logprobs": {
+        "content": [
+          {
+            "token": "<|channel|>",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "analysis",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "<|message|>",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "We",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": " need",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": " to",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": " inspect",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": " the",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": " directory",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": ".",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "<|end|>",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "<|start|>",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "assistant",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "<|channel|>",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "comment",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "ary",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": " to",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "=",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "functions",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": ".list",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "_dir",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": " code",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "<|message|>",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "{\"",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "path",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "\":",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": " \"",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "case",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "\"}",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          },
+          {
+            "token": "<|call|>",
+            "logprob": -0.1,
+            "bytes": null,
+            "top_logprobs": []
+          }
+        ],
+        "refusal": null
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 4613,
+    "completion_tokens": 30,
+    "total_tokens": 4643
+  }
+}

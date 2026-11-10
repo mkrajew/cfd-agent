@@ -3,6 +3,7 @@
 import json
 import os
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -768,6 +769,18 @@ def test_transcript_has_one_line_per_call(tmp_path):
     assert [m["role"] for m in lines[2]["new_messages"]] == ["tool"]
     assert [m["role"] for m in lines[3]["new_messages"]] == ["user"]
     assert lines[2]["new_messages"][0]["tool_call_id"] == "c1"
+
+
+def test_transcript_marks_a_reply_whose_tool_calls_were_recovered(tmp_path):
+    steps = [
+        replace(reply("", tc("calculator", "call_recovered_1", expression="1+1")), recovered=True),
+        reply(None, check(), usage=None),
+    ]
+    ctx, _ = make_ctx(tmp_path, steps, sleeps=[])
+    assert run_stage(ToyStage([GateResult(True, [])]), ctx).ok
+    first, second = read_transcript(ctx)
+    assert first["reply"]["recovered"] is True
+    assert "recovered" not in second["reply"]
 
 
 def test_transcript_attempt_number_follows_the_gate_attempts(tmp_path):

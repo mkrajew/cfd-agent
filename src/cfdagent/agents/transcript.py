@@ -118,6 +118,8 @@ class TranscriptWriter:
                 ],
                 "finish_reason": result.finish_reason,
             }
+            if result.recovered:  # the service dropped the calls; they were read from the tokens
+                reply["recovered"] = True
         entry = {
             "stage": stage,
             "agent": agent,
