@@ -156,8 +156,8 @@ def test_linear_sampling_reaches_the_lid_and_the_floor(solved):
     line = case.sample_line("U", (0.525, 0.0), (0.525, 1.0), n_points=41, method="linear")
     assert line.inside.all()  # both end points lie on the boundary of the mesh
     # next to the lid the interpolation approaches the lid speed (the patch value is in the fit)
-    assert line.value[-1, 0] == pytest.approx(1.0, abs=0.15)
-    assert line.value[0, 0] == pytest.approx(0.0, abs=0.05)  # no-slip floor
+    assert line.value[-1, 0] == pytest.approx(1.0)  # on the lid: the patch value itself
+    assert line.value[0, 0] == pytest.approx(0.0)  # no-slip floor
     # no overshoot beyond the range of the cell values and the lid speed
     assert line.value[:, 0].max() <= 1.0 + 1e-9
     assert line.value[:, 0].min() >= u[:, 0].min() - 0.05

@@ -1,11 +1,12 @@
 """Reading the results of an ASCII OpenFOAM case (``cfdagent.tools.foam_results``), no OpenFOAM."""
 
+import re
 import shutil
 from pathlib import Path
 
 import numpy as np
 import pytest
-from foam_fixtures import write_box_case, write_field
+from foam_fixtures import write_box_case, write_field, write_polymesh
 
 from cfdagent.errors import AgentInputError
 from cfdagent.tools.foam_results import (
@@ -439,17 +440,19 @@ def test_read_solver_log_without_a_solver_log_lists_what_there_is(tmp_path):
         read_solver_log(tmp_path / "log.missing")
 
 
-def test_read_solver_log_of_a_case_takes_the_newest_solver_log(tmp_path):
+def test_read_solver_log_of_a_case_takes_the_longest_run_then_the_newest(tmp_path):
     import os
 
-    old, new = tmp_path / "log.icoFoam", tmp_path / "log.simpleFoam"
-    shutil.copy(LOGS / "icoFoam_ok.log", old)
-    shutil.copy(LOGS / "simpleFoam_converged.log", new)
-    os.utime(old, (1_000_000, 1_000_000))
-    os.utime(new, (2_000_000, 2_000_000))
-    assert read_solver_log(tmp_path).solver == "simpleFoam"
-    os.utime(old, (3_000_000, 3_000_000))
-    assert read_solver_log(tmp_path).solver == "icoFoam"
+    short, long = tmp_path / "log.icoFoam", tmp_path / "log.simpleFoam"
+    shutil.copy(LOGS / "icoFoam_ok.log", short)  # 7 time steps
+    shutil.copy(LOGS / "simpleFoam_converged.log", long)  # 47 time steps
+    os.utime(short, (3_000_000, 3_000_000))
+    os.utime(long, (1_000_000, 1_000_000))
+    assert read_solver_log(tmp_path).solver == "simpleFoam"  # more steps beats a newer file
+    twin = tmp_path / "log.simpleFoam.again"
+    shutil.copy(LOGS / "simpleFoam_converged.log", twin)
+    os.utime(twin, (2_000_000, 2_000_000))
+    assert read_solver_log(tmp_path).path.name == "log.simpleFoam.again"  # equal: the newest
 
 
 @pytest.mark.parametrize("name", ["../p", "../../outside/p", "sub/p", "..\\p", ".hidden", ""])
@@ -460,3 +463,138 @@ def test_a_field_name_cannot_leave_the_time_directory(box, name):
         case.read_field(name, time=1)
     with pytest.raises(FoamResultsError, match="not a field name"):
         case.read_patch_field(name, "left", time=1)
+
+
+def test_a_point_on_a_boundary_face_gets_the_patch_value(box):
+    case = load_case(box)
+    write_field(
+        box,
+        "1",
+        "p",
+        np.arange(12.0),
+        {
+            "left": ("fixedValue", np.array([7.0, 8.0, 9.0])),
+            "right": ("zeroGradient", None),
+            "bottom": ("zeroGradient", None),
+            "top": ("zeroGradient", None),
+            "frontAndBack": ("empty", None),
+        },
+    )
+    for method in ("linear", "nearest"):
+        line = case.sample_line("p", (0.0, 0.5), (2.0, 0.5), n_points=3, method=method)
+        assert line.value[0] == 8.0  # the middle face of the left patch, not a fit
+        assert line.value[2] == 7.0  # right: zeroGradient, the value of cell 7
+        assert line.inside.all()
+
+
+def test_phi_is_zero_on_symmetry_patches_and_unparsable_values_count_as_absent(tmp_path):
+    root = write_box_case(tmp_path, shape=(2, 1, 1), size=(2, 1, 1))
+    case = load_case(root)
+    write_field(
+        root,
+        "1",
+        "phi",
+        np.array([0.25]),
+        {
+            "left": ("symmetry", None),
+            "right": ("calculated", np.array([0.25])),
+            "bottom": ("wedge", None),
+            "top": ("symmetryPlane", None),
+            "frontAndBack": ("empty", None),
+        },
+        cls="surfaceScalarField",
+    )
+    for patch in ("left", "bottom", "top"):
+        assert (
+            case.read_patch_field("phi", patch, time=1).tolist()
+            == [0.0] * case.patches[patch].n_faces
+        )
+    path = write_field(
+        root,
+        "2",
+        "p",
+        np.arange(2.0),
+        {"left": ("fixedValue", np.array([3.0])), "right": ("zeroGradient", None)},
+    )
+    text = re.sub(
+        r"(left\s*\{[^}]*value\s+)[^;]*;", r"\1$internalField;", path.read_text(), count=1
+    )
+    path.write_text(text, encoding="utf-8")
+    assert "$internalField" in path.read_text(encoding="utf-8")
+    assert case.read_field("p", time=2).tolist() == [0.0, 1.0]
+    with pytest.raises(FoamResultsError, match="writes no value"):
+        case.read_patch_field("p", "left", time=2)
+    assert case.read_patch_field("p", "right", time=2).tolist() == [1.0]
+
+
+def test_cell_geometry_of_a_tetrahedron_and_a_triangular_prism(tmp_path):
+    tet = tmp_path / "tet" / "case"
+    write_polymesh(
+        tet,
+        [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)],
+        [[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]],
+        [0, 0, 0, 0],
+        [],
+        [("all", "patch", 4, 0)],
+        1,
+    )
+    case = load_case(tet)
+    assert case.cell_volumes == pytest.approx(np.array([1 / 6]))
+    assert case.cell_centres == pytest.approx(np.array([[0.25, 0.25, 0.25]]))
+    assert case.patches["all"].face_areas.sum(axis=0) == pytest.approx(np.zeros(3), abs=1e-12)
+
+    prism = tmp_path / "prism" / "case"
+    write_polymesh(
+        prism,
+        [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 2), (1, 0, 2), (0, 1, 2)],
+        [[0, 2, 1], [3, 4, 5], [0, 1, 4, 3], [0, 3, 5, 2], [1, 2, 5, 4]],
+        [0] * 5,
+        [],
+        [("all", "patch", 5, 0)],
+        1,
+    )
+    case = load_case(prism)
+    assert case.cell_volumes == pytest.approx(np.array([1.0]))
+    assert case.cell_centres == pytest.approx(np.array([[1 / 3, 1 / 3, 1.0]]))
+
+
+def test_symlinked_mesh_files_are_not_followed(box, tmp_path):
+    other = write_box_case(tmp_path / "other")
+    points = box / "constant" / "polyMesh" / "points"
+    points.unlink()
+    try:
+        points.symlink_to(other / "constant" / "polyMesh" / "points")
+    except OSError:
+        pytest.skip("symbolic links are not available")
+    with pytest.raises(FoamResultsError, match="symbolic link"):
+        _ = load_case(box).n_cells
+
+
+def test_a_corrupt_gz_field_is_a_clear_error(box):
+    (box / "1").mkdir()
+    (box / "1" / "p.gz").write_bytes(b"this is not gzip data")
+    with pytest.raises(FoamResultsError, match="cannot be read"):
+        load_case(box).read_field("p", time=1)
+
+
+def test_a_gz_field_with_a_damaged_stream_is_a_clear_error(box):
+    import gzip
+
+    (box / "1").mkdir()
+    data = bytearray(gzip.compress(b"0123456789" * 200))
+    data[len(data) // 2] ^= 0xFF
+    (box / "1" / "p.gz").write_bytes(bytes(data))
+    with pytest.raises(FoamResultsError, match="cannot be read"):
+        load_case(box).read_field("p", time=1)
+
+
+def test_a_point_just_off_a_boundary_is_not_snapped_to_the_patch_value(box):
+    case = load_case(box)
+    boundary = {"left": ("fixedValue", np.array([700.0, 800.0, 900.0]))}
+    boundary.update({n: ("zeroGradient", None) for n in ("right", "bottom", "top")})
+    boundary["frontAndBack"] = ("empty", None)
+    write_field(box, "1", "p", np.arange(12.0), boundary)
+    near = case.sample_line("p", (1e-4, 0.5), (1.0, 0.5), n_points=2, method="nearest")
+    assert near.value[0] == 4.0  # the cell value, not 800
+    on = case.sample_line("p", (0.0, 0.5), (1.0, 0.5), n_points=2, method="nearest")
+    assert on.value[0] == 800.0

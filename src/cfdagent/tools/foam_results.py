@@ -33,6 +33,7 @@ import gzip
 import math
 import os
 import re
+import zlib
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -79,6 +80,7 @@ _LIST_END_RE = re.compile(r"\)\s*;")
 _EXEC_RE = re.compile(r"^Exec\s*:\s*(\S+)", re.MULTILINE)
 _STEP_RE = re.compile(r"^Time = ", re.MULTILINE)
 _METHODS = ("linear", "nearest")
+_NO_FLUX_TYPES = ("symmetry", "symmetryPlane", "wedge")
 _CACHE_SIZE = 8
 _TOLERANCE = 1e-9  # relative to the size of the mesh: "on the boundary" counts as inside
 
@@ -257,7 +259,10 @@ def _parse_field_text(raw: bytes, name: str, time_name: str, source: Path) -> _F
             value_match = _VALUE_RE.search(content)
             value = None
             if value_match is not None:
-                value = _parse_value(content, value_match.end(), ncomp, f"{what} patch {patch}")
+                try:
+                    value = _parse_value(content, value_match.end(), ncomp, f"{what} patch {patch}")
+                except FoamResultsError:
+                    value = None  # e.g. "value $internalField;": no usable value, see the fallbacks
             boundary[patch] = _Block(kind.group(1) if kind else None, value)
     return _Field(
         cls, ncomp, internal_value, boundary, known.group(1) if known else "", time_name, name
@@ -331,6 +336,11 @@ class _Geometry:
 
 
 def _build_geometry(case_dir: Path) -> _Geometry:
+    for name in ("points", "faces", "owner", "neighbour", "boundary"):
+        if (case_dir / "constant" / "polyMesh" / name).is_symlink():
+            raise FoamResultsError(
+                f"constant/polyMesh/{name} is a symbolic link; links are not followed"
+            )
     try:
         points = polymesh.read_points(case_dir)
         faces = polymesh.read_faces(case_dir)
@@ -560,7 +570,7 @@ class FoamCase:
                 if candidate.suffix == ".gz"
                 else candidate.read_bytes()
             )
-        except (OSError, EOFError) as exc:
+        except (OSError, EOFError, zlib.error) as exc:
             raise FoamResultsError(f"{candidate} cannot be read: {exc}") from exc
         parsed = _parse_field_text(raw, name, dirname, candidate)
         self._cache[key] = parsed
@@ -601,7 +611,10 @@ class FoamCase:
         Shape ``(n_faces,)`` / ``(n_faces, 3)``, in the order of ``case.patches[patch]``'s
         ``face_centres``. Uses the ``value`` entry of the patch. A ``zeroGradient`` patch (it
         writes no value) gives the value of the adjacent cell, ``noSlip`` zero. Any other patch
-        type without a ``value`` entry, and ``empty`` patches (no values), raise an error.
+        type without a ``value`` entry, and ``empty`` patches (no values), raise an error; the
+        exception is a surface field such as ``phi`` on a ``symmetry``, ``symmetryPlane`` or
+        ``wedge`` patch: zero. A ``value`` that is not a literal list (``$internalField``) counts
+        as absent.
         """
         patches = self.patches
         if patch not in patches:
@@ -623,6 +636,8 @@ class FoamCase:
             raise FoamResultsError(
                 f"the file of field {loaded.name!r} has no entry for patch {patch.name!r}"
             )
+        if block.value is None and loaded.location == "surface" and kind in _NO_FLUX_TYPES:
+            return np.zeros((patch.n_faces, 1))  # nothing flows through a symmetry-type patch
         if block.value is not None:
             values = block.value
             if values.ndim == 1:
@@ -642,7 +657,8 @@ class FoamCase:
         raise FoamResultsError(
             f"patch {patch.name!r} of field {loaded.name!r} is of type {kind!r}, which writes no "
             "value; take the value of the adjacent cells instead: read_field(name)"
-            f"[case.patches[{patch.name!r}].owner_cells]"
+            f"[case.patches[{patch.name!r}].owner_cells] (for a vector that keeps a normal "
+            "component, which a symmetry or slip boundary does not have)"
         )
 
     # ------------------------------------------------------------------ mesh
@@ -764,6 +780,43 @@ class FoamCase:
             out[i] = values[c] + (x - g.cell_centres[c]) @ gradient
         return out
 
+    def _apply_boundary_values(
+        self,
+        loaded: _Field,
+        cells: np.ndarray,
+        points: np.ndarray,
+        inside: np.ndarray,
+        result: np.ndarray,
+    ) -> None:
+        """A point on a boundary face gets the patch value of that face (when the patch has one)."""
+        g = self._geometry
+        low, high = g.bounds
+        tol = _TOLERANCE * max(float(np.linalg.norm(high - low)), 1e-300)
+        patches = list(g.patches.values())
+        cache: dict[str, np.ndarray | None] = {}
+        for i in np.nonzero(inside)[0]:
+            c = cells[i]
+            for f in g.cell_faces[g.cell_face_start[c] : g.cell_face_start[c + 1]]:
+                if f < g.n_internal:
+                    continue
+                area = g.face_areas[f]
+                if abs(float((points[i] - g.face_centres[f]) @ area)) > tol * np.linalg.norm(area):
+                    continue
+                patch = next(
+                    (p for p in patches if p.start_face <= f < p.start_face + p.n_faces), None
+                )
+                if patch is None:
+                    continue
+                if patch.name not in cache:
+                    try:
+                        cache[patch.name] = self._patch_values(loaded, patch)
+                    except FoamResultsError:
+                        cache[patch.name] = None
+                wall = cache[patch.name]
+                if wall is not None:
+                    result[i] = wall[f - patch.start_face]
+                    break
+
     def sample_line(
         self,
         name: str,
@@ -779,7 +832,11 @@ class FoamCase:
         of the thickness. ``method="linear"`` (default) evaluates the cell value plus a
         least-squares gradient times the offset from the cell centre (exact for linear fields;
         the gradient uses the neighbouring cells and the patch values); ``"nearest"`` returns the
-        value of the cell that contains the point. A point on a boundary face counts as inside.
+        value of the cell that contains the point. Both are piecewise: the linear result jumps
+        across cell faces (each cell has its own gradient) and is not bounded by the cell values.
+        A point on a boundary face counts as inside and gets the patch value of that face (its
+        ``value`` entry, a ``zeroGradient`` patch's adjacent cell) when the patch has one. Cells
+        next to a patch without values (``empty``, symmetry types) have a one-sided stencil there.
         Points outside the mesh get NaN (see ``LineSample.drop_outside``); an end point on a
         boundary that the mesh only approximates may fall outside: take such a value from
         ``read_patch_field`` instead. Raises if no point is inside the mesh.
@@ -815,6 +872,7 @@ class FoamCase:
         else:
             boundary = self._boundary_values(loaded, flat.shape[1])
             result[inside] = self._reconstruct(cells[inside], points[inside], flat, boundary)
+        self._apply_boundary_values(loaded, cells, points, inside, result)
         shaped = result.reshape((len(points),) + values.shape[1:])
         return LineSample(fractions * length, points, shaped, inside, cells)
 
@@ -850,7 +908,8 @@ def _summarise_log(path: Path) -> SolverLog:
 
 def read_solver_log(path: Path | str) -> SolverLog:
     """Summarise a solver log: a log file, or a case directory (its newest ``log.*`` file with
-    linear-solver output; logs of utilities such as ``postProcess`` have none).
+    linear-solver output and, of those, the one with most time steps; logs of
+    utilities such as ``postProcess`` have no linear-solver output).
 
     Raises ``FoamResultsError`` for a missing file or a directory without a solver log.
     """
@@ -866,10 +925,9 @@ def read_solver_log(path: Path | str) -> SolverLog:
         key=lambda entry: entry.stat().st_mtime_ns,
         reverse=True,
     )
-    for entry in logs:
-        log = _summarise_log(entry)
-        if log.initial_residuals:
-            return log
+    solver_logs = [log for log in map(_summarise_log, logs) if log.initial_residuals]
+    if solver_logs:  # the run with most time steps; of equal ones the newest (the sort is stable)
+        return max(solver_logs, key=lambda log: log.n_time_steps)
     found = ", ".join(entry.name for entry in logs) or "no log.* file"
     raise FoamResultsError(
         f"no solver log (a log.* file with 'Solving for' lines) in {target}; found: {found}"

@@ -30,11 +30,11 @@ Read the solved case with this tested module. **Do not write your own parser of 
 
 - `case = load_case("case")`: opens the case directory (the one with `constant/` and `system/`). `list_times("case")` and `latest_time("case")` need no mesh.
 - `case.times` (numeric root time directories, ascending), `case.latest_time`, `case.list_fields(time=None)`.
-- `case.read_field("U")`, `case.read_field("p", time=0.5)`: the internal field of the latest (or the given) time as a new numpy array: `(n_cells,)` for a scalar, `(n_cells, 3)` for a vector, `(n_cells, 6)` for a symmetric tensor. `case.read_field("phi")` gives the flux on the internal faces.
+- `case.read_field("U")`, `case.read_field("p", time=0.5)`: the internal field of the latest (or the given) time as a new numpy array: `(n_cells,)` for a scalar, `(n_cells, 3)` for a vector, `(n_cells, 6)` for a symmetric tensor (xx xy xz yy yz zz; a full tensor has 9 columns: xx xy xz yx yy yz zx zy zz). `case.read_field("phi")` gives the flux on the internal faces.
 - `case.cell_centres` `(n_cells, 3)` and `case.cell_volumes` `(n_cells,)`, in the order of the field values (a 2D case: the volume is area times thickness); `case.n_cells`; `case.bounds` = (lowest, highest) corner of the mesh; `case.is_2d`.
 - `case.patches`: dict name -> `Patch` with `.type` (`wall`, `patch`, `empty`, ...), `.n_faces`, `.face_centres` `(n, 3)`, `.face_areas` `(n, 3)` (area vectors pointing out of the domain; use them for forces and fluxes) and `.owner_cells` (the cell next to each face).
 - `case.read_patch_field("U", "<patch>")`: the field values on the faces of a patch, in the order of `.face_centres`. Works for `phi` too (flux through each face). A `zeroGradient` patch gives the adjacent cell's value; an `empty` patch has no values and raises.
-- `case.sample_line("U", start, end, n_points=101, time=None, method="linear")`: values at equally spaced points from `start` to `end`, each `(x, y, z)` (`(x, y)` is enough for a 2D case). It returns a `LineSample` with `.s` (distance from `start`, ascending), `.points`, `.value`, `.inside` and `.cell`. `"linear"` is the cell value plus a least-squares gradient times the offset from the cell centre (it reproduces linear fields exactly); `"nearest"` is the value of the containing cell. A point outside the mesh has NaN and `.inside` False: `.drop_outside()` removes those points. A point on a boundary face counts as inside, but an end point of the ideal geometry that the mesh does not reach is dropped: add the boundary value from `read_patch_field`, as described under the quantity rules.
+- `case.sample_line("U", start, end, n_points=101, time=None, method="linear")`: values at equally spaced points from `start` to `end`, each `(x, y, z)` (`(x, y)` is enough for a 2D case with `empty` patches and takes the middle of its thickness; a wedge case needs three coordinates). It returns a `LineSample` with `.s` (distance from `start`, ascending), `.points`, `.value`, `.inside` and `.cell`. `"linear"` is the cell value plus a least-squares gradient times the offset from the cell centre (it reproduces linear fields exactly in the interior, but it is piecewise: the result jumps across cell faces and is not bounded by the cell values); `"nearest"` is the value of the containing cell. A point outside the mesh has NaN and `.inside` False: `.drop_outside()` removes those points. A point that lies on a boundary face counts as inside and gets the patch value of that face (when the patch has one), so a profile that starts and ends on boundaries contains the boundary values. An end point of the ideal geometry that the mesh does not reach is dropped: add the boundary value from `read_patch_field`, as described under the quantity rules.
 - `read_solver_log("case")` (or the path of a log file): a `SolverLog` of the newest solver log in the case with `.solver`, `.n_time_steps` (the iterations of a steady run), `.last_time`, `.completed`, `.converged_at` (set only when a `residualControl` stopped a steady run), `.first_initial_residuals`, `.initial_residuals` and `.final_residuals` (per field, vectors as `Ux`, `Uy`, `Uz`); `.to_dict()` prints well.
 
 A complete `post.py` skeleton. Upper-case names stand for values you take from the plan; add a loop over the requested outputs:
@@ -52,15 +52,26 @@ print("times:", case.times, "fields:", case.list_fields())
 
 # a profile along a line (FIELD, START, END, L_REF and U_REF come from the plan)
 line = case.sample_line(FIELD, START, END, n_points=200).drop_outside()
-profile = {"x": line.s / L_REF, "value": line.value[:, 0] / U_REF}  # line.s ascends
+# line.s is the distance from START, not a coordinate: use line.points[:, axis] when the plan's
+# profile coordinate is a position (then sort by it). A vector field has line.value[:, component];
+# a scalar field has line.value.
+profile = {"x": line.s / L_REF, "value": line.value[:, 0] / U_REF}
 
-# change of the profile between the last two write times (needs at least two of them)
-t_prev, t_last = case.times[-2:]
-before = case.sample_line(FIELD, START, END, n_points=200, time=t_prev).drop_outside()
-change = np.abs(line.value[:, 0] - before.value[:, 0]).max() / np.abs(line.value[:, 0]).max()
-print(f"change between t={t_prev:g} and t={t_last:g}: {change:.3e}")
+# change of the profile between the last two write times after the initial one (time 0 is the
+# initial condition, not an earlier iterate); skip it when there are fewer than two
+written = [t for t in case.times if t > 0]
+change = None
+if len(written) >= 2:
+    t_prev, t_last = written[-2:]
+    before = case.sample_line(FIELD, START, END, n_points=200, time=t_prev).drop_outside()
+    scale = max(np.abs(line.value[:, 0]).max(), 1e-300)
+    change = np.abs(line.value[:, 0] - before.value[:, 0]).max() / scale
+    print(f"change between t={t_prev:g} and t={t_last:g}: {change:.3e}")
+else:
+    print("steadiness cannot be judged from the write times:", case.times)
 
-# net volume flux through the boundaries (zero for an incompressible flow)
+# net flux through the boundaries (zero for a steady flow without sources: a volume flux for
+# an incompressible solver, a mass flux for a compressible one)
 flux = {n: case.read_patch_field("phi", n).sum() for n, p in case.patches.items() if p.type != "empty"}
 print("flux per patch:", flux, "net:", sum(flux.values()))
 

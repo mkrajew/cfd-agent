@@ -129,20 +129,35 @@ def write_box_case(
     faces = [v for _, _, v in internal]
     owner = [o for o, _, _ in internal]
     neighbour = [n for _, n, _ in internal]
-    patch_lines: list[str] = []
+    patches: list[tuple[str, str, int, int]] = []
     for name, items in boundary.items():
         kind = "empty" if name == front_back and nz == 1 else "patch"
-        patch_lines.append(
-            f"    {name}\n    {{\n        type {kind};\n"
-            f"        nFaces {len(items)};\n        startFace {len(faces)};\n    }}\n"
-        )
+        patches.append((name, kind, len(items), len(faces)))
         for cell, vertices in items:
             owner.append(cell)
             faces.append(vertices)
+    write_polymesh(case, coords, faces, owner, neighbour, patches, nx * ny * nz)
+    return case
 
+
+def write_polymesh(
+    case: Path,
+    coords,
+    faces: list,
+    owner: list,
+    neighbour: list,
+    patches: list[tuple[str, str, int, int]],
+    n_cells: int,
+) -> None:
+    """Write ``case/constant/polyMesh``; ``patches`` are ``(name, type, n_faces, start_face)``."""
     poly = case / "constant" / "polyMesh"
     loc = "constant/polyMesh"
-    note = f'    note        "nPoints:{len(coords)}  nCells:{nx * ny * nz}";\n'
+    note = f'    note        "nPoints:{len(coords)}  nCells:{n_cells}";\n'
+    patch_lines = [
+        f"    {name}\n    {{\n        type {kind};\n"
+        f"        nFaces {n};\n        startFace {start};\n    }}\n"
+        for name, kind, n, start in patches
+    ]
 
     def head(cls, obj, with_note=False):
         return HEADER.format(
@@ -167,9 +182,8 @@ def write_box_case(
     _write(
         poly / "boundary",
         head("polyBoundaryMesh", "boundary"),
-        f"{len(boundary)}\n(\n" + "".join(patch_lines) + ")\n",
+        f"{len(patches)}\n(\n" + "".join(patch_lines) + ")\n",
     )
-    return case
 
 
 def _value_text(values: np.ndarray, kind: str = "nonuniform") -> str:
