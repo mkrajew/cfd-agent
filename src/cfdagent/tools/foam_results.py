@@ -907,8 +907,8 @@ def _summarise_log(path: Path) -> SolverLog:
 
 
 def read_solver_log(path: Path | str) -> SolverLog:
-    """Summarise a solver log: a log file, or a case directory (its newest ``log.*`` file with
-    linear-solver output and, of those, the one with most time steps; logs of
+    """Summarise a solver log: a log file, or a case directory (then the ``log.*`` file with the
+    most time steps among those with linear-solver output, the newest of equal ones; logs of
     utilities such as ``postProcess`` have no linear-solver output).
 
     Raises ``FoamResultsError`` for a missing file or a directory without a solver log.
