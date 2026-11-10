@@ -45,6 +45,7 @@ _LIST_END_RE = re.compile(r"\s*+\)\s*+")
 _PATCH_BLOCK_RE = re.compile(r"\s*+([^\s{}()]++)\s*+\{([^{}]*+)\}")
 _NFACES_RE = re.compile(r"\bnFaces\s++(\d++)\s*+;")
 _START_FACE_RE = re.compile(r"\bstartFace\s++(\d++)\s*+;")
+_TYPE_RE = re.compile(r"\btype\s++([^\s;]++)\s*+;")
 
 
 class MeshError(AgentInputError):
@@ -143,6 +144,53 @@ def _read_faces(case_dir: Path, n_points: int) -> list[list[int]]:
     return faces
 
 
+_COMPACT_LIST_RE = re.compile(r"\s*+(\d++)\s*+\{\s*+(-?+\d++)\s*+\}\s*+")
+
+
+def read_points(case_dir: Path) -> np.ndarray:
+    """The mesh points of ``constant/polyMesh/points`` as an ``(n_points, 3)`` array.
+
+    Errors as for ``read_patch_face_centres``.
+    """
+    return _read_points(case_dir)
+
+
+def read_faces(case_dir: Path) -> list[list[int]]:
+    """The faces of ``constant/polyMesh/faces`` as lists of point indices, in file order.
+
+    Errors as for ``read_patch_face_centres``.
+    """
+    return _read_faces(case_dir, len(_read_points(case_dir)))
+
+
+def _read_labels(case_dir: Path, name: str) -> np.ndarray:
+    path = _polymesh_dir(case_dir) / name
+    body = _read_body(path, "labelList")
+    compact = _COMPACT_LIST_RE.fullmatch(body)
+    if compact is not None:  # OpenFOAM writes a list of equal labels as ``n{value}``
+        return np.full(int(compact.group(1)), int(compact.group(2)), dtype=np.int64)
+    start = _LIST_START_RE.match(body)
+    end = body.rstrip().rfind(")")
+    if start is None or end < start.end():
+        raise MeshError(f"{path.name} is malformed: expected a label count and '( ... )'")
+    try:
+        labels = np.array(body[start.end() : end].split(), dtype=np.int64)
+    except ValueError as exc:
+        raise MeshError(f"{path.name} contains a value that is not a label ({exc})") from exc
+    if len(labels) != int(start.group(1)):
+        raise MeshError(f"{path.name} declares {start.group(1)} labels but contains {len(labels)}")
+    return labels
+
+
+def read_owner_neighbour(case_dir: Path) -> tuple[np.ndarray, np.ndarray]:
+    """``(owner, neighbour)`` label arrays of ``constant/polyMesh``: the cell on the normal's side
+    of every face, and the cell on the other side of every internal face (shorter array).
+
+    Errors as for ``read_patch_face_centres``.
+    """
+    return _read_labels(case_dir, "owner"), _read_labels(case_dir, "neighbour")
+
+
 def read_boundary(case_dir: Path) -> dict[str, PatchRange]:
     """Patch name -> face range from ``constant/polyMesh/boundary``, in file order.
 
@@ -172,6 +220,26 @@ def read_boundary(case_dir: Path) -> dict[str, PatchRange]:
     if len(patches) != int(start.group(1)):
         raise MeshError(f"{path.name} declares {start.group(1)} patches but defines {len(patches)}")
     return patches
+
+
+def read_patch_types(case_dir: Path) -> dict[str, str]:
+    """Patch name -> ``type`` (``patch``, ``wall``, ``empty``, ...) from ``polyMesh/boundary``.
+
+    A patch without a ``type`` entry maps to ``patch``. Errors as for ``read_boundary``.
+    """
+    path = _polymesh_dir(case_dir) / "boundary"
+    body = _read_body(path, "polyBoundaryMesh")
+    start = _LIST_START_RE.match(body)
+    if start is None:
+        raise MeshError(f"{path.name} is malformed: expected a patch count and '('")
+    types: dict[str, str] = {}
+    pos = start.end()
+    while block := _PATCH_BLOCK_RE.match(body, pos):
+        name, content = block.groups()
+        found = _TYPE_RE.search(content)
+        types[name] = found.group(1) if found else "patch"
+        pos = block.end()
+    return types
 
 
 class _FaceGeometry(NamedTuple):
