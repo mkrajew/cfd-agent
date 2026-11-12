@@ -707,3 +707,189 @@ def test_enums_refs_and_defaults_are_not_mistaken_for_any():
         nested: Leaf = Leaf(value=1.0)
 
     strict_schema(Mode.model_json_schema())
+
+
+# ---- recovery of tool calls the service drops (finish_reason "stop", no tool_calls) ----
+
+LIST_DIR_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "list_dir",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+    },
+}
+CALL_A = '<|channel|>commentary to=functions.list_dir code<|message|>{"path": "a"}<|call|>'
+
+
+def make_client_from_body(body: dict):
+    requests: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        return httpx2.Response(200, json=body)
+
+    client = LLMClient(
+        LLMSettings(endpoint=ENDPOINT),
+        credential=FakeCredential(),
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+    )
+    return client, requests
+
+
+def dropped_body(*, edit=None) -> dict:
+    body = json.loads((FIXTURES / "chat_dropped_call.json").read_text(encoding="utf-8"))
+    if edit is not None:
+        edit(body)
+    return body
+
+
+def set_tokens(body: dict, text: str) -> None:
+    """Replace the generated tokens by `text`, as one token (the parser joins the tokens)."""
+    body["choices"][0]["logprobs"]["content"] = [
+        {"token": text, "logprob": -0.1, "bytes": None, "top_logprobs": []}
+    ]
+
+
+def chat_tools(body: dict, tools=(LIST_DIR_TOOL,), **kwargs):
+    client, _ = make_client_from_body(body)
+    return client.chat(MESSAGES, ModelConfig(deployment="d"), tools=list(tools), **kwargs)
+
+
+def test_requests_logprobs_only_when_tools_are_sent():
+    client, requests = make_client_from_body(dropped_body())
+    client.chat(MESSAGES, ModelConfig(deployment="d"), tools=[LIST_DIR_TOOL])
+    client.chat(MESSAGES, ModelConfig(deployment="d"))
+    assert sent_json(requests[0])["logprobs"] is True
+    assert "logprobs" not in sent_json(requests[1])
+
+
+def test_recovers_call_dropped_by_the_service():
+    result = chat_tools(dropped_body())
+    (call,) = result.tool_calls
+    assert (call.name, call.arguments) == ("list_dir", {"path": "case"})
+    assert call.id.startswith("call_recovered_") and len(call.id) > len("call_recovered_")
+    assert result.finish_reason == "tool_calls"
+    assert result.recovered is True
+
+
+def test_recovered_call_ids_are_unique():
+    body = dropped_body()
+    assert chat_tools(body).tool_calls[0].id != chat_tools(body).tool_calls[0].id
+
+
+def test_recovers_call_sent_on_the_analysis_channel():
+    body = dropped_body()
+    set_tokens(
+        body,
+        "<|channel|>analysis<|message|>Look.<|end|><|start|>assistant<|channel|>analysis"
+        ' to=functions.list_dir code<|message|>{"path": ""}<|call|>',
+    )
+    result = chat_tools(body)
+    assert [(c.name, c.arguments) for c in result.tool_calls] == [("list_dir", {"path": ""})]
+
+
+def test_recovers_an_analysis_channel_call_with_the_constrain_marker():
+    body = dropped_body()
+    set_tokens(
+        body,
+        "<|channel|>analysis to=functions.list_dir <|constrain|>json<|message|>"
+        '{"path": "b"}<|call|>',
+    )
+    assert [c.arguments for c in chat_tools(body).tool_calls] == [{"path": "b"}]
+
+
+def test_recovers_every_dropped_call_in_order():
+    body = dropped_body()
+    two = CALL_A.replace('"a"', '"b"')
+    set_tokens(body, f"<|start|>assistant{CALL_A}<|start|>assistant{two}")
+    assert [c.arguments["path"] for c in chat_tools(body).tool_calls] == ["a", "b"]
+
+
+def test_recovery_keeps_valid_calls_and_skips_invalid_ones():
+    body = dropped_body()
+    bad = "<|channel|>commentary to=functions.list_dir code<|message|>{oops<|call|>"
+    set_tokens(body, f"{bad}<|start|>assistant{CALL_A}")
+    assert [c.arguments for c in chat_tools(body).tool_calls] == [{"path": "a"}]
+
+
+@pytest.mark.parametrize(
+    "tokens",
+    [
+        # a tool that was not offered
+        '<|channel|>commentary to=functions.rm_rf code<|message|>{"path": "x"}<|call|>',
+        # arguments that are not valid JSON
+        '<|channel|>commentary to=functions.list_dir code<|message|>{"path": <|call|>',
+        # arguments that are not an object
+        "<|channel|>commentary to=functions.list_dir code<|message|>[1]<|call|>",
+        # no call at all
+        "<|channel|>analysis<|message|>Thinking.<|end|>",
+        # a call that was never finished
+        '<|channel|>commentary to=functions.list_dir code<|message|>{"path": "a"}',
+    ],
+)
+def test_does_not_recover_what_is_not_a_complete_offered_call(tokens):
+    body = dropped_body()
+    set_tokens(body, tokens)
+    result = chat_tools(body)
+    assert result.tool_calls == [] and result.recovered is False
+    assert result.finish_reason == "stop"
+
+
+@pytest.mark.parametrize("finish", ["length", "content_filter"])
+def test_no_recovery_unless_the_reply_stopped_normally(finish):
+    def edit(body: dict) -> None:
+        body["choices"][0]["finish_reason"] = finish
+
+    result = chat_tools(dropped_body(edit=edit))
+    assert result.tool_calls == [] and result.recovered is False
+    assert result.finish_reason == finish
+
+
+def test_no_recovery_without_tools_or_logprobs():
+    client, _ = make_client_from_body(dropped_body())
+    assert client.chat(MESSAGES, ModelConfig(deployment="d")).tool_calls == []
+    result = chat_tools(dropped_body(edit=lambda b: b["choices"][0].pop("logprobs")))
+    assert result.tool_calls == [] and result.recovered is False
+
+
+def test_replies_with_text_or_real_tool_calls_are_left_alone():
+    def with_text(body: dict) -> None:
+        body["choices"][0]["message"]["content"] = "Done."
+
+    result = chat_tools(dropped_body(edit=with_text))
+    assert result.tool_calls == [] and result.recovered is False
+
+    body = json.loads((FIXTURES / "chat_tool_call.json").read_text(encoding="utf-8"))
+    body["choices"][0]["logprobs"] = dropped_body()["choices"][0]["logprobs"]
+    result = chat_tools(body)
+    assert [c.id for c in result.tool_calls] == ["call_fixture_1"]
+    assert result.recovered is False
+
+
+def test_recovery_decodes_the_exact_bytes_of_split_characters():
+    body = dropped_body()
+    full = (
+        '<|channel|>commentary to=functions.list_dir code<|message|>{"path": "20\u00b0C"}<|call|>'
+    )
+    data = full.encode("utf-8")
+    cut = data.index("\u00b0".encode()) + 1  # split inside the two-byte character
+    body["choices"][0]["logprobs"]["content"] = [
+        {"token": "\ufffd", "logprob": -0.1, "bytes": list(part), "top_logprobs": []}
+        for part in (data[:cut], data[cut:])
+    ]
+    assert chat_tools(body).tool_calls[0].arguments == {"path": "20\u00b0C"}
+
+
+def test_recovery_is_skipped_for_structured_output_and_odd_tool_shapes():
+    with pytest.raises(StructuredOutputError):
+        chat_tools(dropped_body(), response_schema=Verdict)
+    odd = [{"type": "function"}, {"type": "function", "function": None}]
+    result = chat_tools(dropped_body(), tools=odd)
+    assert result.tool_calls == [] and result.recovered is False
+
+
+def test_recovered_call_is_echoed_as_an_ordinary_tool_call():
+    result = chat_tools(dropped_body())
+    (echoed,) = assistant_message(result)["tool_calls"]
+    assert echoed["id"] == result.tool_calls[0].id
+    assert json.loads(echoed["function"]["arguments"]) == {"path": "case"}

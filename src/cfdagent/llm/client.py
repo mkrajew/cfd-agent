@@ -2,6 +2,8 @@
 
 import json
 import os
+import re
+import uuid
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -84,6 +86,56 @@ class ChatResult:
     parsed: BaseModel | None
     raw: dict
     finish_reason: str | None = None
+    # True when the tool calls were read from the raw tokens (see `recover_dropped_calls`).
+    recovered: bool = False
+
+
+# A tool call as the model writes it in the harmony format of gpt-oss, on the commentary channel
+# (or, wrongly, the analysis channel): `to=functions.NAME`, an optional constraint marker, the
+# message, the end-of-call token.
+_DROPPED_CALL = re.compile(
+    r"<\|channel\|>(?:commentary|analysis) to=functions\.([\w-]+)"
+    r"(?:[^<]|<\|constrain\|>)*<\|message\|>(.*?)<\|call\|>",
+    re.S,
+)
+RECOVERED_ID_PREFIX = "call_recovered_"
+
+
+def recover_dropped_calls(text: str, tool_names: set[str]) -> list[ToolCall]:
+    """Read the tool calls the service failed to parse out of the generated text (the tokens).
+
+    Seen with gpt-oss-120b on Azure AI Foundry: the model writes a complete call but with the
+    marker ` code` where `<|constrain|>json` belongs (or on the analysis channel); the service
+    parser rejects it and answers `finish_reason` "stop" with no `tool_calls`. The tokens (asked
+    for with `logprobs`) still hold the call. Only complete calls to a tool in `tool_names`, with
+    arguments that are a JSON object, are returned, in the order the model wrote them.
+    """
+    calls = []
+    for name, body in _DROPPED_CALL.findall(text):
+        if name not in tool_names:
+            continue
+        try:
+            arguments = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(arguments, dict):
+            calls.append(
+                ToolCall(
+                    id=RECOVERED_ID_PREFIX + uuid.uuid4().hex[:24], name=name, arguments=arguments
+                )
+            )
+    return calls
+
+
+def generated_text(entries: list[Any]) -> str:
+    """The text of a reply's `logprobs.content` entries. The exact bytes are preferred: the
+    `token` string of a character split across tokens is lossy."""
+    if entries and all(isinstance(getattr(e, "bytes", None), list) for e in entries):
+        try:
+            return b"".join(bytes(e.bytes) for e in entries).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            pass
+    return "".join(getattr(e, "token", "") or "" for e in entries)
 
 
 class LLMError(Exception):
@@ -359,6 +411,8 @@ class LLMClient:
             params["reasoning_effort"] = model.reasoning_effort
         if tools:
             params["tools"] = tools
+            # The raw tokens let `recover_dropped_calls` act on a reply the service parsed as blank.
+            params["logprobs"] = True
         if response_format is not None:
             params["response_format"] = response_format
 
@@ -402,6 +456,25 @@ class LLMClient:
                 arguments = {UNPARSED_KEY: raw_args}
             tool_calls.append(ToolCall(id=call.id, name=call.function.name, arguments=arguments))
 
+        finish_reason = choice.finish_reason
+        recovered = False
+        # Only a plain "stop" is recovered: a reply cut off ("length") or withheld
+        # ("content_filter") is not trusted, even if the tokens hold a complete earlier call.
+        if (
+            tools
+            and response_schema is None
+            and finish_reason == "stop"
+            and not tool_calls
+            and not (content or "").strip()
+        ):
+            logprobs = getattr(choice, "logprobs", None)
+            text = generated_text(getattr(logprobs, "content", None) or [])
+            names = {(t.get("function") or {}).get("name") for t in tools} - {None}
+            tool_calls = recover_dropped_calls(text, names)
+            if tool_calls:
+                recovered = True
+                finish_reason = "tool_calls"
+
         parsed = None
         if response_schema is not None:
             parsed = parse_structured(response_schema, content, choice.finish_reason, usage)
@@ -412,5 +485,6 @@ class LLMClient:
             usage=usage,
             parsed=parsed,
             raw=response.model_dump(warnings=False),
-            finish_reason=choice.finish_reason,
+            finish_reason=finish_reason,
+            recovered=recovered,
         )
