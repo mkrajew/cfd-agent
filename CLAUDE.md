@@ -19,8 +19,9 @@ tests/               unit/ (default), integration/, e2e/, fixtures/ (recorded LL
 docker/              Dockerfile (OpenFOAM ESI + Gmsh + CadQuery + Python stack)
 infra/               Bicep, VM scripts; read infra/CLAUDE.md before touching it
 examples/            a few curated successful runs (later; no results in git otherwise)
-docs/design/         design document (approved 2026-10-28)
+docs/design/         design document (approved 2026-10-28), carry-over lists between milestones
 docs/adr/            architecture decision records
+docs/runbooks/       VM host set-up and the first live run, with observed numbers
 docs/journal/        research journal (format in docs/journal/README.md)
 docs/report/         final report (written by report-writer, milestone M4)
 docs/superpowers/    implementation plans
@@ -78,6 +79,21 @@ uv run pytest -m sandbox tests/sandbox              # sandbox tests drive real c
 # integration tests run inside the image, with the repository bind-mounted at /work
 docker run --rm -v "$PWD:/work" -w /work cfdagent:dev pytest -m integration tests/integration
 ```
+
+The command-line interface (`uv run cfdagent ...` on a development machine, plain `cfdagent` on the VM, where `/usr/local/bin/cfdagent` loads `/etc/cfdagent/env`). A live run calls the model and costs money, so rule 4 applies; it needs Docker, the sandbox image (`CFDAGENT_IMAGE`, default `cfdagent:runtime`) and `CFDAGENT_LLM_ENDPOINT`:
+
+```bash
+cfdagent run --benchmark cavity-re100                   # from the repository root: benchmarks/ is read relative to the working directory
+cfdagent run task.md [--detach] [--no-upload] [--model <deployment>] [--reasoning-effort low|medium|high]
+cfdagent status <run-id>                                # state, stage, cost
+cfdagent logs <run-id> --follow                         # stage events until the run has ended
+cfdagent list --limit 10                                # recent runs
+python scripts/verify_sandbox.py                        # seven sandbox checks on the machine that runs the executors (on the VM: /opt/cfdagent-host/bin/python); any FAIL blocks live runs
+python scripts/replay_scripted_run.py tests/fixtures/scripted/cavity_pipeline.json   # whole pipeline with a scripted model, real sandbox and upload: no LLM cost (VM time only)
+scripts/vm-host-setup.sh <commit> --llm-endpoint <url> --storage-account-url <url>   # on the VM, as root; see docs/runbooks/vm-host.md
+```
+
+`cfdagent run` exits with 0 (completed), 1 (failed), 130 (interrupted) or 2 (usage error). Exact VM steps, observed numbers and the run-command form are in `docs/runbooks/vm-host.md` and `docs/runbooks/m1-first-run.md`.
 
 Integration tests need the image; on the host `uv run pytest -m integration` collects nothing (default `testpaths` is `tests/unit`), and `tests/integration` is skipped there because `WM_PROJECT_VERSION` is unset.
 

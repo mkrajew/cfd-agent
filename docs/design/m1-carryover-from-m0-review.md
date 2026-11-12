@@ -2,6 +2,48 @@
 
 Source: the final whole-branch review of M0 (2026-10-29, main 034cc5e). Its blocking findings were fixed on the `docs/m0-complete` branch (bounding-box gates, solver negative test and `--strict-markers`, infra defaults, documentation, hygiene). What remains is collected here as input for the M1 plan: sections A to F are code, test and infrastructure work in the recommended order, and S1 to S9 are the security gaps that must be closed before any LLM-authored script or dictionary is processed. Paths are relative to `src/cfdagent` unless they start with another directory. Findings marked "reproduced" were demonstrated against the real code in the review; "emulated" means not seen on the real VM.
 
+## Status at the close of M1 (2026-11-12)
+
+Every item below was either done in M1 or moved on. **Done** means implemented with a test and reviewed in the task named; the evidence for the infrastructure items is the VM check `scripts/verify_sandbox.py` (7 of 7 PASS on 2026-11-08 and again before the runs of 2026-11-12) or a read-only look at the deployed resources. **M2** means deliberately left open and listed in `docs/design/m2-carryover-from-m1.md`; **M3** means needed only when the full campaign starts. "Not re-checked" marks a point this close-out did not look at again.
+
+| Item | Status | Where / note |
+|---|---|---|
+| A. `run_tool` can still raise; `tail` unbounded; child cleanup | Done | Task 1: a missing `cwd` returns `ok=False`; `TAIL_MAX_BYTES` is 8000; the process group is killed on any exception, `KeyboardInterrupt` included |
+| A. Error channels, `GateResult` module, `check_geometry` / `check_mesh` alignment, runner outputs | Done | Tasks 1-3: `ToolFailure` for non-agent failures, `MeshError` for agent-caused ones; `GateResult` lives in the neutral `gates.py`; both gate functions return it |
+| A. Bounding-box tolerance rule per axis | Done | Task 3 (`tools/bbox.py`, rule fixed with `cfd-reviewer`, ruling R11); the mesh gate default stays 1e-2 for curved boundaries |
+| A. Stale outputs, fresh case directory per attempt | Done | The runners remove stale `geometry.step`, manifest and `mesh.msh`; every attempt gets a fresh attempt directory (Tasks 2, 3, 13, 16-18) |
+| A. Quantities keys, neutral `Quantities` module, scorer `OverflowError` / `csv.Error`, resolved `Benchmark.root` | Done | Task 6 (`quantities.py`, `bench/scoring.py`, `bench/registry.py`) |
+| B. Geometry gate: manifest coverage and expected volume | Done | Task 3. Residual, M2: a few-percent error of a small obstacle and unchecked `key_dimensions` are invisible to the gate; a dropped or lumped boundary is caught only at the mesh stage (rulings R25, R28, R32) |
+| B. Mesh gate: placement, one-cell thickness, quality values, patch table | Done | Task 4 (face centres against locators, empty-face count, `checkMesh` values gated with NaN as failure at 70 / 4 / 1000, `n_patch_rows`). Residual, M2: the gate does not verify that the resolution suits the requested outputs (R33); the structural-boundary exemptions are heuristic (R31) |
+| B. Skeleton files, `end_time` against `endTime` | Done | Tasks 2, 4 (skeletons only in a scratch copy) and 5 (reach rule R14) |
+| C. `SOLVERS` set instead of `_NON_SOLVERS` | Done | Task 5 (`tools/foam.py`, test that the allowlist is the union of the two sets) |
+| C. Parallel path (`--use-hwthread-cpus`, tests, `SolverRun`) | Done | Tasks 5, 7, 22; `verify_sandbox` runs four ranks under the hardened flags on the VM. `run_solver` errors clearly when more ranks than hardware threads are asked for (R13) |
+| C. Convergence gate: blow-up check | Done | Task 5: a residual or Courant number above 1e6 counts as divergence even when the log ends with `End` |
+| C. Convergence gate: `residualControl` | M2 | Deliberately absent in M1 (ADR 0004, owner decision 2026-11-06); neither completed live run ended by it |
+| C. Streaming log parse | M3 | Needed for early abort of long runs; M1 parses the finished log |
+| D. LLM client: `finish_reason`, empty `choices`, unknown usage as `None`, echo helper, maps in schemas, tests | Done | Task 11 (`assistant_message`, `EmptyChoicesError`, `TruncatedOutputError`, `SchemaError` for maps; tests for 429, API-key mode and token refresh). Task 14 settled the `CaseSpec` default-keyword question against the real endpoint. Recorded fixtures are in `tests/fixtures/llm/` |
+| D. Llama check | Done | M0 (2026-10-29) |
+| E. Forced daily shutdown kills a run | Done | Task 10: `idle-shutdown.sh --daily` defers while the active-run marker is younger than four hours (`tests/unit/test_daily_shutdown_deferral.py`) |
+| E. Runtime image without uv, pytest, pre-commit; anchored `.dockerignore` | Done | Task 8 (targets `hardened`, `test`, `runtime`) |
+| E. CI: `pre-commit` in the lint job, `infra-lint` in `publish.needs`, hardened flags for the integration job | Done | Tasks 8, 9 (`.github/workflows/ci.yml`). Whether `infra-lint` is a required status check in the branch protection rules is an owner setting that was not re-checked |
+| E. `.claude/settings.json` deny rule for `--pid` | Done | The owner narrowed the rule during Task 9 (deny `--pid=*` and `--pid <ns>`, allow the `runtime` image) |
+| E. Dependabot ignore for the OpenFOAM base image | Done | Task 9 (blanket ignore, tag and digest) |
+| E. Version drift test | Done | `tests/unit/test_version_drift.py` (`pyproject.toml`, `__init__`, `CITATION.cff`) |
+| F. Calibration of `cavity-re1000`, `pipe-re500`, `cylinder-re20`, `cylinder-re100` with hand-written solutions | M2 | Only `cavity-re100` has a hand-written solution that passes the scorer. Required before the first agent run on each of the four |
+| F. Pipe `task.md` / `make_reference.py` sync test | Done | `tests/unit/test_pipe_sync.py`; the kinematic-pressure trap is documented in `benchmarks/README.md` |
+| F. Generality lint | Done | Task 9 (`tests/unit/test_generality_lint.py` scans `src/`, prompts included, for case names) |
+| F. Test hygiene (shared `PYTHONPATH` fixture, end-to-end timeout) | Done | Tasks 5, 9 (`tests/integration/conftest.py`) |
+| F. `CaseSpec` in SI metres, `expected_bbox` computed by the orchestrator | Done | Task 14. Known gap, M2: a consistently wrong but self-consistent `CaseSpec` is not detected by any gate |
+| S1. `run_tool` as the sandbox boundary | Done | Task 7: every external execution, gates included, runs in an executor container (`sandbox/`, `executor/`); `tests/sandbox` and `verify_sandbox` |
+| S2. Block IMDS and WireServer | Done | Executors use `--network none`; `cfdagent-iptables` (DOCKER-USER rules) is installed by `vm-host-setup.sh`; `verify_sandbox` row "no network" PASS on the VM |
+| S3. Environment scrub | Done | Task 1 (allowlist); `verify_sandbox` row "no credentials in the environment" PASS |
+| S4. Container flags and cleanup | Done | Tasks 7, 8: `--cap-drop ALL`, `no-new-privileges`, read-only root with tmpfs, limits, named containers killed on timeout; rows "read-only root filesystem" and "timeout leaves no container" PASS |
+| S5. Shared run directory treated as hostile | Done | Task 7 and the upload code (symlinks refused, only the run directory mounted); row "run directory is the only mount" PASS |
+| S6. Image hardening, `allowSystemOperations 0` | Done | Task 8 (Dockerfile assertion, test that `#codeStream` is refused); row "`#codeStream` refused" PASS |
+| S7. Entra-only AI account, container-scoped blob role | Done | `disableLocalAuth` was already true (read-only check, 2026-10-30); the container-scoped role was deployed with the owner's approval on 2026-10-30 and the old account-scoped role was removed with approval on 2026-11-08 |
+| S8. SSH limits | Done | `MaxAuthTries 3` and `AllowUsers` drop-in installed by `vm-host-setup.sh` (Task 10). The `docker` group stays root-equivalent, so the key passphrase is the real control; not re-checked |
+| S9. Per-run cap, pinned Actions, public image | Done | The orchestrator enforces `max_cost_usd` (default $1.00) from real usage (Tasks 11, 20); Actions are pinned by commit SHA; the public image holds no secrets. Budget alerts still only notify |
+
 ## A. Tool-layer contracts (do first: every orchestrator call goes through them)
 
 - **`run_tool` can still raise.**
