@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cfd-agent"
-version = "0.0.1"
+version = "0.1.0"
 description = "LLM agents that run full CFD simulations (CadQuery, Gmsh, OpenFOAM) from a plain-language task."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
