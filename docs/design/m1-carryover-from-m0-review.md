@@ -25,7 +25,7 @@ Every item below was either done in M1 or moved on. **Done** means implemented w
 | D. Llama check | Done | M0 (2026-10-29) |
 | E. Forced daily shutdown kills a run | Done | Task 10: `idle-shutdown.sh --daily` defers while the active-run marker is younger than four hours (`tests/unit/test_daily_shutdown_deferral.py`) |
 | E. Runtime image without uv, pytest, pre-commit; anchored `.dockerignore` | Done | Task 8 (targets `hardened`, `test`, `runtime`) |
-| E. CI: `pre-commit` in the lint job, `infra-lint` in `publish.needs`, hardened flags for the integration job | Done, except branch protection | Tasks 8, 9 (`.github/workflows/ci.yml`). Checked on 2026-11-14: the required status checks of `main` are `lint`, `unit`, `image` and `integration`; `infra-lint` and `sandbox` are not required, so a pull request can merge while they fail (they still gate `publish`). Adding them is an owner setting |
+| E. CI: `pre-commit` in the lint job, `infra-lint` in `publish.needs`, hardened flags for the integration job | Done | Tasks 8, 9 (`.github/workflows/ci.yml`). Checked on 2026-11-14: the required status checks of `main` were `lint`, `unit`, `image` and `integration`, so a pull request could merge while `infra-lint` or `sandbox` failed (they still gate `publish`). The owner added both on 2026-11-14 and the API now lists all six |
 | E. `.claude/settings.json` deny rule for `--pid` | Done | The owner narrowed the rule during Task 9 (deny `--pid=*` and `--pid <ns>`, allow the `runtime` image) |
 | E. Dependabot ignore for the OpenFOAM base image | Done | Task 9 (blanket ignore, tag and digest) |
 | E. Version drift test | Done | `tests/unit/test_version_drift.py` (`pyproject.toml`, `__init__`, `CITATION.cff`) |
