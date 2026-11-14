@@ -44,7 +44,9 @@
 | D9 | The Case Setup trial-run Courant limit of 10 (ruling R38, ADR-0004), which the owner asked to revisit after live runs: keep or change, on the evidence of Task 17 | Owner asked for it | Task 18 |
 | D10 | Tag `v0.2.0` | Release | Task 20 |
 
-ADR-0006 and ADR-0007 are written by `scribe` from this plan's interfaces (with `cfd-reviewer` fixing the gate thresholds in ADR-0006), each in a small `docs:` PR that the owner approves before the first task it blocks starts.
+ADR-0006 and ADR-0007 were written by `scribe` from this plan's interfaces and approved together with the plan (2026-11-14); the gate thresholds in ADR-0006 stay provisional until `cfd-reviewer` confirms them in Task 12.
+
+**Owner decisions of 2026-11-14** (in chat): D1, D2 and D3 approved, so ADR-0005, ADR-0006 and ADR-0007 are Accepted (the thresholds of ADR-0006 are provisional until Task 12). D6: the M0-M2 envelope is raised from $30 to $35. D7: the Task 17 cap of $7 (report at $3.5) is approved. D8: the done rule and the Task 19 acceptance series with a cap of $6 are approved. The sessions running Tasks 17 and 19 still announce in chat before spending (rule 4). D4, D5, D9 and D10 remain open.
 
 ## Recommended order
 
@@ -134,7 +136,7 @@ scripts/run_calibration.py  runs one hand-written case and prints the Scorer tab
 - Create: `docs/superpowers/plans/2026-11-14-m2-robustness-and-full-benchmark-set.md`, `docs/adr/0005-in-place-repair-behind-a-flag.md` (status Proposed)
 
 - [ ] **Step 1:** Owner reviews the plan and ADR-0005 in the PR.
-- [ ] **Step 2:** After approval, set ADR-0005 to Accepted and add the sentence on `repair_mode` to design 6.2 (same PR or a `docs:` commit before Task 8).
+- [x] **Step 2:** After approval, set ADR-0005 to Accepted and add the sentence on `repair_mode` to design 6.2 (same PR or a `docs:` commit before Task 8).
 - [ ] **Step 3: Standard close** (docs only). Commit: `docs: M2 plan`.
 
 ---

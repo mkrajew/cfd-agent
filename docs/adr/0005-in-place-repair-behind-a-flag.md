@@ -1,6 +1,6 @@
 # ADR-0005: In-place repair of a failed attempt, behind a configuration flag
 
-- **Status:** Proposed, 2026-11-14 (awaiting the owner's approval; nothing is built before it)
+- **Status:** Accepted, 2026-11-14 (owner approval in chat)
 - **Deciders:** the owner
 
 ## Context

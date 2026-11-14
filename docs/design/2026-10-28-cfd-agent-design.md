@@ -113,7 +113,7 @@ Open-weight models are used **because of budget**, not as part of the hypothesis
 
 ### 6.2 Fixed pipeline and gates
 
-Every run passes the same stages. After each stage a **deterministic gate** checks the output. On failure, the error is fed back to the responsible agent for another attempt, within limits (§6.5).
+Every run passes the same stages. After each stage a **deterministic gate** checks the output. On failure, the error is fed back to the responsible agent for another attempt, within limits (§6.5). The retry may start from the failed attempt's files, controlled by `repair_mode` (default `fresh`; see ADR-0005). A failed Solver Runner gate or a Critic send-back may name an earlier stage; the orchestrator then re-runs from that stage in a numbered pass, with the convergence gate of row 5 restored (ADR-0006). The Critic's verdict is a result beside the run status, and the Scorer runs after the Critic step (ADR-0007).
 
 | # | Stage / agent | Output | Gate (deterministic) |
 |---|---|---|---|
@@ -155,7 +155,7 @@ Each agent's system prompt lives in `src/cfdagent/prompts/<agent>.md`, versioned
 ### 6.5 Orchestrator, limits, run record
 - Plain Python state machine; no agent framework. **[Claude's call]** Reason: transparency, deterministic control, easy logging for research.
 - Default limits per run **[Claude's call, configurable]**: max 3 attempts per stage; max 10 fix loops overall; wall-clock 2 h; max $1.00 LLM cost; max 4 MPI ranks.
-- When a limit is hit, the run ends as `failed` or `partial`, with what was produced so far uploaded.
+- When a limit is hit, the run ends as `failed` or `partial`, with what was produced so far uploaded. Per ADR-0007, `partial` is a Critic verdict, not a run status: the run `status` stays the pipeline status and the verdict is reported beside it. Fix loops are numbered passes with `max_fix_loops = 10` run-wide (ADR-0006).
 - **Run record** (`run_record.json`) for every run: task, task set (development / generality / ad hoc, §9), model + parameters, prompt versions, image version, per-stage attempts and errors, tokens, cost, wall time, verdict, errors vs. reference. This is the raw data for the hypothesis test.
 - Optional debugging flag `--pause-after <stage>`. Default is fully autonomous.
 
@@ -365,9 +365,11 @@ The optional heated-cavity task is the first thing dropped inside row 1. Estimat
 ### 14.2 Spending envelopes (owner's decision, 2026-10-28)
 | Phase | Envelope |
 |---|---|
-| M0–M2 development | ≤ $30 |
+| M0–M2 development | ≤ $30 (raised to ≤ $35 by the owner on 2026-11-14, see the note below) |
 | M3 campaign | ≤ $45 |
 | Reserve | ≈ $25, never spent without a separate owner decision |
+
+Note, 2026-11-14: the owner raised the M0–M2 envelope from $30 to $35, taking $5 from the reserve (about $20 left). The table keeps the original figure; the M2 plan's budget section gives the reason.
 
 - Inside an approved envelope, starting/stopping the VM and running tests/benchmarks need no per-action approval.
 - **Standing approval (owner's decision, 2026-11-14, replaces the earlier rule that creating or changing Azure resources always needs approval):** inside `rg-cfdagent` and the envelope, `az` commands including create, update, delete, role assignments and Bicep deployments run without per-command approval. The main session announces the task in chat first (what is done, with the cost estimate) and then works without further questions. Still needing explicit approval: anything outside `rg-cfdagent` or at subscription or Entra level, deleting the resource group, the storage account or the `runs` container, any task or campaign estimated above $5, and anything that would exceed the envelope.
