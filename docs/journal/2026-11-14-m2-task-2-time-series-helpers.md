@@ -15,3 +15,7 @@ The first test did not tell apart dropping the first part of the record from dro
 ## 2026-11-14 decision: known limitations deferred
 
 Not done in this task: linear detrending (a drifting signal gives a misleading "simulate longer" error), a Nyquist or aliasing check, handling of re-run `_<startTime>` files in v2512 (`force_0.dat` next to `force.dat` is silently stale), the 6-significant-digit Time column that can create repeated times at small time steps, and legacy OpenFOAM Foundation header forms.
+
+## 2026-11-14 observation: second review approved, remaining limitations
+
+The second review (`code-reviewer`) approved the branch after checking each fix with mutations and a real `surfaceFieldValue` run in the image. Limitations it recorded for later: `dominant_frequency` returns a confident but meaningless frequency for round-off-level noise (the constant-signal check is relative to the signal magnitude), so the analyst must report the oscillation amplitude next to the frequency; the real `surfaceFieldValue` header is covered by a unit fixture only, not by an integration test; the prompt warnings have no substring guard in the drift test; float32 scalars are rejected as arguments; a NaN time silently drops the rows before it; symlink rejection has no test.
