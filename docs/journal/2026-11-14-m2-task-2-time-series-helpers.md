@@ -10,7 +10,7 @@ Header rule: the last `#` line starting with `Time` names the columns; vector co
 
 ## 2026-11-14 observation: review found a start-up bias and a wrong-harmonic trap
 
-The first test did not tell apart dropping the first part of the record from dropping the last; fixed in the one round of fixes. `cfd-reviewer` found that the default `period_average(n_periods=None)` averages the start-up transient, which gave a +5.9 % bias in a synthetic case. The analyst prompt now tells the agent to pass `n_periods` and to average the preceding window as a drift check. Force components can oscillate at a multiple of the shedding frequency (Cd at 2f, Cl at f), so the prompt also tells the agent to take the fundamental from the transverse component. Mixed headers in `surfaceFieldValue` output are rejected instead of guessed.
+The first test did not tell apart dropping the first part of the record from dropping the last; fixed in the one round of fixes. `cfd-reviewer` found that the default `period_average(n_periods=None)` averages the start-up transient, which gave a +5.9 % bias in a synthetic case. The analyst prompt now tells the agent to pass `n_periods` and to average the preceding window as a drift check. Force components can oscillate at a multiple of the shedding frequency (Cd at 2f, Cl at f), so the prompt also tells the agent to take the fundamental from the transverse component. The first version rejected the mixed scalar and vector header that `surfaceFieldValue` writes; the fix round resolves it from token widths.
 
 ## 2026-11-14 decision: known limitations deferred
 
