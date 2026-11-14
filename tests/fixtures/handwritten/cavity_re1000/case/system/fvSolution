@@ -1,0 +1,70 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      fvSolution;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+solvers
+{
+    // Linear solves inside one SIMPLE iteration only need to reduce the error by a factor of 10
+    // (relTol 0.1): the outer iteration converges the non-linearity anyway, and solving harder
+    // each time costs time without making the outer loop faster. The absolute tolerance is far
+    // below the residualControl targets below, so it never stops a solve early at the end.
+    p
+    {
+        solver          GAMG;
+        smoother        GaussSeidel;
+        tolerance       1e-10;
+        relTol          0.1;
+    }
+
+    U
+    {
+        solver          smoothSolver;
+        smoother        symGaussSeidel;
+        tolerance       1e-10;
+        relTol          0.1;
+    }
+}
+
+SIMPLE
+{
+    nNonOrthogonalCorrectors 0;
+
+    // SIMPLEC: the pressure equation is consistent with the relaxed momentum equation, which
+    // allows the large velocity relaxation factor below and no relaxation of the pressure.
+    consistent      yes;
+
+    // Closed domain with zero-gradient pressure on every wall: pressure is fixed in one cell.
+    pRefCell        0;
+    pRefValue       0;
+
+    // The run stops when the INITIAL residuals (the residual of the equation before it is
+    // solved in an iteration; the final residual only reflects the linear solver tolerance) of
+    // both the pressure and the velocity fall below these values. Why 1e-6: measured on the mesh of
+    // mesh.py (1094 iterations at 1e-6), tightening both to 1e-8 (1976 iterations) changes the
+    // sampled centreline profiles by 1.1e-4 lid speeds (the acceptance threshold is 0.05), so
+    // the profiles are steady at 1e-6. Looser targets stop earlier but leave the profile
+    // unsteady: 1e-5 (658 iterations) shifts it by 1e-3, 1e-4 (413 iterations) by 5e-3 and 1e-3
+    // (260 iterations) by 3.7e-2, which is nearly the size of the threshold.
+    residualControl
+    {
+        p               1e-6;
+        U               1e-6;
+    }
+}
+
+relaxationFactors
+{
+    // SIMPLEC tolerates an implicit relaxation of the momentum equation of 0.9 (SIMPLE would
+    // need about 0.7 for U and 0.3 for p).
+    equations
+    {
+        U               0.9;
+    }
+}
+
+// ************************************************************************* //
