@@ -307,10 +307,10 @@ Claude (main session) coordinates: talks to the owner in Polish, plans, delegate
 Other Claude Code files:
 - `CLAUDE.md` (root, ~100–150 lines): project summary and repo map with pointers to docs; language rule; working rules (TDD, PR flow, owner merges, no Azure spending without approval, no secrets, journal); key commands.
 - `infra/CLAUDE.md`: subscription limits, allowed regions, mandatory shutdown, cost estimation.
-- `.claude/settings.json`: allow tests, linting and image builds without prompting; always ask for Azure resource-creating commands and deployments.
+- `.claude/settings.json`: allow tests, linting, image builds and (from 2026-11-14, §14.2) `az` without prompting; deny the common irreversible deletes and force pushes.
 - Cloud-agent prompts are **not** CLAUDE.md files; they live in `src/cfdagent/prompts/`.
 
-**Owner approval points:** (1) design decisions / ADRs, (2) PR merge (description + green CI), (3) CFD results at milestones, (4) any Azure cost.
+**Owner approval points:** (1) design decisions / ADRs, (2) PR merge (description + green CI), (3) CFD results at milestones, (4) Azure work outside the standing approval of §14.2 (outside `rg-cfdagent`, irreversible deletes, above $5 or beyond the envelope).
 
 ## 11. Research documentation and report
 

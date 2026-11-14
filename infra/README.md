@@ -1,8 +1,8 @@
 # Infrastructure
 
 Bicep for the cfd-agent research environment. One subscription-scope deployment creates the resource
-group `rg-cfdagent` and everything in it. Read `infra/CLAUDE.md` first: **nothing is deployed without the
-owner's explicit approval**, and every change carries a cost estimate.
+group `rg-cfdagent` and everything in it. Read `infra/CLAUDE.md` first: **deployments follow the standing
+approval of rule 4 in `CLAUDE.md` (announce first)**, and every change carries a cost estimate.
 
 ## What is deployed
 
@@ -155,7 +155,7 @@ From the owner's machine: `az vm get-instance-view` shows the VM running,
   its custom subdomain reserved. Before deploying again, purge it:
   `az cognitiveservices account list-deleted`, then
   `az cognitiveservices account purge --location italynorth --resource-group rg-cfdagent --name <account>`.
-  Otherwise the next deployment fails with a subdomain conflict. Deleting needs the owner's approval.
+  Otherwise the next deployment fails with a subdomain conflict. Deleting it falls under the standing approval of rule 4.
 - **Budget start date** defaults to the first day of the current month at deployment time, so a redeploy in a later
   month would move the start of an existing budget (the effect on an existing budget is unverified). The budget
   was created with start date 2026-10-01, so **a redeploy after 1 November 2026 must pass
@@ -174,4 +174,4 @@ From the owner's machine: `az vm get-instance-view` shows the VM running,
 | Foundry `Llama-3.3-70B-Instruct` (global) | 0.71 USD / 1M input tokens, 0.71 USD / 1M output tokens | per token |
 
 Fixed cost while the environment exists: about 8.7 USD/month. To stop it completely, delete the resource
-group (needs the owner's approval; the public IP changes on the next deployment).
+group (still needs the owner's explicit approval; the public IP changes on the next deployment).
