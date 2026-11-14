@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 import re
 from datetime import datetime
-from typing import Literal, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -19,6 +19,12 @@ from cfdagent.sandbox.config import SandboxConfig
 
 AGENT_NAMES = ("planner", "geometry", "mesh", "case_setup", "solver_runner", "analyst")
 DEFAULT_DEPLOYMENT = "gpt-oss-120b"
+# Case Setup writes a whole set of dictionaries and checks them before its attempt ends; two runs
+# of M1 used all 40 turns without reaching a passing check.
+DEFAULT_TURNS_BY_STAGE = {"case_setup": 60}
+# At reasoning effort ``high`` the reasoning can use the whole structured-call limit and cut the
+# JSON reply off, so the Planner's structured call gets more room.
+HIGH_EFFORT_STRUCTURED_TOKENS = 8192
 DEFAULT_IMAGE = "cfdagent:runtime"  # the shipped image (target `runtime`), not the test image
 MAX_SLUG_CHARS = 40
 MAX_RANKS_LIMIT = 4  # pipeline invariant: never more than four MPI ranks
@@ -38,6 +44,11 @@ class RunLimits(BaseModel):
     max_cost_usd: float = 1.0
     max_ranks: int = Field(default=MAX_RANKS_LIMIT, ge=1, le=MAX_RANKS_LIMIT)
     max_turns_per_attempt: int = Field(default=40, ge=1, le=1000)
+    # Per stage name: replaces ``max_turns_per_attempt`` for that stage. The cost cap is not
+    # affected by it.
+    max_turns_per_attempt_by_stage: dict[str, Annotated[int, Field(ge=1, le=1000)]] = Field(
+        default_factory=dict
+    )
     max_cells: int = Field(default=2_000_000, ge=1)
     max_runtime_minutes: float = 90
     max_memory_gb: float = 12
@@ -81,7 +92,8 @@ class RunConfig(BaseModel):
             )
             for name in AGENT_NAMES
         }
-        return cls(models=models, sandbox=SandboxConfig(image=image))
+        limits = RunLimits(max_turns_per_attempt_by_stage=dict(DEFAULT_TURNS_BY_STAGE))
+        return cls(limits=limits, models=models, sandbox=SandboxConfig(image=image))
 
     @staticmethod
     def llm_settings_from_env() -> LLMSettings:

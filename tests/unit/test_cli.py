@@ -1196,3 +1196,12 @@ def test_python_dash_m_cfdagent_shows_the_commands():
 def test_the_console_script_is_declared():
     text = (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(encoding="utf-8")
     assert '[project.scripts]\ncfdagent = "cfdagent.cli:app"' in text
+
+
+def test_high_effort_raises_planner_structured_tokens(runner, root, fake_run_task, task_file):
+    assert invoke(runner, "run", str(task_file)).exit_code == 0
+    assert fake_run_task.calls[0]["config"].planner_structured_max_tokens == 4096  # the default
+    assert invoke(runner, "run", str(task_file), "--reasoning-effort", "low").exit_code == 0
+    assert fake_run_task.calls[1]["config"].planner_structured_max_tokens == 4096
+    assert invoke(runner, "run", str(task_file), "--reasoning-effort", "high").exit_code == 0
+    assert fake_run_task.calls[2]["config"].planner_structured_max_tokens == 8192

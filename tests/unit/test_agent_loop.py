@@ -1485,3 +1485,75 @@ def test_carry_over_returns_run_relative_paths_of_the_new_files(tmp_path):
     assert carried == ["attempts/toy-2/b.py", "attempts/toy-2/notes/n.txt"]
     assert (attempt / "notes" / "n.txt").read_text(encoding="utf-8") == "n"
     assert not (attempt / ".hidden.py").exists()
+
+
+# ------------------------------------------------------------------ directive check messages
+
+SAME_PROBLEM = "This is the same problem as in the previous attempt; it was not fixed:"
+
+
+def test_identical_error_is_flagged_as_repeated(tmp_path):
+    steps = [reply(None, check(f"k{i}")) for i in range(1, 5)]
+    ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_attempts_per_stage=4))
+    gates = [
+        GateResult(False, ["a is missing", "b is wrong"]),
+        GateResult(False, ["a is missing", "b is wrong"]),  # the same list again
+        GateResult(False, ["a is missing"]),  # different: not flagged
+        GateResult(True, []),
+    ]
+    assert run_stage(ToyStage(gates), ctx).ok
+    first, second, third = (tool_messages(i, backend)[-1]["content"] for i in (1, 2, 3))
+    assert SAME_PROBLEM not in first  # nothing to compare with
+    assert SAME_PROBLEM in second
+    assert second.index(SAME_PROBLEM) < second.index("- a is missing")  # before the listing
+    assert "attempt 2 of 4" in second.splitlines()[0]  # the header line is unchanged
+    assert SAME_PROBLEM not in third
+
+
+def test_a_repeated_error_message_composes_with_the_in_place_retry_text(tmp_path):
+    steps = [
+        write_a(),
+        reply(None, check("k1")),
+        reply(None, check("k2")),
+        reply(None, check("k3")),
+    ]
+    ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_attempts_per_stage=3))
+    gates = [GateResult(False, ["same"]), GateResult(False, ["same"]), GateResult(True, [])]
+    assert run_stage(RepairStage(gates), in_place(ctx)).ok
+    text = tool_messages(3, backend)[-1]["content"]  # the result of the second check
+    assert SAME_PROBLEM in text and "already in the new directory" in text
+    assert text.index(SAME_PROBLEM) < text.index("already in the new directory")
+    assert SAME_PROBLEM not in tool_messages(2, backend)[-1]["content"]  # the first check
+
+
+class NotingStage(ToyStage):
+    def passed_text(self, result):
+        return "Already in order: a.py" if result.data else ""
+
+
+def test_the_stage_may_add_what_passed_to_the_check_result(tmp_path):
+    steps = [reply(None, check("k1")), reply(None, check("k2"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    stage = NotingStage([GateResult(False, ["bad"], data={"x": 1}), GateResult(True, [])])
+    assert run_stage(stage, ctx).ok
+    text = tool_messages(1, backend)[-1]["content"]
+    assert "Already in order: a.py" in text
+    assert text.index("- bad") < text.index("Already in order") < text.index("attempts/toy-2")
+    # the default hook of a plain stage adds nothing:
+    plain, plain_backend = make_ctx(
+        tmp_path / "plain", [reply(None, check()), reply(None, check())]
+    )
+    run_stage(ToyStage([GateResult(False, ["bad"], data={"x": 1}), GateResult(True, [])]), plain)
+    assert "Already in order" not in tool_messages(1, plain_backend)[-1]["content"]
+
+
+def test_turn_limit_override_per_stage(tmp_path):
+    steps = [reply(None, tc("calculator", f"c{i}", expression="1+1")) for i in range(8)]
+    limits = RunLimits(max_turns_per_attempt=3, max_turns_per_attempt_by_stage={"toy": 5})
+    ctx, backend = make_ctx(tmp_path, steps, limits=limits)
+    outcome = run_stage(ToyStage([]), ctx)
+    assert not outcome.ok and len(backend.calls) == 5  # the override, not the default of 3
+    assert "5" in outcome.reason and "max_turns_per_attempt" in outcome.reason
+    other = RunLimits(max_turns_per_attempt=3, max_turns_per_attempt_by_stage={"mesh": 9})
+    ctx, backend = make_ctx(tmp_path / "other", steps, limits=other)
+    assert not run_stage(ToyStage([]), ctx).ok and len(backend.calls) == 3  # another stage's key

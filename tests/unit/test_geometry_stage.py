@@ -12,7 +12,7 @@ from test_casespec import make_spec
 from cfdagent.agents.gatehelp import MANIFEST_MAX_BYTES, last_bytes
 from cfdagent.agents.geometry import GATE_TIMEOUT_S, SCRIPT_TIMEOUT_S, GeometryStage
 from cfdagent.agents.loop import run_stage
-from cfdagent.agents.stage import StageContext
+from cfdagent.agents.stage import CASESPEC_FROM_ATTEMPT, StageContext
 from cfdagent.agents.transcript import TranscriptWriter
 from cfdagent.config import RunConfig
 from cfdagent.errors import ToolFailure
@@ -581,3 +581,21 @@ def test_stage_loop_passes_promotes_and_records_one_attempt(tmp_path):
         "write_file",
         "check_stage",
     }
+
+
+def test_opening_messages_state_input_paths(tmp_path):
+    ctx = make_ctx(tmp_path, FakeSandbox({}))
+    text = GeometryStage().opening_message(ctx)
+    assert "working directory" in text
+    assert "../../casespec.json" in text  # the plan, from the attempt directory the script runs in
+    assert "geometry.step" in text and "boundary_manifest.json" in text  # written there
+    assert "only file" in text and "no other" not in text  # the plan is the one file it may read
+
+
+def test_the_plan_path_given_to_scripts_leads_from_the_attempt_directory_to_the_plan(tmp_path):
+    ctx = make_ctx(tmp_path, FakeSandbox({}))
+    (ctx.run.root / "casespec.json").write_text("{}", encoding="utf-8")
+    attempt = ctx.run.attempt_dir("geometry", 1)
+    assert (attempt / CASESPEC_FROM_ATTEMPT).resolve() == (ctx.run.root / "casespec.json").resolve()
+    prompt = load_prompt("geometry").text
+    assert CASESPEC_FROM_ATTEMPT in prompt and "no other files" not in prompt

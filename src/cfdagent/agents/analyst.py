@@ -40,7 +40,12 @@ from pydantic import BaseModel, Field
 
 from cfdagent.agents.casespec import CaseSpec, OutputSpec
 from cfdagent.agents.gatehelp import last_bytes, names
-from cfdagent.agents.stage import Stage, StageContext, carried_files_text
+from cfdagent.agents.stage import (
+    CASESPEC_FROM_ATTEMPT,
+    Stage,
+    StageContext,
+    carried_files_text,
+)
 from cfdagent.agents.tools import FileScope, Tool
 from cfdagent.errors import AgentInputError, ToolFailure
 from cfdagent.executor.protocol import OpResponse, RunScriptArgs, RunUtilityArgs
@@ -219,8 +224,11 @@ class AnalystStage(Stage):
             "convergence verdict with the numbers (the stage cannot pass without it), the "
             "conservation and plausibility checks, a short physical interpretation and the "
             "limits. Read only the root time directories of the case, never processor*/ "
-            "(a parallel run keeps the decomposed data there). Call check_stage when both files "
-            "are written."
+            "(a parallel run keeps the decomposed data there). The script's working directory is "
+            f"the attempt directory and every path in it is relative to that directory: the "
+            f"solved case is `{CASE_NAME}/`, the plan is {CASESPEC_FROM_ATTEMPT}, and the "
+            f"outputs are `{QUANTITIES_NAME}` and `{PLOTS_DIR}/`. Call check_stage when both "
+            "files are written."
         )
 
     def _summary_text(self, ctx: StageContext) -> str:
