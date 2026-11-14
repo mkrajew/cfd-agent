@@ -1,5 +1,6 @@
 """The Analyst prompt documents ``cfdagent.tools.foam_results``; that text must not drift."""
 
+import inspect
 import json
 import re
 import shutil
@@ -52,6 +53,30 @@ def test_the_prompt_names_only_things_the_module_has():
     for name in ("type", "n_faces", "face_centres", "face_areas", "owner_cells"):
         assert name in foam_results.Patch.__dataclass_fields__ and f".{name}" in section
     assert "PyVista" in section  # the warning against opening the case with it
+
+
+def test_the_prompt_names_the_series_helpers_and_their_keywords():
+    section = _section()
+    for name in ("read_function_object", "dominant_frequency", "period_average"):
+        assert f"`{name}(" in section or f"= {name}(" in section, name
+        assert callable(getattr(foam_results, name)), name
+    assert "FunctionObjectTable" in section
+    assert inspect.isclass(foam_results.FunctionObjectTable)
+    assert ".column(" in section and callable(foam_results.FunctionObjectTable.column)
+    for helper, keyword in (
+        ("read_function_object", "file"),
+        ("dominant_frequency", "skip_fraction"),
+        ("period_average", "n_periods"),
+    ):
+        parameters = inspect.signature(getattr(foam_results, helper)).parameters
+        assert keyword in parameters, (helper, keyword)
+        assert f"{keyword}=" in section, keyword
+    # the import line of the helpers must import names that exist
+    imported = re.findall(r"from cfdagent\.tools\.foam_results import ([\w, ]+)", section)
+    names = {name.strip() for line in imported for name in line.split(",")}
+    assert {"read_function_object", "dominant_frequency", "period_average"} <= names
+    for name in names:
+        assert hasattr(foam_results, name), name
 
 
 def test_the_prompt_skeleton_runs_on_a_case(tmp_path, monkeypatch):
