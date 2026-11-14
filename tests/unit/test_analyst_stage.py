@@ -612,6 +612,17 @@ def test_a_failed_attempt_is_retried_and_asks_for_no_diagnosis(tmp_path):
     assert "post.py" in setup.stage.retry_text("attempts/analyst-1")
 
 
+def test_the_retry_text_with_carried_files_says_they_are_already_there(tmp_path):
+    setup = prepared(tmp_path)
+    carried = ["attempts/analyst-2/post.py"]
+    text = setup.stage.retry_text("attempts/analyst-1", carried)
+    assert "attempts/analyst-2/post.py" in text and "already in the new directory" in text
+    assert "fresh copy of the solved case" in text
+    assert setup.stage.retry_text("attempts/analyst-1", None) == setup.stage.retry_text(
+        "attempts/analyst-1"
+    )
+
+
 def test_the_prompt_states_the_rules_of_the_stage():
     text = load_prompt("analyst").text
     for needle in (

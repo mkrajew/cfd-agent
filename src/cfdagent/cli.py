@@ -100,6 +100,11 @@ class Effort(StrEnum):
     high = "high"
 
 
+class RepairMode(StrEnum):
+    fresh = "fresh"
+    in_place = "in_place"
+
+
 # ---------------------------------------------------------------------------------- small helpers
 
 
@@ -441,7 +446,12 @@ def _benchmark_task(benchmark_id: str) -> str:
     return _read_task_file(entry.root / entry.task_file)
 
 
-def _build_config(model: str | None, effort: Effort | None, benchmark_id: str | None) -> Any:
+def _build_config(
+    model: str | None,
+    effort: Effort | None,
+    benchmark_id: str | None,
+    repair_mode: RepairMode | None = None,
+) -> Any:
     from cfdagent.config import DEFAULT_DEPLOYMENT, RunConfig
     from cfdagent.llm.cost import PRICING
 
@@ -464,6 +474,8 @@ def _build_config(model: str | None, effort: Effort | None, benchmark_id: str | 
         config = config.model_copy(update={"models": models})
     if benchmark_id is not None:
         config = config.model_copy(update={"benchmark_id": benchmark_id, "task_set": "development"})
+    if repair_mode is not None:
+        config = config.model_copy(update={"repair_mode": repair_mode.value})
     return config
 
 
@@ -474,6 +486,7 @@ def _child_command(
     effort: Effort | None,
     no_upload: bool,
     run_id: str,
+    repair_mode: RepairMode | None = None,
 ) -> list[str]:
     argv = [sys.executable, "-m", "cfdagent", "run"]
     if task_file is not None:
@@ -484,6 +497,8 @@ def _child_command(
         argv += ["--model", model]
     if effort is not None:
         argv += ["--reasoning-effort", effort.value]
+    if repair_mode is not None:
+        argv += ["--repair-mode", repair_mode.value]
     if no_upload:
         argv.append("--no-upload")
     argv += ["--run-id", run_id]
@@ -534,6 +549,14 @@ def run(
     reasoning_effort: Annotated[
         Effort | None, typer.Option("--reasoning-effort", help="Reasoning effort for all agents.")
     ] = None,
+    repair_mode: Annotated[
+        RepairMode | None,
+        typer.Option(
+            "--repair-mode",
+            help="How a retry starts: fresh (empty directory, default) or in_place (seeded with "
+            "the failed attempt's files).",
+        ),
+    ] = None,
     detach: Annotated[
         bool, typer.Option("--detach", help="Start in the background, print the run id, return.")
     ] = False,
@@ -551,7 +574,7 @@ def run(
         _check_run_id(run_id)
 
     task = _read_task_file(task_file) if task_file is not None else _benchmark_task(str(benchmark))
-    config = _build_config(model, reasoning_effort, benchmark)
+    config = _build_config(model, reasoning_effort, benchmark, repair_mode)
     root = runs_root()
 
     if detach:
@@ -564,7 +587,9 @@ def run(
         from cfdagent import orchestrator
 
         new_id = run_id or orchestrator.new_run_id(task)
-        argv = _child_command(task_file, benchmark, model, reasoning_effort, no_upload, new_id)
+        argv = _child_command(
+            task_file, benchmark, model, reasoning_effort, no_upload, new_id, repair_mode
+        )
         _detach(argv, root, new_id)
         typer.echo(new_id)
         typer.echo(

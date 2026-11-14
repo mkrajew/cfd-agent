@@ -180,6 +180,7 @@ class RunRecord(BaseModel):
     tokens_out: int = Field(default=0, ge=0)
     cost_usd: float = Field(default=0.0, ge=0)
     cost_estimated: bool = False
+    repair_mode: Literal["fresh", "in_place"] = "fresh"  # runs of both modes are never mixed
     wall_seconds: float = Field(default=0.0, ge=0)
     critic_verdict: None = None  # filled from M2 on
     comparison: dict[str, Any] | None = None

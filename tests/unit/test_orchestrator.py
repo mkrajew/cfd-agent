@@ -139,6 +139,15 @@ def test_a_good_run_runs_every_step_in_order_and_completes(tmp_path):
     assert "No reference data for this task" in summary
 
 
+def test_the_repair_mode_of_the_configuration_reaches_the_record(tmp_path):
+    fresh = go(tmp_path / "a", FakeStep("one"))
+    assert fresh.record.repair_mode == "fresh"
+    config = RunConfig.default().model_copy(update={"repair_mode": "in_place"})
+    in_place = go(tmp_path / "b", FakeStep("one"), config=config)
+    assert in_place.record.repair_mode == "in_place"
+    assert read_record(RunDir(in_place.run_dir)).repair_mode == "in_place"
+
+
 def test_failed_stage_stops_pipeline_and_records_reason(tmp_path):
     first = FakeStep("one")
     second = FakeStep("two", ok=False, reason="stage 'two' failed after 3 attempts; last errors: x")

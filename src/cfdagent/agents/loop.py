@@ -355,11 +355,17 @@ class _StageRun(ModelConversation):
     def _relative(self, path: Path) -> str:
         return self.ctx.run.relative(path) + "/"
 
-    def _start_attempt(self) -> None:
+    def _start_attempt(self, previous_dir: Path | None = None) -> list[str]:
+        """Prepare the directory of the next attempt. With ``previous_dir`` (a retry) and repair
+        mode ``in_place`` the agent's files of that attempt are carried over; the files carried
+        (run-relative) are returned."""
         number = self.attempts + 1
+        carried: list[str] = []
         with internal("preparing the attempt directory"):
             self.attempt_dir = self.ctx.run.attempt_dir(self.stage.name, number)
             self.stage.prepare_attempt(self.ctx, self.attempt_dir)
+            if previous_dir is not None and self.ctx.config.repair_mode == "in_place":
+                carried = self.stage.carry_over(self.ctx, previous_dir, self.attempt_dir)
         self.attempt_started = self.ctx.clock()
         self.turns = 0
         self.did_work = False
@@ -381,6 +387,7 @@ class _StageRun(ModelConversation):
         for tool in extra:
             registry.add(tool)
         self.registry = registry
+        return carried
 
     def _attempt_note(self) -> str:
         return (
@@ -424,13 +431,15 @@ class _StageRun(ModelConversation):
             self.no_retry = True
             self._progress()
             return text + "\nNo retry: another attempt of this stage cannot fix this failure."
-        previous = self._relative(self.attempt_dir)
-        self._start_attempt()
+        previous_dir = self.attempt_dir
+        previous = self._relative(previous_dir)
+        carried = self._start_attempt(previous_dir)
         self._progress()
         return (
-            f"{text}\n\nA fresh attempt directory {self._relative(self.attempt_dir)} is ready "
+            f"{text}\n\nA {'new' if carried else 'fresh'} attempt directory "
+            f"{self._relative(self.attempt_dir)} is ready "
             f"(attempt {self.attempts + 1} of {self.limits.max_attempts_per_stage}). "
-            f"{self.stage.retry_text(previous)}"
+            f"{self.stage.retry_text(previous, carried)}"
         )
 
     # ------------------------------------------------------------------ the loop
