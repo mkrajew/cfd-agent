@@ -62,6 +62,9 @@ class RunConfig(BaseModel):
     task_set: Literal["development", "generality", "ad hoc"] = "ad hoc"
     # Token limit of the Planner's structured (JSON) call; the other calls use ModelConfig.
     planner_structured_max_tokens: int = Field(default=4096, ge=1)
+    # How a retry of a failed stage starts (ADR-0005): ``fresh`` is an empty attempt directory,
+    # ``in_place`` one seeded with the files the agent wrote in the failed attempt.
+    repair_mode: Literal["fresh", "in_place"] = "fresh"
 
     @model_validator(mode="after")
     def _models_cover_exactly_the_agents(self) -> Self:

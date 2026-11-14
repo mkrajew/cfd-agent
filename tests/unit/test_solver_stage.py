@@ -515,6 +515,12 @@ def test_the_retry_text_tells_the_agent_to_run_the_solver_not_to_write_files(tmp
     assert "run_solver" in text and "corrected files" not in text and "write" not in text.lower()
 
 
+def test_the_retry_text_accepts_the_carried_files_of_the_loop(tmp_path):
+    setup = prepared(tmp_path)  # the scope is read-only, so the loop never carries anything
+    text = setup.stage.retry_text("attempts/solver_runner-1/", [])
+    assert text == setup.stage.retry_text("attempts/solver_runner-1/")
+
+
 # ------------------------------------------------------------------ the case the solver runs on
 
 

@@ -295,7 +295,8 @@ class SolverRunnerStage(Stage):
         deterministic: the same case fails the same way."""
         return len(errors) == 1 and errors[0].startswith(NOT_RUN_PREFIX)
 
-    def retry_text(self, previous: str) -> str:
+    def retry_text(self, previous: str, carried: list[str] | None = None) -> str:
+        # The stage's scope is read-only, so nothing is ever carried: ``carried`` is not used.
         return (
             "Call run_solver on the fresh copy of the case, wait for the run to finish and call "
             f"check_stage (the files of the previous attempt stay readable in {previous})."

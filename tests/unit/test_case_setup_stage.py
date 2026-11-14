@@ -341,6 +341,35 @@ def test_prepare_attempt_copies_the_mesh_into_a_fresh_case(tmp_path):
     assert sorted(p.name for p in (again / "case").iterdir()) == ["constant"]
 
 
+def test_case_setup_in_place_keeps_dictionaries_and_fresh_mesh(tmp_path):
+    setup = Setup(tmp_path)
+    first = setup.prepare(1)
+    write_case(setup.ctx, 1)
+    (first / "notes.md").write_text("what I decided\n", encoding="utf-8")
+    (first / "case" / "constant" / "polyMesh" / "points").write_bytes(b"damaged\n")  # a bad mesh
+    (first / "case" / "log.icoFoam").write_text(
+        "solver output\n", encoding="utf-8"
+    )  # not the agent's
+    second = setup.prepare(2)  # the mesh comes from prepare_attempt, as in every mode
+    carried = setup.stage.carry_over(setup.ctx, first, second)
+    prefix = "attempts/case_setup-2/"
+    expected = sorted(
+        f"{prefix}case/{p.relative_to(CASE_FIXTURE).as_posix()}"
+        for p in CASE_FIXTURE.rglob("*")
+        if p.is_file()
+    )
+    assert carried == sorted([*expected, f"{prefix}notes.md"])
+    for rel in ("0/U", "0/p", "constant/transportProperties", "system/fvSolution"):
+        assert (second / "case" / rel).read_bytes() == (CASE_FIXTURE / rel).read_bytes()
+    assert (second / "notes.md").read_text(encoding="utf-8") == "what I decided\n"
+    polymesh = second / "case" / "constant" / "polyMesh"
+    assert sorted(p.name for p in polymesh.iterdir()) == sorted(POLYMESH_FILES)
+    assert (polymesh / "points").read_bytes() == POLYMESH_FILES["points"].encode()  # the fresh one
+    assert not (second / "case" / "log.icoFoam").exists()
+    result = setup.stage.execute_and_gate(setup.ctx, second)  # the carried case passes as it is
+    assert result.ok, result.errors
+
+
 def test_prepare_attempt_needs_the_mesh_and_a_known_solver(tmp_path):
     setup = Setup(tmp_path, with_mesh=False)
     with pytest.raises(ToolFailure, match="case/constant/polyMesh"):

@@ -7,6 +7,9 @@ attempt to its canonical place in the run directory.
 
 from __future__ import annotations
 
+import os
+import shutil
+import stat
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -22,13 +25,14 @@ from cfdagent.llm.client import ChatBackend
 from cfdagent.llm.cost import CostTracker
 from cfdagent.prompts import load_prompt
 from cfdagent.record import RunRecord
-from cfdagent.rundir import RunDir
+from cfdagent.rundir import RunDir, RunDirError, UnsafePath
 from cfdagent.sandbox.client import SandboxClient
 
 if TYPE_CHECKING:
     from cfdagent.agents.casespec import CaseSpec
 
 MIN_INNER_TIMEOUT_S = 1.0  # sandbox calls refuse a timeout of zero or less
+MAX_CARRIED_LISTED = 30  # carried files named in a retry message; the rest is counted
 
 
 @dataclass
@@ -72,6 +76,18 @@ class StageContext:
         return max(MIN_INNER_TIMEOUT_S, min(float(requested_s), self.remaining_s()))
 
 
+def carried_files_text(carried: list[str]) -> str:
+    """The sentence that tells the agent which files of the failed attempt are already in the new
+    attempt directory, and that only the reported problems need fixing (long lists are cut)."""
+    shown = ", ".join(carried[:MAX_CARRIED_LISTED])
+    if len(carried) > MAX_CARRIED_LISTED:
+        shown += f" and {len(carried) - MAX_CARRIED_LISTED} more"
+    return (
+        "The files you wrote in the previous attempt are already in the new directory "
+        f"(copied there): {shown}. Only the problems reported above need fixing."
+    )
+
+
 class Stage(ABC):
     """One pipeline stage. Subclasses set ``name`` (letters, digits, underscores), ``agent`` (a
     key of ``RunConfig.models`` and the prompt file name) and ``scope`` (file access)."""
@@ -95,6 +111,45 @@ class Stage(ABC):
         agent's fault. The default does nothing."""
         return None
 
+    def carry_over(self, ctx: StageContext, previous_dir: Path, attempt_dir: Path) -> list[str]:
+        """Seed the new attempt directory with the agent's files of the failed attempt (repair
+        mode ``in_place``, ADR-0005). Called by the loop right after ``prepare_attempt``, for the
+        second and later attempts of a pass only.
+
+        Copies every regular file of ``previous_dir`` that this stage's scope lets the agent write
+        (writable and not excluded, judged by its path in the new directory); the stage's inputs
+        come from ``prepare_attempt``, never from here. A symbolic link, a path through one, a
+        hidden file and anything else that is not a regular file is left out. Returns the copied
+        files as run-relative paths of the new directory, sorted.
+        """
+        run = ctx.run
+        source_rel = run.relative(previous_dir)
+        target_rel = run.relative(attempt_dir)
+        carried: list[str] = []
+        try:
+            top = run.path(source_rel)
+            # A linked directory is not entered (``followlinks=False``) and a linked file fails
+            # ``run.path`` below, so nothing outside the run directory can be copied.
+            for directory, _names, files in os.walk(top, followlinks=False):
+                for name in sorted(files):
+                    inside = Path(directory, name).relative_to(top).as_posix()
+                    target = f"{target_rel}/{inside}"
+                    try:
+                        if not self.scope.can_write(target):
+                            continue
+                        source = run.path(f"{source_rel}/{inside}")  # refuses links on the way
+                        if not stat.S_ISREG(os.lstat(source).st_mode):
+                            continue
+                        destination = run.path(target)
+                    except UnsafePath:
+                        continue
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, destination, follow_symlinks=False)
+                    carried.append(target)
+        except OSError as exc:
+            raise RunDirError(f"cannot copy {source_rel!r} ({type(exc).__name__})") from None
+        return sorted(carried)
+
     def extra_tools(self, ctx: StageContext, attempt_dir: Path) -> list[Tool]:
         """Stage-specific tools, built afresh for every attempt (``attempt_dir`` is absolute)."""
         return []
@@ -117,9 +172,17 @@ class Stage(ABC):
         ends the stage after the diagnosis. The default is ``True``."""
         return True
 
-    def retry_text(self, previous: str) -> str:
-        """What the agent is told about the fresh attempt directory after a failed gate
-        (``previous`` is the failed attempt's directory, relative to the run directory)."""
+    def retry_text(self, previous: str, carried: list[str] | None = None) -> str:
+        """What the agent is told about the new attempt directory after a failed gate
+        (``previous`` is the failed attempt's directory, relative to the run directory).
+        ``carried`` lists the files ``carry_over`` copied into the new directory; with it the
+        text says they are already there."""
+        if carried:
+            return (
+                f"{carried_files_text(carried)} Leave everything else as it is and add any file "
+                f"that is missing. The previous attempt stays readable in {previous}. Call "
+                "check_stage again when done."
+            )
         return (
             "Write the corrected files there; the files of the previous attempt stay readable in "
             f"{previous}. Call check_stage again when done."

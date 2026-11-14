@@ -40,7 +40,7 @@ from pydantic import BaseModel, Field
 
 from cfdagent.agents.casespec import CaseSpec, OutputSpec
 from cfdagent.agents.gatehelp import last_bytes, names
-from cfdagent.agents.stage import Stage, StageContext
+from cfdagent.agents.stage import Stage, StageContext, carried_files_text
 from cfdagent.agents.tools import FileScope, Tool
 from cfdagent.errors import AgentInputError, ToolFailure
 from cfdagent.executor.protocol import OpResponse, RunScriptArgs, RunUtilityArgs
@@ -516,7 +516,15 @@ class AnalystStage(Stage):
             raise ToolFailure("the analyst needs the CaseSpec; run the planner first")
         return ctx.casespec
 
-    def retry_text(self, previous: str) -> str:
+    def retry_text(self, previous: str, carried: list[str] | None = None) -> str:
+        if carried:
+            return (
+                f"{carried_files_text(carried)} {CASE_NAME}/ is a fresh copy of the solved case; "
+                f"the previous attempt stays readable in {previous}. Results of run_utility from "
+                f"the previous attempt are not carried; run them again if {SCRIPT_NAME} needs "
+                f"them. Update {ANALYSIS_NAME} if your corrections change the numbers it states. "
+                "Call check_stage again when done."
+            )
         return (
             f"Write the corrected {SCRIPT_NAME} and {ANALYSIS_NAME} there ({CASE_NAME}/ is a fresh "
             f"copy of the solved case); the files of the previous attempt stay readable in "

@@ -49,6 +49,14 @@ def test_default_config_models_and_limits():
     assert config.task_set == "ad hoc"
 
 
+def test_repair_mode_defaults_to_fresh_and_accepts_only_the_two_modes():
+    assert RunConfig.default().repair_mode == "fresh"
+    data = RunConfig.default().model_dump()
+    assert RunConfig(**{**data, "repair_mode": "in_place"}).repair_mode == "in_place"
+    with pytest.raises(ValidationError):
+        RunConfig(**{**data, "repair_mode": "inplace"})
+
+
 def test_limits_reject_nonsense():
     for field, value in [
         ("max_ranks", 5),

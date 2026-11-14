@@ -827,6 +827,7 @@ def run_task(
         benchmark_id=config.benchmark_id,
         started_at=started,
         status="running",
+        repair_mode=config.repair_mode,
         models=dict(config.models),
         prompt_versions={agent: load_prompt(agent).version for agent in config.models},
         image_id=config.sandbox.image,

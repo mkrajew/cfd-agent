@@ -106,6 +106,24 @@ def test_record_fields_and_defaults():
         make_record(critic_verdict="approve")
 
 
+def test_the_repair_mode_is_recorded_and_defaults_to_fresh(run):
+    assert make_record().repair_mode == "fresh"
+    record = make_record(repair_mode="in_place")
+    write_record(run, record)
+    assert json.loads((run.root / "run_record.json").read_text())["repair_mode"] == "in_place"
+    assert read_record(run).repair_mode == "in_place"
+    with pytest.raises(ValidationError):
+        make_record(repair_mode="sometimes")
+
+
+def test_old_run_record_without_repair_mode_loads(run):
+    write_record(run, make_record(status="completed", finished_at=NOW))
+    document = json.loads((run.root / "run_record.json").read_text())
+    del document["repair_mode"]
+    (run.root / "run_record.json").write_text(json.dumps(document), encoding="utf-8")
+    assert read_record(run).repair_mode == "fresh"
+
+
 def test_record_redacts_urls_addresses_and_ips_in_free_text():
     record = make_record(
         status="failed",

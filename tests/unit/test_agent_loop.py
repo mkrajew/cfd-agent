@@ -1257,7 +1257,7 @@ class NoRetryStage(DiagnosingStage):
     def retry_after_failure(self, errors):
         return False
 
-    def retry_text(self, previous):
+    def retry_text(self, previous, carried=None):
         return f"custom retry text about {previous}"
 
 
@@ -1301,7 +1301,7 @@ def test_the_default_stage_retries_and_keeps_the_standard_retry_text(tmp_path):
 
 def test_a_stage_can_replace_the_retry_text(tmp_path):
     class Custom(ToyStage):
-        def retry_text(self, previous):
+        def retry_text(self, previous, carried=None):
             return f"custom retry text about {previous}"
 
     steps = [reply(None, check("k1")), reply(None, check("k2"))]
@@ -1318,3 +1318,170 @@ def test_the_resume_message_after_a_diagnosis_is_neutral(tmp_path):
     run_stage(DiagnosingStage([GateResult(False, ["x"]), GateResult(True, [])]), ctx)
     resumed = backend.calls[2].messages[-1]["content"]
     assert "attempt 2 of 3" in resumed and "corrected" not in resumed
+
+
+# ------------------------------------------------------------------ repair_mode (ADR-0005)
+
+
+class RepairStage(ToyStage):
+    """A toy stage whose scope allows scripts and notes but not binaries, and keeps one
+    directory as it was received."""
+
+    scope = FileScope(
+        readable=["attempts/toy-*/*"],
+        writable=["attempts/toy-*/*.py", "attempts/toy-*/notes/*"],
+        excluded=["attempts/toy-*/notes/frozen*"],
+    )
+
+    def __init__(self, gates, junk=()):
+        super().__init__(gates)
+        self.junk = dict(junk)  # relative path -> text, written by the first gate run
+        self.listings: list[list[str]] = []  # what each gate run found in its directory
+        self.carry_calls: list[tuple[str, str]] = []
+
+    def execute_and_gate(self, ctx, attempt_dir) -> GateResult:
+        found = sorted(p.relative_to(attempt_dir).as_posix() for p in attempt_dir.rglob("*"))
+        self.listings.append([name for name in found if (attempt_dir / name).is_file()])
+        if len(self.listings) == 1:
+            for rel, text in self.junk.items():
+                target = attempt_dir / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+        return super().execute_and_gate(ctx, attempt_dir)
+
+    def carry_over(self, ctx, previous_dir, attempt_dir):
+        self.carry_calls.append((previous_dir.name, attempt_dir.name))
+        return super().carry_over(ctx, previous_dir, attempt_dir)
+
+
+def in_place(ctx):
+    ctx.config = ctx.config.model_copy(update={"repair_mode": "in_place"})
+    return ctx
+
+
+def write_a(call_id="w1", path="attempts/toy-1/a.py", content="x = 1\n"):
+    return reply(None, tc("write_file", call_id, path=path, content=content))
+
+
+def test_fresh_mode_is_default_and_unchanged(tmp_path):
+    steps = [write_a(), reply(None, check("k1")), reply(None, check("k2"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    assert ctx.config.repair_mode == "fresh"
+    stage = RepairStage([GateResult(False, ["bad"]), GateResult(True, [])], junk={"j.bin": "x"})
+    assert run_stage(stage, ctx).ok
+    assert stage.listings == [["a.py"], []]  # attempt 2 starts empty
+    assert stage.carry_calls == []  # the hook is not even called
+    shown = tool_messages(2, backend)[-1]["content"]
+    assert "Write the corrected files there" in shown
+    assert "already in the new directory" not in shown
+
+
+def test_in_place_seeds_only_writable_files(tmp_path):
+    steps = [write_a(), reply(None, check("k1")), reply(None, check("k2"))]
+    ctx, _ = make_ctx(tmp_path, steps)
+    stage = RepairStage(
+        [GateResult(False, ["bad"]), GateResult(True, [])], junk={"junk.bin": "binary"}
+    )
+    assert run_stage(stage, in_place(ctx)).ok
+    assert stage.listings == [["a.py"], ["a.py"]]  # junk.bin was in attempt 1 and is not carried
+    first = ctx.run.root / "attempts" / "toy-1"
+    second = ctx.run.root / "attempts" / "toy-2"
+    assert (first / "junk.bin").exists() and not (second / "junk.bin").exists()
+    assert (second / "a.py").read_text(encoding="utf-8") == "x = 1\n"
+    assert (first / "a.py").read_text(encoding="utf-8") == "x = 1\n"  # the earlier attempt stays
+    (stage_record,) = ctx.record.stages
+    assert [(a.n, a.ok) for a in stage_record.attempts] == [(1, False), (2, True)]
+
+
+def test_in_place_respects_excluded_patterns(tmp_path):
+    steps = [
+        write_a(),
+        reply(None, tc("write_file", "w2", path="attempts/toy-1/notes/n.txt", content="n")),
+        reply(None, check("k1")),
+        reply(None, check("k2")),
+    ]
+    ctx, _ = make_ctx(tmp_path, steps)
+    stage = RepairStage(
+        [GateResult(False, ["bad"]), GateResult(True, [])],
+        junk={"notes/frozen.txt": "kept as received", "notes/frozen/deep.txt": "x"},
+    )
+    assert run_stage(stage, in_place(ctx)).ok
+    assert stage.listings[1] == ["a.py", "notes/n.txt"]
+
+
+def test_in_place_carries_only_for_attempts_after_the_first(tmp_path):
+    steps = [
+        write_a(),
+        reply(None, check("k1")),
+        reply(None, check("k2")),
+        reply(None, check("k3")),
+    ]
+    ctx, _ = make_ctx(tmp_path, steps)
+    stage = RepairStage(
+        [GateResult(False, ["bad"]), GateResult(False, ["bad"]), GateResult(True, [])]
+    )
+    assert run_stage(stage, in_place(ctx)).ok
+    assert stage.carry_calls == [("toy-1", "toy-2"), ("toy-2", "toy-3")]
+    assert stage.listings == [["a.py"], ["a.py"], ["a.py"]]  # carried on from attempt to attempt
+
+
+def test_in_place_retry_text_lists_carried_files(tmp_path):
+    steps = [write_a(), reply(None, check("k1")), reply(None, check("k2"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    stage = RepairStage([GateResult(False, ["bad"]), GateResult(True, [])])
+    assert run_stage(stage, in_place(ctx)).ok
+    shown = tool_messages(2, backend)[-1]["content"]
+    assert "attempts/toy-2/a.py" in shown
+    assert "already in the new directory" in shown
+    assert "Only the problems reported above need fixing" in shown
+    assert "attempts/toy-1/" in shown  # the failed attempt stays readable
+    assert "Write the corrected files there" not in shown
+
+
+def test_the_default_retry_text_without_carried_files_is_unchanged():
+    stage = ToyStage([])
+    plain = stage.retry_text("attempts/toy-1/")
+    assert plain == stage.retry_text("attempts/toy-1/", None)
+    assert plain == stage.retry_text("attempts/toy-1/", [])  # nothing was carried
+    listed = stage.retry_text("attempts/toy-1/", ["attempts/toy-2/a.py", "attempts/toy-2/b.py"])
+    assert "attempts/toy-2/a.py, attempts/toy-2/b.py" in listed
+
+
+def test_a_long_list_of_carried_files_is_shortened_in_the_retry_text():
+    carried = [f"attempts/toy-2/f{i:03d}.py" for i in range(200)]
+    text = ToyStage([]).retry_text("attempts/toy-1/", carried)
+    assert "f000.py" in text and "f199.py" not in text and "more" in text
+    assert len(text) < 3000
+
+
+def test_carry_over_does_not_copy_symbolic_links(tmp_path):
+    ctx, _ = make_ctx(tmp_path, [])
+    previous = ctx.run.attempt_dir("toy", 1)
+    attempt = ctx.run.attempt_dir("toy", 2)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.py").write_text("secret\n", encoding="utf-8")
+    (previous / "a.py").write_text("x = 1\n", encoding="utf-8")
+    try:
+        os.symlink(outside / "secret.py", previous / "link.py")
+        os.symlink(outside, previous / "notes", target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links are not available here")
+    carried = RepairStage([]).carry_over(ctx, previous, attempt)
+    assert carried == ["attempts/toy-2/a.py"]
+    assert sorted(p.name for p in attempt.iterdir()) == ["a.py"]
+    assert (outside / "secret.py").read_text(encoding="utf-8") == "secret\n"
+
+
+def test_carry_over_returns_run_relative_paths_of_the_new_files(tmp_path):
+    ctx, _ = make_ctx(tmp_path, [])
+    previous = ctx.run.attempt_dir("toy", 1)
+    attempt = ctx.run.attempt_dir("toy", 2)
+    (previous / "notes").mkdir()
+    (previous / "notes" / "n.txt").write_text("n", encoding="utf-8")
+    (previous / "b.py").write_text("b\n", encoding="utf-8")
+    (previous / ".hidden.py").write_text("h\n", encoding="utf-8")  # hidden: never writable
+    carried = RepairStage([]).carry_over(ctx, previous, attempt)
+    assert carried == ["attempts/toy-2/b.py", "attempts/toy-2/notes/n.txt"]
+    assert (attempt / "notes" / "n.txt").read_text(encoding="utf-8") == "n"
+    assert not (attempt / ".hidden.py").exists()

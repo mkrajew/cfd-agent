@@ -254,6 +254,23 @@ def test_the_default_model_keeps_the_default_effort(runner, root, fake_run_task,
     assert fake_run_task.calls[0]["config"].models == default.models
 
 
+def test_repair_mode_in_record_and_cli(runner, root, fake_run_task, task_file):
+    assert invoke(runner, "run", str(task_file)).exit_code == 0
+    assert fake_run_task.calls[0]["config"].repair_mode == "fresh"  # the default
+    result = invoke(runner, "run", str(task_file), "--repair-mode", "in_place")
+    assert result.exit_code == 0, result.output
+    assert fake_run_task.calls[1]["config"].repair_mode == "in_place"
+    result = invoke(runner, "run", str(task_file), "--repair-mode", "fresh")
+    assert result.exit_code == 0, result.output
+    assert fake_run_task.calls[2]["config"].repair_mode == "fresh"
+
+
+def test_an_invalid_repair_mode_is_a_usage_error(runner, root, fake_run_task, task_file):
+    result = invoke(runner, "run", str(task_file), "--repair-mode", "sometimes")
+    assert result.exit_code == 2
+    assert fake_run_task.calls == []
+
+
 def test_the_sandbox_image_comes_from_the_environment(
     runner, root, monkeypatch, fake_run_task, task_file
 ):
@@ -1084,6 +1101,8 @@ def test_detach_passes_the_options_on_and_never_the_benchmark_to_a_file(
         "Llama-3.3-70B-Instruct",
         "--reasoning-effort",
         "low",
+        "--repair-mode",
+        "in_place",
         "--no-upload",
         "--detach",
     )
@@ -1093,6 +1112,7 @@ def test_detach_passes_the_options_on_and_never_the_benchmark_to_a_file(
     assert argv[argv.index("--benchmark") + 1] == "bench-one"
     assert argv[argv.index("--model") + 1] == "Llama-3.3-70B-Instruct"
     assert argv[argv.index("--reasoning-effort") + 1] == "low"
+    assert argv[argv.index("--repair-mode") + 1] == "in_place"
     assert "--no-upload" in argv
     assert "bench-one" not in run_id  # the id comes from the task text
     for path in root.rglob("*"):
