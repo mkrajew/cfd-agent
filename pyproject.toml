@@ -57,6 +57,7 @@ markers = [
     "integration: tests that need external tools (Docker, OpenFOAM, Gmsh) or services",
     "sandbox: tests that start real hardened executor containers (need Docker and the image)",
     "e2e: end-to-end runs of the full pipeline",
+    "calibration: hand-written benchmark solutions, long, run manually in the image",
 ]
 
 [tool.ruff]

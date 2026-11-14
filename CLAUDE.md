@@ -80,6 +80,13 @@ uv run pytest -m sandbox tests/sandbox              # sandbox tests drive real c
 docker run --rm -v "$PWD:/work" -w /work cfdagent:dev pytest -m integration tests/integration
 ```
 
+Calibration (a hand-written solution of a benchmark through the toolchain and the Scorer; minutes, no LLM, run in the image; Git Bash needs the `MSYS_NO_PATHCONV=1` prefix):
+
+```bash
+MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/work" -w /work cfdagent:dev pytest -m calibration tests/calibration/test_cavity_re1000.py -s
+MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/work" -w /work cfdagent:dev python scripts/run_calibration.py tests/fixtures/handwritten/cavity_re1000 --benchmark cavity-re1000   # prints the Scorer table; --keep DIR keeps the work directory
+```
+
 The command-line interface (`uv run cfdagent ...` on a development machine, plain `cfdagent` on the VM, where `/usr/local/bin/cfdagent` loads `/etc/cfdagent/env`). A live run calls the model and costs money, so rule 4 applies; it needs Docker, the sandbox image (`CFDAGENT_IMAGE`, default `cfdagent:runtime`) and `CFDAGENT_LLM_ENDPOINT`:
 
 ```bash

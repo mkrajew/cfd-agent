@@ -1,0 +1,91 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      controlDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+application     simpleFoam;
+
+startFrom       startTime;
+
+startTime       0;
+
+stopAt          endTime;
+
+// Steady solver: "time" is the iteration counter and deltaT = 1 is the iteration step.
+// endTime is only a safety cap on the number of SIMPLE iterations. The run is meant to end
+// earlier, by the residualControl of the SIMPLE dictionary in fvSolution ("SIMPLE solution
+// converged in N iterations"). Measured with that residualControl: 1094 iterations on the
+// 128 x 128 mesh of mesh.py (483 / 770 / 1466 / 2723 on 64 / 96 / 160 / 256 cells per side; the
+// count grows slightly faster than in proportion to the number of cells per side). The cap of
+// 20000 is about 18 times the count at N = 128, so a run that reaches it did not converge; it is
+// not a number of iterations to rely on.
+deltaT          1;
+
+endTime         20000;
+
+writeControl    timeStep;
+
+// Write rarely: the sets function object below writes at every write time, and the final write
+// happens when residualControl stops the run, so the sampled time is always the last iteration.
+writeInterval   5000;
+
+purgeWrite      0;
+
+writeFormat     ascii;
+
+writePrecision  8;
+
+writeCompression off;
+
+timeFormat      general;
+
+timePrecision   6;
+
+runTimeModifiable false;
+
+functions
+{
+    // Centrelines through the geometric centre of the cavity, sampled over the FULL range
+    // [0, 1] so that the end points lie on the walls. z = 0.05 is mid-thickness of the single
+    // cell layer (0 <= z <= 0.1). 129 points: spacing 1/128 (the reference profiles of the
+    // benchmark have their own, irregular spacing; the scorer interpolates linearly).
+    // cellPoint interpolation: the profile follows linear interpolation of point values, and
+    // the point values on a wall are the boundary-condition values, so the end points carry the
+    // wall values (u = 1 on the lid, 0 on the fixed walls) without anything being added later.
+    centrelines
+    {
+        type                sets;
+        libs                (sampling);
+        writeControl        writeTime;
+        interpolationScheme cellPoint;
+        setFormat           raw;
+        fields              (U);
+
+        sets
+        (
+            verticalCentreline
+            {
+                type        uniform;
+                axis        y;
+                start       (0.5 0 0.05);
+                end         (0.5 1 0.05);
+                nPoints     129;
+            }
+
+            horizontalCentreline
+            {
+                type        uniform;
+                axis        x;
+                start       (0 0.5 0.05);
+                end         (1 0.5 0.05);
+                nPoints     129;
+            }
+        );
+    }
+}
+
+// ************************************************************************* //

@@ -1,0 +1,53 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      fvSchemes;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// Steady state: there is no time derivative; the iteration is pseudo-time stepping only.
+ddtSchemes
+{
+    default         steadyState;
+}
+
+gradSchemes
+{
+    default         Gauss linear;
+    grad(p)         Gauss linear;
+}
+
+// Convection of momentum: second-order linear-upwind with the gradient of U. The cell Reynolds
+// number is U dx / nu = 1 * (1/N) / 0.001 = 1000 / N, which is above 2 on every mesh of order 100
+// cells per side (see N_IN_PLANE in mesh.py); linear-upwind is second-order accurate and robust
+// at such cell Reynolds numbers. First-order upwind would be stable but its numerical diffusion
+// (U dx / 2 = 0.5 / N, several times the physical viscosity of 0.001 at N = 128) smears the
+// profiles: measured error 0.07 at N = 128, above the acceptance threshold of 0.05.
+// "bounded" subtracts the continuity error (div(phi) U), which only matters while the
+// iteration is unconverged and keeps it stable.
+divSchemes
+{
+    default         none;
+    div(phi,U)      bounded Gauss linearUpwind grad(U);
+    div((nuEff*dev2(T(grad(U))))) Gauss linear;
+}
+
+// The mesh is a uniform orthogonal grid: no non-orthogonal correction is needed.
+laplacianSchemes
+{
+    default         Gauss linear orthogonal;
+}
+
+interpolationSchemes
+{
+    default         linear;
+}
+
+snGradSchemes
+{
+    default         orthogonal;
+}
+
+// ************************************************************************* //
