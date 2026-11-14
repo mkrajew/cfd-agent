@@ -35,4 +35,4 @@ Every infra change is accompanied by a cost estimate in the commit or PR descrip
 
 Reference prices: VM `Standard_D4as_v4` (belgiumcentral) $0.208/h; `gpt-oss-120b` $0.15 per 1M input tokens and $0.60 per 1M output tokens.
 
-Envelopes (owner's decision, 2026-10-28): M0-M2 development at most $30; M3 campaign at most $45; reserve about $25 is never spent without a separate decision. Track spend from run records and report it at each milestone.
+Envelopes (owner's decision, 2026-10-28): M0-M2 development at most $30; M3 campaign at most $45; reserve about $25 is never spent without a separate decision. Note, 2026-11-14: the owner raised the M0-M2 envelope to $35. Track spend from run records and report it at each milestone.

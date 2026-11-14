@@ -1,6 +1,6 @@
 # ADR-0004: No Solver Runner convergence gate in M1
 
-- **Status:** Accepted, 2026-11-06
+- **Status:** Superseded by ADR-0006 (2026-11-14)
 - **Deciders:** the owner
 
 ## Context
