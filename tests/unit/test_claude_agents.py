@@ -55,24 +55,44 @@ def _matches(kind: str, tool: str, command: str) -> bool:
     return any(t == tool and fnmatchcase(command, pat) for t, pat in _rules(kind))
 
 
-AZ_CMD = r'"C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd" vm create'
-PUSH_COMMANDS = ["git push", "git push origin main", "git -C /x push origin main"]
-AZ_COMMANDS = ["az vm create -g x", AZ_CMD, "az deployment group what-if -g x", f"& {AZ_CMD}"]
+IRREVERSIBLE_AZ = [
+    "group delete -n rg-cfdagent --yes",
+    "storage account delete -n x -g rg-cfdagent",
+    "storage container delete -n runs --account-name x",
+]
+AZ_EXE = r'"C:\Program Files\Microsoft SDKs\Azure\CLI2\wbin\az.cmd"'
+AZ_VM_CREATE = AZ_EXE + " vm create"
+AZ_FORMS = ["az {c}", AZ_EXE + " {c}"]
+FORCE_PUSHES = [
+    "git push --force origin x",
+    "git push origin x --force-with-lease",
+    "git push -f origin x",
+]
 
 
-def test_no_allow_rule_matches_git_push():
+def test_push_is_allowed_to_origin_but_never_forced():
+    """Owner's decision of 2026-11-14: a push to origin does not prompt; force pushes are denied."""
     for tool in ("Bash", "PowerShell"):
-        for command in PUSH_COMMANDS:
-            assert not _matches("allow", tool, command), (tool, command)
-            assert _matches("ask", tool, command), (tool, command)
+        assert _matches("allow", tool, "git push origin docs/x"), tool
+        assert not _matches("ask", tool, "git push origin docs/x"), tool
+        for command in FORCE_PUSHES:
+            assert _matches("deny", tool, command), (tool, command)
 
 
-def test_every_az_invocation_asks_and_is_never_allowed():
-    for command in AZ_COMMANDS:
-        assert _matches("ask", "Bash", command), command
-        assert not _matches("allow", "Bash", command), command
-    assert _matches("ask", "PowerShell", f"& {AZ_CMD}")
-    assert _matches("ask", "PowerShell", "az vm create -g x")
+def test_az_runs_without_a_prompt_except_irreversible_deletes():
+    """Standing approval of rule 4 in CLAUDE.md: az is allowed, nothing asks, deletes of the
+    resource group, the storage account and containers are denied (deny wins over allow)."""
+    assert _rules("ask") == []
+    for tool in ("Bash", "PowerShell"):
+        for command in ("az vm create -g x", AZ_VM_CREATE, "az deployment group what-if -g x"):
+            assert _matches("allow", tool, command), (tool, command)
+        for form in AZ_FORMS:
+            for tail in IRREVERSIBLE_AZ:
+                command = form.format(c=tail)
+                assert _matches("deny", tool, command), (tool, command)
+        # Legitimate neighbours are not caught by the deny rules.
+        for tail in ("cognitiveservices account show -n x", "storage account show -n x"):
+            assert not _matches("deny", tool, f"az {tail}"), (tool, tail)
 
 
 def test_project_commands_are_allowed():

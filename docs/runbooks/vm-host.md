@@ -2,8 +2,8 @@
 
 Applies to the project VM `vm-cfdagent`. It covers `scripts/vm-host-setup.sh` and the files it installs from
 `infra/vm/`, the container-scoped blob role in `infra/modules/roles.bicep`, and how to verify and roll back
-each of them. Read `infra/CLAUDE.md` first: creating, changing or deleting Azure resources needs the owner's
-explicit approval; starting and deallocating the VM inside the approved envelope does not.
+each of them. Read `infra/CLAUDE.md` first: Azure work follows the standing approval of rule 4 in `CLAUDE.md` (announce the
+task to the owner, then work); the exceptions listed there still need explicit approval.
 
 Values in angle brackets are placeholders. Nothing here is committed with real values: take them from the
 deployment outputs or from your own machine.
@@ -21,7 +21,7 @@ from `infra/vm/cloud-init.yaml` (through `infra/modules/vm.bicep`), so both path
 | sshd drop-in `20-cfdagent-ssh-extra.conf` | `vm-host-setup.sh`, guarded by `sshd -t` | cloud-init |
 | `idle-shutdown.sh --daily`, daily service, daily timer with the 10-minute retry | `vm-host-setup.sh` | cloud-init |
 | State and runs directories owned by the admin user | `vm-host-setup.sh` | cloud-init |
-| Container-scoped blob role, Entra-only AI account | Bicep deployment (owner approval) | Bicep deployment |
+| Container-scoped blob role, Entra-only AI account | Bicep deployment (standing approval) | Bicep deployment |
 
 The cost of everything in this runbook is zero: no Azure resource is created. The VM bills $0.208/h while it
 runs (about 0.5 h for the setup and the checks, about $0.10).
@@ -87,8 +87,8 @@ az vm run-command invoke --resource-group rg-cfdagent --name vm-cfdagent --comma
     --scripts "@<path-to-wrapper>.sh"
 ```
 
-`run-command` is a write operation on the VM (it needs the same approval as any `az` call that changes
-something). Its output is cut to the last few kilobytes: the summary at the end is what you see. Only one
+`run-command` is a write operation on the VM (it falls under the standing approval of rule 4 in `CLAUDE.md`:
+announce the task to the owner first). Its output is cut to the last few kilobytes: the summary at the end is what you see. Only one
 run-command can run at a time on a VM.
 
 ### 2.3 Options and behaviour
@@ -214,7 +214,7 @@ below are done, the VM identity still has Storage Blob Data Contributor on the w
 - Cost: no new billable resource (role assignments and the account setting are free); expected change in the
   monthly estimate: none.
 - Order: (1) `infra/scripts/deploy.ps1 -WhatIfOnly` (pass `budgetStartDate=2026-10-01T00:00:00Z` if the date is
-  after 1 November), (2) owner approval, (3) deploy, (4) verify, (5) with a second approval, delete the old
+  after 1 November), (2) announce to the owner, (3) deploy, (4) verify, (5) delete the old
   account-scoped assignment.
 - Expected what-if: the AI account changes `disableLocalAuth` to true; one new role assignment (Storage Blob
   Data Contributor for the VM identity, scope `.../containers/runs`); nothing else. The old assignment at the
@@ -246,7 +246,7 @@ Step 5 was done on 2026-11-08 with the owner's approval: only the `runs` contain
 replay uploaded 253 files afterwards (a few minutes after the deletion; role changes can take up to about 10 minutes
 to propagate, so the first live run is the stronger confirmation).
 
-Step 5 (after approval): delete the assignment whose scope is the storage account and whose role is
+Step 5 (after the verification): delete the assignment whose scope is the storage account and whose role is
 `Storage Blob Data Contributor` for the VM principal: `az role assignment delete --assignee <vm-principal-id>
 --role "Storage Blob Data Contributor" --scope <storage-account-resource-id>`. Check with the list command
 above that only the `runs` container assignment remains.
@@ -259,8 +259,8 @@ above that only the `runs` container assignment remains.
 | Firewall | `systemctl disable --now cfdagent-iptables` (the stop action removes the rules); remove `/etc/systemd/system/cfdagent-iptables.service` and `/usr/local/sbin/cfdagent-iptables` for a full removal, then `systemctl daemon-reload` |
 | Deferral | edit `/etc/systemd/system/cfdagent-daily-shutdown.service` so that ExecStart ends in `--force`, remove the `OnUnitActiveSec` line from the timer, `systemctl daemon-reload && systemctl restart cfdagent-daily-shutdown.timer` |
 | Host environment | `rm -r /opt/cfdagent-host /opt/cfdagent-src /usr/local/bin/cfdagent /etc/cfdagent` |
-| Blob role | re-create the account-scoped assignment (Bicep: `scope: storage` in `roles.bicep`); needs approval |
-| Entra-only | `disableLocalAuth=false` in the parameters, redeploy; needs approval |
+| Blob role | re-create the account-scoped assignment (Bicep: `scope: storage` in `roles.bicep`); standing approval |
+| Entra-only | `disableLocalAuth=false` in the parameters, redeploy; standing approval |
 
 If an SSH change locks you out, the VM can still be reached through `az vm run-command invoke` (no SSH) to
 remove the drop-in.
