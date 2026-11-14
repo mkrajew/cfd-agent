@@ -16,9 +16,14 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from foam_cases import BLOCK_MESH_DICT, build_case
+from foam_cases import BLOCK_MESH_DICT, CONTROL_DICT, build_case
 
-from cfdagent.tools.foam_results import load_case, read_solver_log
+from cfdagent.tools.foam_results import (
+    FoamResultsError,
+    load_case,
+    read_function_object,
+    read_solver_log,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -210,3 +215,101 @@ def test_a_post_script_runs_in_a_clean_working_directory(solved, tmp_path):
     assert data["iterations"] == 50
     assert len(data["profile"]["x"]) == 21
     assert data["profile"]["x"] == sorted(data["profile"]["x"])
+
+
+FOAM_HEADER = "FoamFile { version 2.0; format ascii; class dictionary; object %s; }\n"
+
+FUNCTIONS = """
+functions
+{
+    wallForces
+    {
+        type forces; libs (forces); patches (movingWall fixedWalls);
+        rho rhoInf; rhoInf 1; CofR (0.5 0.5 0.05);
+        writeControl timeStep; writeInterval 1;
+    }
+    wallCoeffs
+    {
+        type forceCoeffs; libs (forces); patches (movingWall fixedWalls);
+        rho rhoInf; rhoInf 1; CofR (0.5 0.5 0.05);
+        liftDir (0 1 0); dragDir (1 0 0); pitchAxis (0 0 1); magUInf 1; lRef 1; Aref 0.1;
+        writeControl timeStep; writeInterval 1;
+    }
+    probePoints
+    {
+        type probes; libs (sampling); fields (p U);
+        probeLocations ((0.5 0.5 0.05) (0.2 0.2 0.05));
+        writeControl timeStep; writeInterval 1;
+    }
+}
+"""
+
+PIMPLE_SOLUTION = """solvers
+{
+    p { solver PCG; preconditioner DIC; tolerance 1e-8; relTol 0.05; }
+    pFinal { $p; relTol 0; }
+    "(U|UFinal)" { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-8; relTol 0; }
+}
+PIMPLE { nOuterCorrectors 1; nCorrectors 2; nNonOrthogonalCorrectors 0; pRefCell 0; pRefValue 0; }
+"""
+
+
+@pytest.fixture(scope="module")
+def forces_case(tmp_path_factory):
+    """A few pimpleFoam steps of the small 2D case with forces, forceCoeffs and probes."""
+    case = build_case(tmp_path_factory.mktemp("forces"), end_time=0.02)
+    control = CONTROL_DICT.format(end_time=0.02).replace("icoFoam", "pimpleFoam")
+    (case / "system" / "controlDict").write_text(control + FUNCTIONS, encoding="utf-8")
+    (case / "system" / "fvSolution").write_text(
+        FOAM_HEADER % "fvSolution" + PIMPLE_SOLUTION, encoding="utf-8"
+    )
+    schemes = case / "system" / "fvSchemes"
+    schemes.write_text(
+        schemes.read_text(encoding="utf-8").replace(
+            "div(phi,U)      Gauss linear;",
+            "div(phi,U)      Gauss linear;\n    div((nuEff*dev2(T(grad(U))))) Gauss linear;",
+        ),
+        encoding="utf-8",
+    )
+    (case / "constant" / "transportProperties").write_text(
+        FOAM_HEADER % "transportProperties" + "transportModel Newtonian;\nnu 0.01;\n",
+        encoding="utf-8",
+    )
+    (case / "constant" / "turbulenceProperties").write_text(
+        FOAM_HEADER % "turbulenceProperties" + "simulationType laminar;\n", encoding="utf-8"
+    )
+    run(["pimpleFoam"], case)
+    return case
+
+
+def test_forces_table_from_real_pimplefoam_run(forces_case):
+    with pytest.raises(FoamResultsError, match="force.dat") as ambiguous:
+        read_function_object(forces_case, "wallForces")  # force.dat and moment.dat
+    assert "moment.dat" in str(ambiguous.value)
+    forces = read_function_object(forces_case, "wallForces", file="force.dat")
+    assert forces.columns == [
+        "Time",
+        "total_x", "total_y", "total_z",
+        "pressure_x", "pressure_y", "pressure_z",
+        "viscous_x", "viscous_y", "viscous_z",
+    ]  # fmt: skip
+    assert forces.column("Time") == pytest.approx([0.005, 0.01, 0.015, 0.02])
+    total, pressure, viscous = (forces.column(f"{n}_x") for n in ("total", "pressure", "viscous"))
+    assert total == pytest.approx(pressure + viscous, rel=1e-6, abs=1e-9)
+    assert np.abs(viscous).max() > 0  # the lid drags on the fluid: a real, non-zero force
+    assert forces.column("total_z") == pytest.approx(np.zeros(4), abs=1e-12)  # 2D case
+
+    # the coefficients file of the same run: Cd = Fx / (0.5 rho U^2 Aref), names with parentheses
+    coefficients = read_function_object(forces_case, "wallCoeffs", file="coefficient")
+    assert {"Cd", "Cd(f)", "Cd(r)", "Cl"} <= set(coefficients.columns)
+    assert coefficients.column("Time") == pytest.approx(forces.column("Time"))
+    assert coefficients.column("Cd") == pytest.approx(total / (0.5 * 0.1), rel=1e-6)
+
+
+def test_probe_tables_from_real_pimplefoam_run(forces_case):
+    vectors = read_function_object(forces_case, "probePoints", file="U")
+    assert vectors.columns == ["Time", "0_x", "0_y", "0_z", "1_x", "1_y", "1_z"]
+    assert vectors.column("0_x").shape == (4,) and np.isfinite(vectors.data).all()
+    scalars = read_function_object(forces_case, "probePoints", file="p")
+    assert scalars.columns == ["Time", "0", "1"]
+    assert scalars.column("Time") == pytest.approx(vectors.column("Time"))

@@ -13,6 +13,15 @@ The Analyst's ``post.py`` imports this module instead of writing its own parser:
     line.s, line.value                        # distance from the start, values (NaN outside)
     log = read_solver_log("case")             # residuals, iteration count, convergence line
 
+Histories written by function objects (``postProcessing/<name>/<start time>/<file>``) come as a
+table, and two helpers turn a history into numbers::
+
+    forces = read_function_object("case", "<name>", file="force.dat")   # restarts are joined
+    forces.columns                            # "Time", then the names of the header line
+    t, fx = forces.column("Time"), forces.column("total_x")
+    f = dominant_frequency(t, fx)             # oscillation frequency, first half skipped
+    mean = period_average(t, fx, f)           # average over the last whole periods
+
 What it reads: the ASCII files that the pipeline's cases are written in (``writeFormat ascii``,
 optionally ``.gz``) in the root time directories; ``processor*/`` directories are ignored. The mesh
 geometry (cell centres, volumes, face centres and areas) is rebuilt from
@@ -49,12 +58,16 @@ from cfdagent.tools.foam import parse_solver_log_file
 __all__ = [
     "FoamCase",
     "FoamResultsError",
+    "FunctionObjectTable",
     "LineSample",
     "Patch",
     "SolverLog",
+    "dominant_frequency",
     "latest_time",
     "list_times",
     "load_case",
+    "period_average",
+    "read_function_object",
     "read_solver_log",
 ]
 
@@ -932,3 +945,395 @@ def read_solver_log(path: Path | str) -> SolverLog:
     raise FoamResultsError(
         f"no solver log (a log.* file with 'Solving for' lines) in {target}; found: {found}"
     )
+
+
+# --------------------------------------------------------------------------------------------
+# Function-object tables (postProcessing/<name>/<start time>/<file>)
+# --------------------------------------------------------------------------------------------
+
+_COMPONENT_SUFFIXES = {
+    1: (),
+    3: ("x", "y", "z"),
+    6: ("xx", "xy", "xz", "yy", "yz", "zz"),
+    9: ("xx", "xy", "xz", "yx", "yy", "yz", "zx", "zy", "zz"),
+}
+_HEADER_TOKEN_RE = re.compile(r"([^\s()]+)\(([^()]*)\)|\(([^()]*)\)|([^\s()]+)")
+
+
+@dataclass(frozen=True)
+class FunctionObjectTable:
+    """The columns of a function-object file: ``data`` is ``(n_rows, len(columns))``.
+
+    The first column is the time and is named ``Time``. ``column(name)`` returns one column as a
+    new ``(n_rows,)`` array and lists the available names when ``name`` is unknown.
+    """
+
+    columns: list[str]
+    data: np.ndarray = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if self.data.ndim != 2 or self.data.shape[1] != len(self.columns):
+            raise FoamResultsError(
+                f"the table has {len(self.columns)} columns but data of shape {self.data.shape}"
+            )
+
+    def column(self, name: str) -> np.ndarray:
+        """The values of column ``name`` as a new array (a case-only difference is accepted when
+        it is unambiguous)."""
+        if name in self.columns:
+            return self.data[:, self.columns.index(name)].copy()
+        folded = [i for i, column in enumerate(self.columns) if column.lower() == str(name).lower()]
+        if len(folded) == 1:
+            return self.data[:, folded[0]].copy()
+        raise FoamResultsError(
+            f"no column {name!r} in the table; available columns: {', '.join(self.columns)}"
+        )
+
+
+def _header_names(comment: str) -> list[str]:
+    """Names of the columns after ``Time`` in a header comment (the text after the ``#``).
+
+    A plain word is one name. ``a(b c)`` and ``(b c)`` are groups: ``a_b a_c`` and ``b c``. A
+    name with a single word in parentheses, such as ``Cd(f)``, is kept whole.
+    """
+    names: list[str] = []
+    for prefix, inner, bare, word in _HEADER_TOKEN_RE.findall(comment):
+        if word:
+            names.append(word)
+        elif bare or (prefix and len(inner.split()) != 1):
+            words = (bare or inner).split()
+            names.extend(f"{prefix}_{w}" if prefix else w for w in words)
+        else:
+            names.append(f"{prefix}({inner.strip()})")
+    return names[1:]  # the first word is Time
+
+
+def _token_widths(line: str) -> list[int]:
+    """Number of values in each top-level token of a data line after the time: a plain number
+    is 1, a balanced parenthesis group (possibly nested) counts its numbers."""
+    tokens: list[str] = []
+    depth, start = 0, None
+    for i, char in enumerate(line):
+        if char == "(":
+            start = i if start is None else start
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0 and start is not None:
+                tokens.append(line[start : i + 1])
+                start = None
+        elif depth == 0:
+            if char.isspace():
+                if start is not None:
+                    tokens.append(line[start:i])
+                    start = None
+            elif start is None:
+                start = i
+    if start is not None:
+        tokens.append(line[start:])
+    return [len(t.replace("(", " ").replace(")", " ").split()) for t in tokens[1:]]
+
+
+def _latest_rows(data: np.ndarray) -> np.ndarray:
+    """Rows of ``data`` (time first) after a restart: a row is dropped when a later row has the
+    same or an earlier time, so the times are strictly increasing."""
+    times = data[:, 0]
+    later_min = np.append(np.minimum.accumulate(times[::-1])[::-1][1:], np.inf)
+    return data[times < later_min]
+
+
+def _parse_table_text(text: str, what: str) -> tuple[list[str], np.ndarray]:
+    """``(column names, data)`` of one function-object file; ``what`` names it in messages."""
+    names: list[str] | None = None
+    rows: list[list[float]] = []
+    first_data_line = ""
+    for number, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            comment = stripped.lstrip("#").strip()
+            if comment.split()[:1] and comment.split()[0].lower() == "time":
+                names = _header_names(comment)
+            continue
+        if not rows:
+            first_data_line = stripped
+        try:
+            values = [float(word) for word in stripped.replace("(", " ").replace(")", " ").split()]
+        except ValueError as exc:
+            raise FoamResultsError(
+                f"{what} line {number} has a value that is not a number: {exc}"
+            ) from exc
+        if rows and len(values) != len(rows[0]):
+            raise FoamResultsError(
+                f"{what} line {number} has {len(values)} values, the first data line has "
+                f"{len(rows[0])}"
+            )
+        rows.append(values)
+    if not rows:
+        return [], np.empty((0, 0))  # a header only: the caller decides whether that matters
+    width = len(rows[0]) - 1  # the values after the time
+    if names is None:
+        columns = [f"col{i}" for i in range(1, width + 1)]
+    else:
+        widths = _token_widths(first_data_line)
+        if len(widths) == len(names) and all(w in _COMPONENT_SUFFIXES for w in widths):
+            # one value or one vector / tensor per name (a mix of scalars and vectors is allowed)
+            columns = [
+                f"{name}_{s}" if w > 1 else name
+                for name, w in zip(names, widths, strict=True)
+                for s in _COMPONENT_SUFFIXES[w] or (None,)
+            ]
+        else:
+            per_name, remainder = divmod(width, len(names)) if names else (0, 1)
+            if remainder or per_name not in _COMPONENT_SUFFIXES:
+                raise FoamResultsError(
+                    f"{what}: the header has {len(names)} column names but the data lines have "
+                    f"{width} values after the time; expected one value per name, or 3, 6 or 9 "
+                    "(a vector, symmetric tensor or tensor) per name"
+                )
+            suffixes = _COMPONENT_SUFFIXES[per_name]
+            columns = [f"{name}_{s}" for name in names for s in suffixes] if suffixes else names
+    return ["Time", *columns], _latest_rows(np.array(rows, dtype=float))
+
+
+def _plain_name(value: str, what: str) -> str:
+    if not isinstance(value, str) or not value or value.startswith(".") or "/" in value:
+        raise FoamResultsError(
+            f"{what} must be a plain name without path separators, not {value!r}"
+        )
+    if "\\" in value:
+        raise FoamResultsError(
+            f"{what} must be a plain name without path separators, not {value!r}"
+        )
+    return value
+
+
+def _real_dir(path: Path) -> bool:
+    return path.is_dir() and not path.is_symlink()
+
+
+def read_function_object(
+    case_dir: Path | str, name: str, file: str | None = None
+) -> FunctionObjectTable:
+    """Read ``postProcessing/<name>/<start time>/<file>`` of a case into a table.
+
+    ``name`` is the function object's name in ``system/controlDict``. A run that was restarted
+    has one start-time directory per run; the files of all of them are joined in numeric order
+    of the start time, and a later run replaces every row of the earlier ones at its own start
+    time or after (a restart from the last written time repeats that one row); a time that goes
+    back inside one file counts as a restart as well, and a file with a header only is skipped
+    (an error when all are). ``file`` is a file name such as ``force.dat``, with or without the
+    extension; it may be omitted when the function object writes a single file, otherwise
+    ``FoamResultsError`` lists the files.
+
+    Columns: the first is ``Time``; the others are named by the ``# Time ...`` header line (all
+    other ``#`` lines are ignored). ``total_x total_y total_z`` stay as written, a name in
+    parentheses such as ``Cd(f)`` stays whole, a group ``forces(pressure viscous)`` becomes
+    ``forces_pressure forces_viscous``, and when the data lines hold 3 (6, 9) values per header
+    name (probes of a vector field write ``(ux uy uz)``) the name gets the suffixes ``_x _y _z``
+    (``_xx _xy _xz _yy _yz _zz``; ``_xx _xy _xz _yx _yy _yz _zx _zy _zz``), so probe ``0`` of a
+    vector gives ``0_x 0_y 0_z``. When the data line has as many top-level values (a number or a
+    parenthesis group) as the header has names, each name takes its own width, so a header
+    ``areaAverage(p) areaAverage(U)`` with the values ``0.04 (1 0 0)`` gives ``areaAverage(p)``
+    and ``areaAverage(U)_x`` ... ``_z``. Parentheses in the values are ignored. A file with no
+    ``# Time`` header line gets the names ``col1``, ``col2``, ... .
+    """
+    root = _check_case_dir(case_dir) / "postProcessing"
+    _plain_name(name, "the function object name")
+    if not _real_dir(root):
+        raise FoamResultsError(
+            f"{str(root)!r} does not exist: the case has no postProcessing directory, so the "
+            "function object wrote nothing (check the functions entry of system/controlDict and "
+            "the solver log)"
+        )
+    base = root / name
+    if not _real_dir(base):
+        available = sorted(e.name for e in root.iterdir() if _real_dir(e)) or ["none"]
+        raise FoamResultsError(
+            f"no function object {name!r} in {root}; available: {', '.join(available)}"
+        )
+    starts = sorted(
+        (float(e.name), e)
+        for e in base.iterdir()
+        if _real_dir(e) and _TIME_NAME_RE.fullmatch(e.name)
+    )
+    files: dict[str, list[Path]] = {}
+    for _, directory in starts:
+        for entry in sorted(directory.iterdir()):
+            if entry.is_file() and not entry.is_symlink() and not entry.name.startswith("."):
+                files.setdefault(entry.name, []).append(entry)
+    listing = ", ".join(repr(n) for n in sorted(files)) or "none"
+    if file is None:
+        if len(files) != 1:
+            raise FoamResultsError(
+                f"function object {name!r} writes {len(files)} files; pass file=... with one of: "
+                f"{listing}"
+            )
+        chosen = next(iter(files))
+    else:
+        _plain_name(file, "file")
+        matches = [n for n in files if n == file or Path(n).stem == file]
+        if len(matches) != 1:
+            raise FoamResultsError(
+                f"no file {file!r} in {base}; available files: {listing}"
+                if not matches
+                else f"file {file!r} matches several files of {base}: {listing}"
+            )
+        chosen = matches[0]
+
+    tables: list[tuple[list[str], np.ndarray]] = []
+    sources: list[str] = []
+    for path in files[chosen]:
+        what = f"{path.parent.parent.name}/{path.parent.name}/{path.name}"
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise FoamResultsError(f"{what} cannot be read as text: {exc}") from exc
+        sources.append(what)
+        tables.append(_parse_table_text(text, what))
+    filled = [(c, d) for c, d in tables if len(d)]
+    if not filled:
+        raise FoamResultsError(f"{sources[0]} has no data rows")
+    columns = filled[0][0]
+    if any(other != columns for other, _ in filled[1:]):
+        raise FoamResultsError(
+            f"the start-time directories of {base} hold {chosen!r} with different columns; "
+            "they cannot be joined"
+        )
+    # the later run wins: it replaces the rows of earlier ones from its first time on
+    return FunctionObjectTable(columns, _latest_rows(np.vstack([d for _, d in filled])))
+
+
+# --------------------------------------------------------------------------------------------
+# Time-series helpers
+# --------------------------------------------------------------------------------------------
+
+_MIN_SAMPLES = 8
+_MAX_RESAMPLED = 1 << 18
+_PADDING = 8  # zero padding of the spectrum, before the parabolic refinement of the peak
+_MIN_PERIODS = 3
+
+
+def _series(t: Any, y: Any) -> tuple[np.ndarray, np.ndarray]:
+    try:
+        times, values = np.asarray(t, dtype=float), np.asarray(y, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise FoamResultsError(f"t and y must be arrays of numbers ({exc})") from exc
+    if times.ndim != 1 or values.ndim != 1:
+        raise FoamResultsError(
+            "t and y must be one-dimensional (take one column of the table with column(name))"
+        )
+    if len(times) != len(values):
+        raise FoamResultsError(
+            f"t and y must have the same length, got {len(times)} and {len(values)}"
+        )
+    if not (np.isfinite(times).all() and np.isfinite(values).all()):
+        raise FoamResultsError("t and y must be finite (no NaN or infinity)")
+    if len(times) > 1 and not (np.diff(times) > 0).all():
+        raise FoamResultsError("t must be strictly increasing")
+    return times, values
+
+
+def dominant_frequency(t: Any, y: Any, skip_fraction: float = 0.5) -> float:
+    """The frequency of the strongest oscillation of ``y(t)``, in 1 / (unit of ``t``).
+
+    The first ``skip_fraction`` of the time span is dropped (start-up transient), the rest is
+    resampled to a uniform grid (linear interpolation; the steps of ``t`` may differ), the mean
+    is removed, a Hann window is applied and the peak of the zero-padded spectrum is refined by
+    parabolic interpolation. Frequencies below one cycle over the used span are not searched.
+    The function object must write at every time step (or at least about 10 samples per period):
+    a coarser output can alias to a lower frequency without any error. Raises
+    ``FoamResultsError`` when the input is not usable, when ``y`` is constant, or when
+    fewer than 3 periods of the found frequency remain after skipping (the frequency would not
+    be established: simulate longer or lower ``skip_fraction``).
+    """
+    times, values = _series(t, y)
+    if isinstance(skip_fraction, bool) or not (
+        isinstance(skip_fraction, int | float) and 0.0 <= skip_fraction < 1.0
+    ):
+        raise FoamResultsError(f"skip_fraction must be in [0, 1), got {skip_fraction!r}")
+    if len(times) < 2:
+        raise FoamResultsError(f"at least {_MIN_SAMPLES} samples are needed to find a frequency")
+    start = times[0] + skip_fraction * (times[-1] - times[0])
+    keep = times >= start
+    times, values = times[keep], values[keep]
+    if len(times) < _MIN_SAMPLES:
+        raise FoamResultsError(
+            f"at least {_MIN_SAMPLES} samples must remain after skipping the first "
+            f"{skip_fraction:g} of the record, got {len(times)}"
+        )
+    span = float(times[-1] - times[0])
+    if np.ptp(values) <= 1e-10 * max(float(np.abs(values).max()), 1e-300):
+        raise FoamResultsError("the signal is constant after skipping: it has no frequency")
+    step = max(float(np.median(np.diff(times))), span / (_MAX_RESAMPLED - 1))
+    n = int(round(span / step)) + 1
+    grid = times[0] + step * np.arange(n)
+    sample = np.interp(grid, times, values)
+    sample = (sample - sample.mean()) * np.hanning(n)
+    n_fft = 1 << int(np.ceil(np.log2(n * _PADDING)))
+    spectrum = np.abs(np.fft.rfft(sample, n_fft))
+    df = 1.0 / (n_fft * step)
+    first = max(int(np.ceil(1.0 / (span * df))), 1)  # one cycle over the span
+    if first >= len(spectrum) - 1:
+        raise FoamResultsError("the record is too short to find a frequency")
+    peak = first + int(np.argmax(spectrum[first:-1]))
+    shift = 0.0
+    if peak > first and spectrum[peak - 1 : peak + 2].min() > 0:
+        a, b, c = np.log(spectrum[peak - 1 : peak + 2])
+        shift = 0.5 * (a - c) / (a - 2 * b + c) if (a - 2 * b + c) != 0 else 0.0
+    frequency = (peak + shift) * df
+    if frequency * span < _MIN_PERIODS:
+        raise FoamResultsError(
+            f"only {frequency * span:.2g} periods of the strongest oscillation ({frequency:.4g}) "
+            f"remain after skipping the first {skip_fraction:g} of the record, which spans "
+            f"{span:.4g}; at least {_MIN_PERIODS} periods are needed: simulate longer or lower "
+            "skip_fraction"
+        )
+    return float(frequency)
+
+
+def period_average(t: Any, y: Any, frequency: float, n_periods: int | None = None) -> float:
+    """The time average of ``y`` over the last whole number of periods of ``frequency``.
+
+    The window ends at the last time. ``n_periods=None`` uses all whole periods the record holds,
+    otherwise exactly ``n_periods`` (an integer of at least 1). The default window reaches back
+    to the first time, so it includes any start-up transient: pass ``n_periods`` to keep the
+    window inside the developed oscillation. The integral is the trapezoid
+    rule on the actual (possibly uneven) time steps, divided by the length of the window.
+    Raises ``FoamResultsError`` for an unusable input, a ``frequency`` that is not positive and
+    finite, a record shorter than one period, or more ``n_periods`` than the record holds.
+    """
+    times, values = _series(t, y)
+    if (
+        isinstance(frequency, bool)
+        or not isinstance(frequency, int | float)
+        or not math.isfinite(frequency)
+        or frequency <= 0
+    ):
+        raise FoamResultsError(f"frequency must be a positive, finite number, got {frequency!r}")
+    if n_periods is not None and (
+        isinstance(n_periods, bool) or not isinstance(n_periods, int | np.integer) or n_periods < 1
+    ):
+        raise FoamResultsError(f"n_periods must be a positive integer or None, got {n_periods!r}")
+    if len(times) < 2:
+        raise FoamResultsError("at least two samples are needed to average over a period")
+    period = 1.0 / frequency
+    whole = math.floor((times[-1] - times[0]) / period + 1e-9)
+    if whole < 1:
+        raise FoamResultsError(
+            f"the record spans {times[-1] - times[0]:.4g}, less than one period ({period:.4g}) of "
+            f"frequency {frequency:.4g}; simulate longer"
+        )
+    count = whole if n_periods is None else int(n_periods)
+    if count > whole:
+        raise FoamResultsError(
+            f"n_periods={count} was asked but the record holds only {whole} whole periods of "
+            f"{period:.4g}"
+        )
+    end = float(times[-1])
+    begin = max(end - count * period, float(times[0]))
+    inside = (times > begin) & (times < end)
+    xs = np.concatenate([[begin], times[inside], [end]])
+    ys = np.interp(xs, times, values)
+    return float(np.sum(0.5 * (ys[1:] + ys[:-1]) * np.diff(xs)) / (end - begin))
