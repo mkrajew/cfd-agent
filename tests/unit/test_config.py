@@ -35,7 +35,7 @@ def test_default_config_models_and_limits():
         assert model.max_tokens == 8192
     assert config.planner_structured_max_tokens == 4096
     limits = config.limits
-    assert limits == RunLimits()
+    assert limits == RunLimits(max_turns_per_attempt_by_stage={"case_setup": 60})
     assert limits.max_attempts_per_stage == 3
     assert limits.wall_clock_s == 7200
     assert limits.max_cost_usd == 1.0
@@ -102,3 +102,21 @@ def test_models_must_cover_exactly_the_six_agents():
         RunConfig(**{**data, "models": missing})
     with pytest.raises(ValidationError):
         RunConfig(**{**data, "models": {**data["models"], "critic": data["models"]["mesh"]}})
+
+
+def test_turn_limit_override_per_stage():
+    assert RunLimits().max_turns_per_attempt_by_stage == {}
+    limits = RunConfig.default().limits
+    assert limits.max_turns_per_attempt == 40  # the general limit is unchanged
+    assert limits.max_turns_per_attempt_by_stage == {"case_setup": 60}
+    assert limits.max_cost_usd == 1.0  # the cost cap is unchanged
+    with pytest.raises(ValidationError):
+        RunLimits(max_turns_per_attempt_by_stage={"mesh": 0})
+    with pytest.raises(ValidationError):
+        RunLimits(max_turns_per_attempt_by_stage={"mesh": 100_000})
+
+
+def test_old_config_without_the_turn_override_loads():
+    data = RunConfig.default().model_dump()
+    del data["limits"]["max_turns_per_attempt_by_stage"]
+    assert RunConfig(**data).limits.max_turns_per_attempt_by_stage == {}

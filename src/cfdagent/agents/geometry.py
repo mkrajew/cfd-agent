@@ -25,7 +25,7 @@ from pathlib import Path
 
 from cfdagent.agents.casespec import CaseSpec
 from cfdagent.agents.gatehelp import last_bytes, names, read_manifest
-from cfdagent.agents.stage import Stage, StageContext
+from cfdagent.agents.stage import CASESPEC_FROM_ATTEMPT, Stage, StageContext
 from cfdagent.agents.tools import FileScope
 from cfdagent.errors import ToolFailure
 from cfdagent.executor.protocol import CheckGeometryArgs, OpResponse, RunScriptArgs
@@ -179,7 +179,10 @@ class GeometryStage(Stage):
             f"{MANIFEST_FILE_NAME} names every boundary face with the boundary names above. "
             "Exceptions: the `empty` patches of a 2D case and the `wedge` patches of an "
             "axisymmetric case may have any name, and a boundary of the plan that has no face "
-            "(such as an axis) gets no patch. Units are metres."
+            "(such as an axis) gets no patch. Units are metres.\n\n"
+            "The script runs with the attempt directory as its working directory; every path in "
+            f"it is relative to that directory. It writes {STEP_NAME} and {MANIFEST_FILE_NAME} "
+            f"there, and the only file it may read is the plan, {CASESPEC_FROM_ATTEMPT}."
         )
 
     def execute_and_gate(self, ctx: StageContext, attempt_dir: Path) -> GateResult:

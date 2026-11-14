@@ -7,6 +7,8 @@ from OpenFOAM). The unit tests here need no OpenFOAM.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 from solver_cases import BOUNDARY, REMOVALS, SOLVERS, complete_case
 
@@ -224,6 +226,8 @@ def test_relaxation_factors_inside_the_algorithm_dictionary_are_reported(tmp_pat
     assert "system/fvSolution" in message and f"`{ALGORITHM[solver]}`" in message
     assert "relaxationFactors" in message and "top-level" in message
     assert "equations" in message and "ignores" in message  # the shape and why it matters
+    assert '"relaxationFactors { fields { p <factor>; } equations { U <factor>; } }"' in message
+    assert "0.3" not in message and "0.7" not in message  # no values: placeholders only
 
 
 def test_nested_relaxation_factors_are_harmless_when_a_top_level_dictionary_exists(tmp_path):
@@ -304,3 +308,98 @@ def test_nested_relaxation_in_a_dictionary_the_solver_does_not_read_is_not_judge
         )
 
     assert errors_of(write_case(tmp_path, "simpleFoam", mutate), "simpleFoam") == []
+
+
+# ------------------------------------------------------------------ directive messages
+
+
+SKELETON = re.compile(r'(?:add|create it with) "[^"]*;[^"]*"')
+
+
+@pytest.mark.parametrize(("label", "rel", "edit", "solver"), list(removal_params()))
+def test_every_missing_item_names_its_file_and_shows_a_skeleton(tmp_path, label, rel, edit, solver):
+    def mutate(files):
+        if edit is None:
+            del files[rel]
+        else:
+            files[rel] = edit(files[rel])
+
+    (error,) = errors_of(write_case(tmp_path, solver, mutate), solver)
+    assert error.startswith(f"{rel}: "), error  # the file to create or edit comes first
+    assert SKELETON.search(error), error  # and the minimal entry in quotes
+
+
+def test_a_skeleton_is_a_generic_requirement_and_never_a_case_value(tmp_path):
+    def mutate(files):
+        del files["system/fvSolution"]
+        del files["system/fvSchemes"]
+        del files["constant/transportProperties"]
+
+    errors = errors_of(write_case(tmp_path, "pimpleFoam", mutate), "pimpleFoam")
+    text = "\n".join(errors)
+    assert "<value>" in text and "<tolerance>" in text and "<convection scheme>" in text
+    assert "Euler" in text and "pFinal" in text and "UFinal" in text and "PIMPLE" in text
+    steady = errors_of(write_case(tmp_path / "s", "simpleFoam", mutate), "simpleFoam")
+    joined = "\n".join(steady)
+    assert "SIMPLE {" in joined and "PIMPLE" not in joined and "ddtSchemes" not in joined
+
+
+def test_no_skeleton_carries_a_mesh_dependent_value(tmp_path):
+    def mutate(files):
+        del files["system/fvSolution"]
+
+    for solver in SOLVERS:
+        (error,) = errors_of(write_case(tmp_path / solver, solver, mutate), solver)
+        assert "nNonOrthogonalCorrectors <" in error  # a placeholder, never a number
+
+
+def test_a_missing_steady_fvsolution_skeleton_has_under_relaxation(tmp_path):
+    def mutate(files):
+        del files["system/fvSolution"]
+
+    (error,) = errors_of(write_case(tmp_path / "s", "simpleFoam", mutate), "simpleFoam")
+    assert "relaxationFactors { fields { p <factor>; } equations { U <factor>; } }" in error
+    assert "residualControl" in error and "optional" in error
+    (transient,) = errors_of(write_case(tmp_path / "t", "pimpleFoam", mutate), "pimpleFoam")
+    assert "relaxationFactors" not in transient and "residualControl" not in transient
+    assert len(SKELETON.findall(error)) == 1  # one quoted skeleton, not several fragments
+
+
+def test_a_missing_scheme_or_solution_file_says_a_turbulence_model_needs_more(tmp_path):
+    def laminar_without_files(files):
+        del files["system/fvSchemes"]
+        del files["system/fvSolution"]
+
+    def turbulent_without_files(files):
+        laminar_without_files(files)
+        files["constant/turbulenceProperties"] = files["constant/turbulenceProperties"].replace(
+            "laminar", "RAS"
+        )
+
+    def unknown_without_files(files):
+        laminar_without_files(files)
+        del files["constant/turbulenceProperties"]
+
+    for label, mutate, expected in (
+        ("lam", laminar_without_files, False),
+        ("ras", turbulent_without_files, True),
+        ("unk", unknown_without_files, True),
+    ):
+        errors = errors_of(write_case(tmp_path / label, "simpleFoam", mutate), "simpleFoam")
+        named = [e for e in errors if e.startswith(("system/fvSchemes", "system/fvSolution"))]
+        assert len(named) == 2
+        for error in named:
+            assert ("momentum and pressure entries only" in error) is expected, error
+    ico = errors_of(write_case(tmp_path / "ico", "icoFoam", laminar_without_files), "icoFoam")
+    assert not any("momentum and pressure" in e for e in ico)  # icoFoam has no turbulence model
+
+
+def test_the_missing_final_solver_message_has_one_skeleton_and_no_pattern_advice(tmp_path):
+    def mutate(files):
+        text = files["system/fvSolution"]
+        start, end = text.index("    pFinal"), text.index("    U\n")
+        files["system/fvSolution"] = text[:start] + text[end:]
+
+    (error,) = errors_of(write_case(tmp_path, "icoFoam", mutate), "icoFoam")
+    assert "pFinal { $p; relTol 0; }" in error
+    assert "(p|pFinal)" not in error and error.count('"') == 2
