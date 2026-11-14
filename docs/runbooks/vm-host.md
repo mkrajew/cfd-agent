@@ -87,8 +87,8 @@ az vm run-command invoke --resource-group rg-cfdagent --name vm-cfdagent --comma
     --scripts "@<path-to-wrapper>.sh"
 ```
 
-`run-command` is a write operation on the VM (it needs the same approval as any `az` call that changes
-something). Its output is cut to the last few kilobytes: the summary at the end is what you see. Only one
+`run-command` is a write operation on the VM (it falls under the standing approval of rule 4 in `CLAUDE.md`:
+announce the task to the owner first). Its output is cut to the last few kilobytes: the summary at the end is what you see. Only one
 run-command can run at a time on a VM.
 
 ### 2.3 Options and behaviour

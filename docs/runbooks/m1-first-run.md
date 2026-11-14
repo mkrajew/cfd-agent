@@ -113,7 +113,7 @@ az storage blob list --auth-mode login --account-name <account> --container-name
 ```
 
 The folder `<run-id>/` must hold `summary.md`, `run_record.json`, `results/comparison.json`, `casespec.json`,
-`analysis.md` and the logs. The `az` call is read-only; every `az` call still triggers a permission prompt.
+`analysis.md` and the logs. The `az` call is read-only.
 
 Observed (read-only, from the laptop): 253 blobs under the run prefix, matching the 253 uploaded files. Top-level
 entries include `summary.md`, `run_record.json`, `run.log`, `status.json`, `task.md`, `casespec.json`,

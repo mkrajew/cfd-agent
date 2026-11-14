@@ -212,7 +212,7 @@ A run survives SSH disconnects (`--detach`, re-attach via `logs --follow`).
 
 ## 7. Infrastructure (Azure, Bicep)
 
-Resource group `rg-cfdagent` in `italynorth`, deployed/destroyed with one command. **Deployment runs only after the owner approves.** No CI-driven deployment in v1. **[Claude's call]**
+Resource group `rg-cfdagent` in `italynorth`, deployed/destroyed with one command. **Deployment runs under the owner's standing approval of 2026-11-14 (section 14.2): announced to the owner first, no per-command approval.** No CI-driven deployment in v1. **[Claude's call]**
 
 | Resource | Details |
 |---|---|
@@ -300,7 +300,7 @@ Claude (main session) coordinates: talks to the owner in Polish, plans, delegate
 | `implementer` | Implements one plan task | TDD; only the task's scope; no secrets; ends with green tests and a plain-language change summary |
 | `code-reviewer` | Critical review before PR | Starts without the author's context (diff + spec only); bugs, missing tests, security (especially execution of LLM-generated code); verdict approve / changes / reject; **must not rubber-stamp** |
 | `cfd-reviewer` | Domain expert | Physics and numerics: solver choice, BCs, schemes, mesh quality criteria, benchmark references and thresholds; reviews cloud-agent prompts and knowledge notes and **blocks any case-specific content** (generality rule, §6.3) |
-| `infra-engineer` | Bicep, Docker, GitHub Actions, Azure | Cost estimate with every change; **never deploys anything that costs money without owner approval**; auto/idle shutdown, budget alerts, least privilege; knows §3 constraints |
+| `infra-engineer` | Bicep, Docker, GitHub Actions, Azure | Cost estimate with every change; **deploys only under the standing approval of §14.2 (announce first, cost estimate with every change)**; auto/idle shutdown, budget alerts, least privilege; knows §3 constraints |
 | `scribe` | Research journal | Entries in `docs/journal/` of five kinds: decision, obstacle + solution, milestone, experiment (with numbers), observation (agent behaviour). Max a few sentences each; test: "would this sentence appear in the report?". Larger architecture decisions also as ADRs in `docs/adr/`. Invoked by Claude at each milestone and end of each work session. **Backfills the decisions and obstacles of the 2026-10-27/28 design conversation** when the repo is created. |
 | `report-writer` | Final report | Process in §11 |
 
@@ -370,7 +370,7 @@ The optional heated-cavity task is the first thing dropped inside row 1. Estimat
 | Reserve | ≈ $25, never spent without a separate owner decision |
 
 - Inside an approved envelope, starting/stopping the VM and running tests/benchmarks need no per-action approval.
-- Creating or changing Azure resources, and any campaign estimated above $5, always need the owner's approval.
+- **Standing approval (owner's decision, 2026-11-14, replaces the earlier rule that creating or changing Azure resources always needs approval):** inside `rg-cfdagent` and the envelope, `az` commands including create, update, delete, role assignments and Bicep deployments run without per-command approval. The main session announces the task in chat first (what is done, with the cost estimate) and then works without further questions. Still needing explicit approval: anything outside `rg-cfdagent` or at subscription or Entra level, deleting the resource group, the storage account or the `runs` container, any task or campaign estimated above $5, and anything that would exceed the envelope.
 - Spend is tracked from run records and reported at each milestone.
 
 ## 15. Left to the builder

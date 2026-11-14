@@ -4,9 +4,9 @@ Rules for anything under `infra/`: Bicep, VM scripts, budget and shutdown policy
 
 ## Approval rule
 
-**Creating, changing or deleting Azure resources always needs the owner's explicit approval in chat first.** Every `az` invocation triggers a permission prompt in `.claude/settings.json`; that prompt is a safety net that the owner answers, not a substitute for asking first. Read-only commands (`list`, `show`, `what-if`, `validate`) are fine.
+Standing approval (owner's decision, 2026-11-14): inside `rg-cfdagent` and the approved envelope (M0-M2: at most $30), the main session runs `az` commands, including create, update, delete, role assignments and Bicep deployments, without asking per command. Before starting a task that uses Azure, it tells the owner in chat, in a few sentences, what will be done on the machine or in Azure and what it costs (VM time only, or also changes to resources, with the cost estimate), and then works without further questions in that task. Still needing explicit chat approval first: anything outside `rg-cfdagent` or at subscription or Entra level (`az account`, `az ad`), deleting the resource group, the storage account or the `runs` container (run results are not in git), any task or campaign estimated above $5 and anything that would exceed the envelope. `.claude/settings.json` additionally denies `az account`, `az ad` and the delete commands for resource groups, storage accounts and storage containers.
 
-Inside an owner-approved spending envelope, starting, stopping or deallocating the project VM and running tests or benchmarks need no extra chat approval. Creating, changing or deleting resources, and any campaign estimated above $5, always need explicit chat approval first.
+Read-only commands (`list`, `show`, `what-if`, `validate`) never need an announcement of their own. Run `what-if` before every deployment and put its result and the cost estimate into the announcement.
 
 ## Subscription limits (verified 2026-10-27)
 
