@@ -45,18 +45,25 @@
       "PowerShell(git stash*)",
       "PowerShell(git rev-parse*)",
       "PowerShell(git ls-files*)",
-      "PowerShell(git merge-base*)"
-    ],
-    "ask": [
+      "PowerShell(git merge-base*)",
       "Bash(az *)",
-      "Bash(*az.cmd*)",
-      "Bash(* az *)",
-      "PowerShell(*az*)",
-      "Bash(git push*)",
-      "Bash(git * push*)",
-      "PowerShell(git push*)",
-      "PowerShell(git * push*)"
+      "Bash(*az.cmd* *)",
+      "PowerShell(az *)",
+      "PowerShell(*az.cmd* *)",
+      "Bash(gh run *)",
+      "Bash(gh release view*)",
+      "Bash(gh release list*)",
+      "Bash(git fetch*)",
+      "Bash(git push origin *)",
+      "Bash(uv *)",
+      "PowerShell(gh run *)",
+      "PowerShell(gh release view*)",
+      "PowerShell(gh release list*)",
+      "PowerShell(git fetch*)",
+      "PowerShell(git push origin *)",
+      "PowerShell(uv *)"
     ],
+    "ask": [],
     "deny": [
       "Bash(git reset --hard*)",
       "Bash(git clean*)",
@@ -79,7 +86,23 @@
       "PowerShell(docker *--network=host*)",
       "PowerShell(docker *--pid=*)",
       "PowerShell(docker *--pid *)",
-      "PowerShell(docker build *--push*)"
+      "PowerShell(docker build *--push*)",
+      "Bash(az group delete*)",
+      "Bash(*az.cmd* group delete*)",
+      "PowerShell(az group delete*)",
+      "PowerShell(*az.cmd* group delete*)",
+      "Bash(az storage account delete*)",
+      "Bash(*az.cmd* storage account delete*)",
+      "PowerShell(az storage account delete*)",
+      "PowerShell(*az.cmd* storage account delete*)",
+      "Bash(az storage container delete*)",
+      "Bash(*az.cmd* storage container delete*)",
+      "PowerShell(az storage container delete*)",
+      "PowerShell(*az.cmd* storage container delete*)",
+      "Bash(git push*--force*)",
+      "Bash(git push* -f *)",
+      "PowerShell(git push*--force*)",
+      "PowerShell(git push* -f *)"
     ]
   }
 }
