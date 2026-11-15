@@ -917,12 +917,20 @@ def run_task(
     benchmark: Benchmark | None = None
     task_text = task
     if config.benchmark_id is not None:
-        registry = (
-            load_registry(benchmarks_root) if benchmarks_root is not None else load_registry()
+        # The generality set is opened only for a run configured as such (design 9.1): a
+        # development or ad hoc configuration cannot reach it.
+        registry = load_registry(
+            benchmarks_root if benchmarks_root is not None else Path("benchmarks"),
+            include_generality=config.task_set == "generality",
         )
         benchmark = registry.get(config.benchmark_id)
         if benchmark is None:
             raise ValueError(f"unknown benchmark {config.benchmark_id!r}")
+        if benchmark.task_set != config.task_set:
+            raise ValueError(
+                f"benchmark {config.benchmark_id!r} belongs to the {benchmark.task_set} set, "
+                f"not {config.task_set!r}"
+            )
         task_text = (benchmark.root / benchmark.task_file).read_text(encoding="utf-8")
 
     pricing = _pricing(config)

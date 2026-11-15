@@ -31,6 +31,10 @@ the registry models; physical parameters therefore cannot be stored in it (see t
 
 Full citations are in the `citation` field of each `benchmark.toml`.
 
+The generality test set (design section 9.1) lives in `benchmarks/generality/`, with its own README.
+It is not part of the default registry and `cfdagent run --benchmark <id>` refuses it unless
+`--allow-generality` is given, which is for the frozen M3 campaign only.
+
 ## How the references were obtained
 
 - **Cavity (Ghia et al.).** Transcribed from Table I (u on the vertical line through the geometric

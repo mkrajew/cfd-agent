@@ -245,3 +245,127 @@ def test_generality_lint_scans_prompts(tmp_path):
     )
     leaks = [leak.replace("\\", "/") for leak in find_leaks(copy, benchmark_markers())]
     assert any(leak.startswith("prompts/planner.md") for leak in leaks)
+
+
+# ------------------------------------------------------------ generality families (design 9.1)
+# Words that identify the flow types of the generality test set: family names, the references
+# and the headline quantity. They must never appear under src/cfdagent (contents or file names):
+# development sessions and agents must not learn the set from the code, the prompts or the notes.
+# Fixed with cfd-reviewer (2026-11-15); a change to this list needs a cfd-reviewer verdict.
+# No letter boundaries: none of these is a substring of an ordinary word, and without boundaries
+# CamelCase and compound identifiers (BackwardFacingStep, HagenPoiseuille, deVahlDavis) are caught.
+# Deliberately not banned (general vocabulary): boundary layer, reattachment alone, Nusselt,
+# Rayleigh, buoyancy, similarity, channel, backward alone (a time scheme), step.
+GENERALITY_FAMILY_WORDS = re.compile(
+    r"(?:back|rear)wards?[\W_]{0,24}facing"
+    r"|couette|poiseuille|blasius|armaly|gartling"
+    r"|flat[\W_]{0,24}plate"
+    r"|vahl[\W_]{0,24}davis"
+    r"|differential(?:ly)?[\W_]{0,24}heat(?:ed|ing)"
+    r"|natural[\W_]{0,24}convection"
+    r"|reattachment[\W_]{0,24}length",
+    re.I,
+)
+
+
+def scan_generality_families(root: Path) -> tuple[list[str], int]:
+    """Return (hits, files scanned): a family word in a file name or in the whole text of a file
+    (so a phrase wrapped over two lines is found as well)."""
+    hits: list[str] = []
+    scanned = 0
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or "__pycache__" in path.parts or path.suffix == ".pyc":
+            continue
+        scanned += 1
+        name = path.relative_to(root).as_posix()
+        hits.extend(
+            f"{name}: file name has {m.group(0)!r}" for m in GENERALITY_FAMILY_WORDS.finditer(name)
+        )
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            hits.append(f"{name}: not valid UTF-8, the lint cannot read it")
+            continue
+        for m in GENERALITY_FAMILY_WORDS.finditer(text):
+            line = text.count("\n", 0, m.start()) + 1
+            hits.append(f"{name}:{line}: {m.group(0)!r}")
+    return hits, scanned
+
+
+def test_src_has_no_generality_family_words():
+    hits, scanned = scan_generality_families(SRC)
+    assert scanned > 0, "the scan found no files: the lint would pass vacuously"
+    assert hits == [], "generality-family words in src/ break design 9.1:\n" + "\n".join(hits)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "# Backward-facing step",
+        "backward_facing_step = 1",
+        "class BackwardFacingStep:",
+        "backwardFacingStep",
+        "backwards facing",
+        "rearward-facing",
+        "Backward‑facing",
+        "Couette flow",
+        "TaylorCouette",
+        "plane Poiseuille",
+        "HagenPoiseuille",
+        "Blasius profile",
+        "BlasiusSolution",
+        "Armaly et al.",
+        "Gartling (1990)",
+        "flat plate boundary layer",
+        "flat plates",
+        "FlatPlateBL",
+        "de Vahl Davis",
+        "deVahlDavis",
+        "differentially heated",
+        "differential heating",
+        "natural convection",
+        "natural_convection",
+        "reattachment length",
+        "reattachment-length",
+        "backward-\nfacing",
+        "flat\nplate",
+        "    # backward\n    # facing step",
+        '    """Backward-\n        facing step."""',
+    ],
+)
+def test_generality_lint_catches_every_spelling(tmp_path, text):
+    (tmp_path / "planted.md").write_text(text + "\n", encoding="utf-8")
+    assert scan_generality_families(tmp_path)[0], f"{text!r} should be flagged"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "backward Euler",
+        "ddtSchemes { default backward; }",
+        "cosine similarity",
+        "boundary layer",
+        "reattachment point",
+        "Nusselt number",
+        "divergence-free convection",
+        "backstep",
+        "flat, then a plate",
+        "A plate of glass; a step back; facing north.",
+    ],
+)
+def test_generality_lint_ignores_general_vocabulary(tmp_path, text):
+    (tmp_path / "planted.md").write_text(text + "\n", encoding="utf-8")
+    assert scan_generality_families(tmp_path)[0] == []
+
+
+def test_generality_lint_checks_file_names_and_encoding_and_reports_the_line(tmp_path):
+    (tmp_path / "notes").mkdir()
+    (tmp_path / "notes" / "backward-facing-step.md").write_text("clean\n", encoding="utf-8")
+    (tmp_path / "bad.md").write_bytes(b"caf\xe9\n")
+    (tmp_path / "late.md").write_text("one\ntwo\nCouette\n", encoding="utf-8")
+    hits, scanned = scan_generality_families(tmp_path)
+    assert scanned == 3
+    assert any(h.startswith("notes/backward-facing-step.md: file name") for h in hits)
+    assert any(h.startswith("bad.md: not valid UTF-8") for h in hits)
+    assert "late.md:3: 'Couette'" in hits
+    assert len(hits) == 3

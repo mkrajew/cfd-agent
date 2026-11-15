@@ -4,6 +4,10 @@ On disk, a benchmark is a directory ``<root>/<id>/`` with a ``benchmark.toml`` (
 ``family``, ``task_file``, ``citation`` and one ``[[criteria]]`` table per criterion), the task
 file, and the reference CSVs (header ``x,value``) that the criteria point at. Paths in the TOML
 are relative to the benchmark directory.
+
+Benchmarks under ``<root>/generality/<id>/`` form the generality test set (design 9.1). The
+loader reads them only on request (``include_generality=True``) and sets ``Benchmark.task_set``
+from the directory: the TOML cannot name its own task set.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 BENCHMARK_FILE_NAME = "benchmark.toml"
+GENERALITY_DIR_NAME = "generality"
 
 _PROFILE_METRICS = ("max_abs_error", "rms_error")
 _SCALAR_VALUE_METRICS = ("rel_error", "max_abs_error")
@@ -94,6 +99,7 @@ class Benchmark(BaseModel):
     citation: str
     criteria: list[Criterion]
     root: Path
+    task_set: Literal["development", "generality"]  # set by the loader, never by the TOML
 
 
 def _inside(root: Path, relative: str) -> Path:
@@ -107,23 +113,24 @@ def _inside(root: Path, relative: str) -> Path:
     return path
 
 
-def _load_one(directory: Path) -> Benchmark:
+def _load_one(directory: Path, task_set: Literal["development", "generality"]) -> Benchmark:
     toml_path = directory / BENCHMARK_FILE_NAME
     try:
         with toml_path.open("rb") as handle:
             data = tomllib.load(handle)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
+    except (OSError, ValueError) as exc:  # ValueError: bad TOML or not UTF-8
         raise RegistryError(f"{directory.name}: cannot read {BENCHMARK_FILE_NAME}: {exc}") from exc
 
-    if "root" in data:
-        raise RegistryError(f"{directory.name}: 'root' is set by the loader, not by the TOML")
+    for key in ("root", "task_set"):
+        if key in data:
+            raise RegistryError(f"{directory.name}: {key!r} is set by the loader, not by the TOML")
     if data.get("id") != directory.name:
         raise RegistryError(
             f"{directory.name}: id {data.get('id')!r} in {BENCHMARK_FILE_NAME} does not match "
             "the directory name"
         )
     try:
-        benchmark = Benchmark(**data, root=directory.resolve())
+        benchmark = Benchmark(**data, root=directory.resolve(), task_set=task_set)
     except ValidationError as exc:
         raise RegistryError(f"{directory.name}: invalid {BENCHMARK_FILE_NAME}: {exc}") from exc
 
@@ -135,19 +142,42 @@ def _load_one(directory: Path) -> Benchmark:
     return benchmark
 
 
-def load_registry(root: Path = Path("benchmarks")) -> dict[str, Benchmark]:
+def _load_directory(
+    root: Path, task_set: Literal["development", "generality"], registry: dict[str, Benchmark]
+) -> None:
+    for directory in sorted(p for p in root.iterdir() if (p / BENCHMARK_FILE_NAME).is_file()):
+        if directory.name == GENERALITY_DIR_NAME:
+            raise RegistryError(f"{GENERALITY_DIR_NAME!r} is reserved for the generality test set")
+        if task_set == "development" and directory.resolve().is_relative_to(
+            (root / GENERALITY_DIR_NAME).resolve()
+        ):
+            raise RegistryError(
+                f"{directory.name}: a link into {GENERALITY_DIR_NAME!r} would hide a generality "
+                "benchmark in the development set"
+            )
+        benchmark = _load_one(directory, task_set)
+        if benchmark.id in registry:
+            raise RegistryError(f"duplicate benchmark id {benchmark.id!r}")
+        registry[benchmark.id] = benchmark
+
+
+def load_registry(
+    root: Path = Path("benchmarks"), include_generality: bool = False
+) -> dict[str, Benchmark]:
     """Load every ``<root>/<id>/benchmark.toml`` into ``{id: Benchmark}``.
 
-    Raises ``RegistryError`` if the TOML id differs from the directory name, an id occurs twice,
-    a referenced task or reference file is missing, or a benchmark file is invalid.
+    The generality test set under ``<root>/generality/`` is read only with
+    ``include_generality=True``; by default it is not even opened, so a default registry cannot
+    start a generality run by accident. Raises ``RegistryError`` if the TOML id differs from the
+    directory name, an id occurs twice (also across the two sets), a referenced task or reference
+    file is missing, or a benchmark file is invalid.
     """
     root = Path(root)
     if not root.is_dir():
         raise RegistryError(f"benchmark root {root} does not exist")
     registry: dict[str, Benchmark] = {}
-    for directory in sorted(p for p in root.iterdir() if (p / BENCHMARK_FILE_NAME).is_file()):
-        benchmark = _load_one(directory)
-        if benchmark.id in registry:
-            raise RegistryError(f"duplicate benchmark id {benchmark.id!r}")
-        registry[benchmark.id] = benchmark
+    _load_directory(root, "development", registry)
+    generality = root / GENERALITY_DIR_NAME
+    if include_generality and generality.is_dir():
+        _load_directory(generality, "generality", registry)
     return registry

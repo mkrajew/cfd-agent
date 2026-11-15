@@ -30,6 +30,7 @@ def make_benchmark(root: Path, criteria: list[Criterion]) -> Benchmark:
         citation="made up for the unit tests",
         criteria=criteria,
         root=root,
+        task_set="development",
     )
 
 

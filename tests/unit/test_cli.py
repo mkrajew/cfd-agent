@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -55,7 +56,11 @@ def benchmarks(tmp_path, monkeypatch) -> Path:
         'threshold = 0.05\nreference_file = "reference/ref.csv"\n',
         encoding="utf-8",
     )
-    monkeypatch.setattr(cli, "_registry", lambda: load_registry(base))
+    monkeypatch.setattr(
+        cli,
+        "_registry",
+        lambda include_generality=False: load_registry(base, include_generality=include_generality),
+    )
     return base
 
 
@@ -1205,3 +1210,99 @@ def test_high_effort_raises_planner_structured_tokens(runner, root, fake_run_tas
     assert fake_run_task.calls[1]["config"].planner_structured_max_tokens == 4096
     assert invoke(runner, "run", str(task_file), "--reasoning-effort", "high").exit_code == 0
     assert fake_run_task.calls[2]["config"].planner_structured_max_tokens == 8192
+
+
+# ------------------------------------------------------------- generality guard (design 9.1)
+
+GENERALITY_REFUSAL = "generality benchmarks run only in the frozen M3 campaign (--allow-generality)"
+
+
+@pytest.fixture
+def generality_benchmarks(benchmarks) -> Path:
+    """The ``benchmarks`` fixture plus a generality benchmark ``gen-one``."""
+    source = benchmarks / "bench-one"
+    target = benchmarks / "generality" / "gen-one"
+    shutil.copytree(source, target)
+    toml = (target / "benchmark.toml").read_text(encoding="utf-8")
+    (target / "benchmark.toml").write_text(toml.replace("bench-one", "gen-one"), encoding="utf-8")
+    return benchmarks
+
+
+def test_generality_benchmark_refused_by_default(
+    runner, root, fake_run_task, generality_benchmarks
+):
+    result = invoke(runner, "run", "--benchmark", "gen-one")
+    assert result.exit_code == 2
+    assert GENERALITY_REFUSAL in result.output
+    assert fake_run_task.calls == []
+    assert "Traceback" not in result.output
+
+
+def test_allow_generality_sets_task_set(runner, root, fake_run_task, generality_benchmarks):
+    result = invoke(runner, "run", "--benchmark", "gen-one", "--allow-generality")
+    assert result.exit_code == 0, result.output
+    (call,) = fake_run_task.calls
+    assert call["config"].benchmark_id == "gen-one"
+    assert call["config"].task_set == "generality"
+    # A development benchmark is unaffected by the flag.
+    invoke(runner, "run", "--benchmark", "bench-one", "--allow-generality")
+    assert fake_run_task.calls[1]["config"].task_set == "development"
+
+
+def test_detach_passes_allow_generality_through(runner, root, popen, generality_benchmarks):
+    refused = invoke(runner, "run", "--benchmark", "gen-one", "--detach")
+    assert refused.exit_code == 2
+    assert GENERALITY_REFUSAL in refused.output
+    assert popen.instances == []
+
+    result = invoke(runner, "run", "--benchmark", "gen-one", "--allow-generality", "--detach")
+    assert result.exit_code == 0, result.output
+    argv = popen.instances[0].args
+    assert "--allow-generality" in argv
+    assert argv[argv.index("--benchmark") + 1] == "gen-one"
+
+    # Not passed on when it was not given.
+    popen.instances.clear()
+    plain = invoke(
+        runner, "run", "--benchmark", "bench-one", "--detach", "--run-id", "20261112-143005-plain"
+    )
+    assert plain.exit_code == 0, plain.output
+    assert "--allow-generality" not in popen.instances[0].args
+
+
+def test_unknown_benchmark_message_does_not_list_generality_ids(
+    runner, root, fake_run_task, generality_benchmarks
+):
+    result = invoke(runner, "run", "--benchmark", "nope")
+    assert result.exit_code == 2
+    assert "bench-one" in result.output
+    assert "gen-one" not in result.output
+
+
+def test_the_real_registry_wiring_keeps_a_broken_generality_set_out_of_development_runs(
+    runner, root, fake_run_task, generality_benchmarks, monkeypatch
+):
+    # No monkeypatched _registry here: the guard works through the real loader.
+    monkeypatch.undo()
+    monkeypatch.setenv("CFDAGENT_RUNS_DIR", str(root))
+    monkeypatch.setattr(orchestrator, "run_task", fake_run_task)
+    monkeypatch.setattr(cli, "apply_retention", lambda *a, **k: None)
+    monkeypatch.chdir(generality_benchmarks.parent)
+
+    refused = invoke(runner, "run", "--benchmark", "gen-one")
+    assert refused.exit_code == 2 and GENERALITY_REFUSAL in refused.output
+    allowed = invoke(runner, "run", "--benchmark", "gen-one", "--allow-generality")
+    assert allowed.exit_code == 0, allowed.output
+    assert fake_run_task.calls[-1]["config"].task_set == "generality"
+
+    # A broken generality entry neither blocks a development run nor shows up in its output.
+    broken = generality_benchmarks / "generality" / "gen-bad"
+    broken.mkdir()
+    (broken / "benchmark.toml").write_text("this is not toml = = secret-marker", encoding="utf-8")
+    calls = len(fake_run_task.calls)
+    development = invoke(runner, "run", "--benchmark", "bench-one")
+    assert development.exit_code == 0, development.output
+    assert len(fake_run_task.calls) == calls + 1
+    unknown = invoke(runner, "run", "--benchmark", "nope")
+    assert unknown.exit_code == 2 and "secret-marker" not in unknown.output
+    assert "gen-bad" not in unknown.output
