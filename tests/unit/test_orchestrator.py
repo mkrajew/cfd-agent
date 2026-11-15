@@ -959,6 +959,32 @@ def bench_config(task_set="development"):
     )
 
 
+def test_a_generality_benchmark_is_reachable_only_with_the_generality_task_set(tmp_path):
+    import shutil
+
+    root = make_benchmarks(tmp_path)
+    shutil.move(str(root / "bench-one"), str(root / "generality" / "bench-one"))
+    toml = root / "generality" / "bench-one" / "benchmark.toml"
+    assert toml.is_file()
+
+    # a development configuration does not see the generality set at all
+    with pytest.raises(ValueError, match="unknown benchmark"):
+        go(tmp_path, FakeStep("one"), config=bench_config(), benchmarks_root=root)
+    # the generality configuration reaches it
+    analyst = FakeStep("analyst", action=write_quantities(GOOD_QUANTITIES))
+    result = go(
+        tmp_path, analyst, config=bench_config("generality"), benchmarks_root=root, task="ignored"
+    )
+    assert result.record.task_set == "generality"
+    assert result.comparison["passed"] is True
+
+
+def test_a_development_benchmark_cannot_run_as_generality(tmp_path):
+    root = make_benchmarks(tmp_path)
+    with pytest.raises(ValueError, match="development set"):
+        go(tmp_path, FakeStep("one"), config=bench_config("generality"), benchmarks_root=root)
+
+
 def test_scorer_runs_only_for_benchmark_runs_and_never_retries(tmp_path):
     root = make_benchmarks(tmp_path)
     analyst = FakeStep("analyst", action=write_quantities(GOOD_QUANTITIES))

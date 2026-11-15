@@ -56,7 +56,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any, NoReturn
+from typing import Annotated, Any, Literal, NoReturn
 
 import typer
 
@@ -407,10 +407,11 @@ def apply_retention(
 # ---------------------------------------------------------------------------------- run
 
 
-def _registry() -> dict:
+def _registry(include_generality: bool = False) -> dict:
+    """The benchmark registry. The generality set is opened only on request (design 9.1)."""
     from cfdagent.bench.registry import load_registry
 
-    return load_registry()
+    return load_registry(include_generality=include_generality)
 
 
 def _read_task_file(path: Path) -> str:
@@ -432,7 +433,16 @@ def _read_task_file(path: Path) -> str:
     return text
 
 
-def _benchmark_task(benchmark_id: str) -> str:
+def _benchmark_task(
+    benchmark_id: str, allow_generality: bool = False
+) -> tuple[str, Literal["development", "generality"]]:
+    """The task text and the task set of a registered benchmark.
+
+    The development registry is consulted first, so a development run never opens the generality
+    set (and a fault in it cannot block or leak into such a run). An id that is not a development
+    benchmark is looked up in the generality set only to be refused, unless ``allow_generality``:
+    those run only in the frozen M3 campaign (design 9.1). Their ids are never listed.
+    """
     from cfdagent.bench.registry import RegistryError
 
     try:
@@ -441,9 +451,20 @@ def _benchmark_task(benchmark_id: str) -> str:
         _usage_error(f"the benchmark registry cannot be loaded: {exc}")
     entry = registry.get(benchmark_id)
     if entry is None:
-        known = ", ".join(sorted(registry)) or "(none)"
-        _usage_error(f"unknown benchmark {benchmark_id!r}; known benchmarks: {known}")
-    return _read_task_file(entry.root / entry.task_file)
+        try:
+            entry = _registry(include_generality=True).get(benchmark_id)
+        except RegistryError:
+            entry = None  # no detail of the generality set in a development session's output
+            if allow_generality:
+                _usage_error("the generality set cannot be loaded")
+        if entry is None:
+            known = ", ".join(sorted(registry)) or "(none)"
+            _usage_error(f"unknown benchmark {benchmark_id!r}; known benchmarks: {known}")
+        if not allow_generality:
+            _usage_error(
+                "generality benchmarks run only in the frozen M3 campaign (--allow-generality)"
+            )
+    return _read_task_file(entry.root / entry.task_file), entry.task_set
 
 
 def _build_config(
@@ -451,6 +472,7 @@ def _build_config(
     effort: Effort | None,
     benchmark_id: str | None,
     repair_mode: RepairMode | None = None,
+    task_set: Literal["development", "generality"] = "development",
 ) -> Any:
     from cfdagent.config import DEFAULT_DEPLOYMENT, HIGH_EFFORT_STRUCTURED_TOKENS, RunConfig
     from cfdagent.llm.cost import PRICING
@@ -477,7 +499,7 @@ def _build_config(
             update={"planner_structured_max_tokens": HIGH_EFFORT_STRUCTURED_TOKENS}
         )
     if benchmark_id is not None:
-        config = config.model_copy(update={"benchmark_id": benchmark_id, "task_set": "development"})
+        config = config.model_copy(update={"benchmark_id": benchmark_id, "task_set": task_set})
     if repair_mode is not None:
         config = config.model_copy(update={"repair_mode": repair_mode.value})
     return config
@@ -491,6 +513,7 @@ def _child_command(
     no_upload: bool,
     run_id: str,
     repair_mode: RepairMode | None = None,
+    allow_generality: bool = False,
 ) -> list[str]:
     argv = [sys.executable, "-m", "cfdagent", "run"]
     if task_file is not None:
@@ -503,6 +526,8 @@ def _child_command(
         argv += ["--reasoning-effort", effort.value]
     if repair_mode is not None:
         argv += ["--repair-mode", repair_mode.value]
+    if allow_generality:
+        argv.append("--allow-generality")
     if no_upload:
         argv.append("--no-upload")
     argv += ["--run-id", run_id]
@@ -561,6 +586,13 @@ def run(
             "the failed attempt's files).",
         ),
     ] = None,
+    allow_generality: Annotated[
+        bool,
+        typer.Option(
+            "--allow-generality",
+            help="Allow a generality-set benchmark. For the frozen M3 campaign only.",
+        ),
+    ] = False,
     detach: Annotated[
         bool, typer.Option("--detach", help="Start in the background, print the run id, return.")
     ] = False,
@@ -577,8 +609,12 @@ def run(
     if run_id is not None:
         _check_run_id(run_id)
 
-    task = _read_task_file(task_file) if task_file is not None else _benchmark_task(str(benchmark))
-    config = _build_config(model, reasoning_effort, benchmark, repair_mode)
+    task_set: Literal["development", "generality"] = "development"
+    if task_file is not None:
+        task = _read_task_file(task_file)
+    else:
+        task, task_set = _benchmark_task(str(benchmark), allow_generality)
+    config = _build_config(model, reasoning_effort, benchmark, repair_mode, task_set)
     root = runs_root()
 
     if detach:
@@ -592,7 +628,14 @@ def run(
 
         new_id = run_id or orchestrator.new_run_id(task)
         argv = _child_command(
-            task_file, benchmark, model, reasoning_effort, no_upload, new_id, repair_mode
+            task_file,
+            benchmark,
+            model,
+            reasoning_effort,
+            no_upload,
+            new_id,
+            repair_mode,
+            allow_generality,
         )
         _detach(argv, root, new_id)
         typer.echo(new_id)
