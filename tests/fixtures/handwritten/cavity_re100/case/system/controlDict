@@ -56,6 +56,21 @@ runTimeModifiable false;
 
 functions
 {
+    // Monitor of the approach to the steady state. A time-marched solver has no residualControl
+    // that stops the run, so the Solver Runner gate judges steadiness by the change of the
+    // monitored quantities over the last tenth of the run (ADR-0006). Two points of the flow,
+    // one at the centre and one in the upper left quadrant, z = 0.05 mid-thickness; p and U are
+    // written at every step (the file is small). The probes do not change the solution.
+    probes
+    {
+        type                probes;
+        libs                (sampling);
+        writeControl        timeStep;
+        writeInterval       1;
+        fields              (p U);
+        probeLocations      ((0.5 0.5 0.05) (0.25 0.75 0.05));
+    }
+
     // Centrelines through the geometric centre of the cavity, sampled over the FULL range
     // [0, 1] so that the end points lie on the walls. z = 0.05 is mid-thickness of the single
     // cell layer (0 <= z <= 0.1). 129 points: spacing 1/128 = dx/2.

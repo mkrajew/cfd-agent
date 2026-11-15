@@ -14,13 +14,13 @@ Run in the `cfdagent:dev` image with `scripts/run_calibration.py --gate`, OpenFO
 
 | calibration | solver | plan (time_dependence / periodic_outputs) | Scorer | gate | evidence |
 |---|---|---|---|---|---|
-| cavity-re100 | icoFoam, 40 s, 8000 steps | steady / false | PASS | FAIL | no stopping criterion and no monitored quantity in the case; final initial residuals Ux 9e-12, Uy 1e-11, p 2e-9 |
+| cavity-re100 | icoFoam, 40 s, 8000 steps | steady / false | PASS | FAIL as first run, PASS after the owner's decision below | no stopping criterion and no monitored quantity in the case; final initial residuals Ux 9e-12, Uy 1e-11, p 2e-9 |
 | cavity-re1000 | simpleFoam | steady / false | PASS | PASS | `residualControl` stopped the run at iteration 1094 |
 | pipe-re500 | simpleFoam (wedge) | steady / false | PASS | PASS | `residualControl` at iteration 135 |
 | cylinder-re20 | simpleFoam | steady / false | PASS | PASS | `residualControl` at iteration 692 |
 | cylinder-re100 | pimpleFoam, 4 ranks, 30 s | transient / true | PASS | PASS | Cl: 24.6 periods, f = 1.637, mean change 3.2e-6, amplitude change 3.9e-6 |
 
-The cavity-re100 failure is genuine: the hand-written case predates decision 8 (icoFoam has no `residualControl`, and the case writes no time history), so the gate cannot show steadiness whatever the thresholds are. Nothing in the case was changed to fit the gate.
+The cavity-re100 failure is genuine: the hand-written case predates decision 8 (icoFoam has no `residualControl`, and the case writes no time history), so the gate cannot show steadiness whatever the thresholds are. Nothing in the case was changed to fit the gate until the owner decided (next entries).
 
 ## 2026-11-15 experiment: margins of the monitored-change and periodicity branches
 
@@ -42,6 +42,10 @@ The failure was the author's own mutation check running in the same worktree, no
 
 Unit suite: 2425 passed, 143 skipped on Windows. Integration suite in the `cfdagent:dev` image after the last code change: 254 passed, 1 skipped. `ruff` and pre-commit are clean. Azure cost: zero. The gate is verified on five laminar hand-written solutions and on scripted and integration cases, not on a real model's output or on turbulent flow.
 
-## 2026-11-15 observation: open for the owner, nothing applied
+## 2026-11-15 decision: the owner has the hand-written cavity-re100 case monitored by a probe
 
-The cavity-re100 calibration fails the gate; the options are to add a monitoring function object to the hand-written case, to declare its plan transient, or to relax the rule, and none was applied. The ADR-0006 Amendments (the three rules made explicit, decision 8 amended to `SIMPLE` only) await the owner's confirmation, together with the open points listed at the end of that section (a `residualControl` run passes whatever the tolerances; no spectral-concentration guard; one force column judged and no other mean compared; a periodic flow without a body can never pass; the diagnosis routes only to Case Setup or Mesh).
+The owner agreed in chat to the recommended option: one `probes` function object (two points, `p` and `U`, written every step) was added to `tests/fixtures/handwritten/cavity_re100/case/system/controlDict`, the monitor that decision 8 now demands of an agent. No threshold, no plan entry and no benchmark file changed; the scripted Case Setup fixture `case_setup_ok.json` was regenerated from the hand-written dictionaries, because a unit test keeps the two equal. Run through `scripts/run_calibration.py --gate` in the image, the committed case passes the gate (`monitored_change`, 8 monitored quantities, largest relative change 8.6e-08 over the last tenth of the run, final initial residuals 9e-12 to 2e-9) and the Scorer errors are unchanged (0.0049 and 0.0087, thresholds 0.05). All five merged calibrations now pass the gate.
+
+## 2026-11-15 observation: still open for the owner
+
+The ADR-0006 Amendments (the three rules made explicit, decision 8 amended to `SIMPLE` only) are confirmed by merging the pull request, together with the open points listed at the end of that section: a run ended by `residualControl` passes whatever the tolerances are; there is no spectral-concentration guard against noise (white noise at every step still passes in about 1 % of trials); one force-coefficient column is judged and no other mean is compared; a periodic flow without a body can never pass; the diagnosis routes only to Case Setup or Mesh. Nothing in the gate has been exercised on a turbulent or a real-model run.
