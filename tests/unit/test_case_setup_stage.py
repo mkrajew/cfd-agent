@@ -418,6 +418,35 @@ def test_prepare_attempt_keeps_a_seed_that_is_already_in_the_attempt(tmp_path):
     assert sorted(p.name for p in polymesh.iterdir()) == sorted(POLYMESH_FILES)
 
 
+def test_seed_from_canonical_skips_the_decompose_dictionary_the_solver_runner_made(tmp_path):
+    """After a passed parallel solve the canonical ``case/system`` holds a ``decomposeParDict`` that
+    the solver tool wrote, not the agent. A Critic send-back to Case Setup must not seed it as if
+    the agent had written it (the prompt tells the agent not to write one)."""
+    setup = Setup(tmp_path)
+    run = setup.ctx.run
+    for name in ("0/U", "system/controlDict", "constant/transportProperties"):
+        run.write_text(f"case/{name}", f"canonical {name}")
+    run.write_text("case/system/decomposeParDict", "numberOfSubdomains 4;")
+    run.write_text("case/system/fvSchemes", "a dictionary the agent wrote")
+    setup.ctx.pass_no = 1
+    attempt = run.attempt_dir("case_setup", 1, 1)
+    carried = setup.stage.seed_from_canonical(setup.ctx, attempt)
+    prefix = "attempts/case_setup-p1-1/case"
+    assert carried == [
+        f"{prefix}/0/U",
+        f"{prefix}/constant/transportProperties",
+        f"{prefix}/system/controlDict",
+        f"{prefix}/system/fvSchemes",
+    ]
+    assert not any("decomposeParDict" in name for name in carried)
+    assert not (attempt / "case" / "system" / "decomposeParDict").exists()
+    setup.stage.prepare_attempt(setup.ctx, attempt)
+    assert not (attempt / "case" / "system" / "decomposeParDict").exists()
+    assert (attempt / "case" / "system" / "controlDict").read_text(encoding="utf-8") == (
+        "canonical system/controlDict"
+    )
+
+
 def checked_by_the_real_consistency_check(ctx):
     """A sandbox whose consistency check is the real one (the other ops are the canned ones)."""
 

@@ -1,10 +1,12 @@
-"""The whole pipeline through ``run_task`` inside the image: a scripted model plays all six agents
-(Planner, Geometry, Mesh, Case Setup, Solver Runner, Analyst), the local-mode executor runs the real
-tools and the real solver, and the real Scorer judges the result. The upload is faked. Local mode
-imports the ``cfdagent`` under test (the checked-out sources), see ``SandboxClient._command``.
+"""The whole pipeline through ``run_task`` inside the image: a scripted model plays all seven agents
+(Planner, Geometry, Mesh, Case Setup, Solver Runner, Analyst, Critic), the local-mode executor runs
+the real tools and the real solver, and the real Scorer judges the result. The upload is faked.
+Local mode imports the ``cfdagent`` under test (the checked-out sources), see
+``SandboxClient._command``.
 
-The conversation is ``tests/fixtures/scripted/cavity_pipeline.json``: the Planner's three replies
-followed by the recorded conversations of the five stages. About two minutes per run.
+The conversation is ``tests/fixtures/scripted/cavity_pipeline.json``: the Planner's three replies,
+the recorded conversations of the five stages and the Critic's three replies (``critic_ok.json``).
+About two minutes per run.
 """
 
 import copy
@@ -32,8 +34,9 @@ FIXTURE = ROOT / "tests" / "fixtures" / "scripted" / "cavity_pipeline.json"
 BENCHMARK = "cavity-re100"
 PLANNER_STEPS = 3
 GEOMETRY_STEPS = 2
-STAGE_STEPS = 2  # every stage after the Planner is two scripted replies
-STAGES = ["planner", "geometry", "mesh", "case_setup", "solver_runner", "analyst"]
+STAGE_STEPS = 2  # every stage after the Planner, up to the Analyst, is two scripted replies
+CRITIC_STEPS = 3  # two tool turns and the verdict
+STAGES = ["planner", "geometry", "mesh", "case_setup", "solver_runner", "analyst", "critic"]
 
 
 class FakeUploader:
@@ -112,6 +115,7 @@ def test_scripted_cavity_pipeline_passes_scorer(clean):
     assert [s.name for s in result.record.stages] == STAGES
     assert all(s.ok and [a.ok for a in s.attempts] == [True] for s in result.record.stages)
     assert len(backend.calls) == len(fixture_steps())  # every scripted reply was used
+    assert result.record.critic_verdict.verdict == "success"
 
     comparison = result.comparison
     report = "\n".join(
@@ -142,6 +146,46 @@ def test_scripted_cavity_pipeline_passes_scorer(clean):
 
 def tmp_state(result) -> Path:
     return result.run_dir.parents[1] / "state"
+
+
+def test_scripted_cavity_pipeline_with_critic_success(clean):
+    result, backend, _ = clean
+    assert result.status == "completed", result.record.failure_reason
+    verdict = result.record.critic_verdict
+    assert verdict is not None and verdict.verdict == "success"
+    assert [c.name for c in verdict.checks] == [
+        "requested_outputs",
+        "task_parameters",
+        "convergence",
+        "plausibility",
+    ]
+    assert all(c.passed for c in verdict.checks)
+    assert verdict.send_back_to is None and verdict.instruction is None
+    assert result.record.critic_rounds == 0 and result.record.fix_loops == []
+    assert [s.name for s in result.record.stages][-2:] == ["analyst", "critic"]
+    assert read_record(RunDir(result.run_dir)).critic_verdict == verdict
+    assert result.comparison["passed"] is True  # the Scorer ran after the Critic
+
+    # the Critic read the real files of this run through its read-only tools
+    critic_calls = backend.calls[-CRITIC_STEPS:]
+    first = critic_calls[0]
+    assert {t["function"]["name"] for t in first.tools} == {"calculator", "read_file", "list_dir"}
+    assert len(first.messages) == 2  # a fresh conversation: the prompt and the opening message
+    assert "End of the solver log (logs/log.icoFoam)" in first.messages[1]["content"]
+    answers = [m["content"] for m in critic_calls[1].messages if m["role"] == "tool"]
+    assert len(answers) == 5 and not any(a.startswith("error:") for a in answers), answers
+    assert "analysis.md" in answers[0] and "logs/" in answers[0]
+    assert "results/" in answers[0] and "attempts" not in answers[0]
+    assert '"value"' in answers[4] and answers[3].strip()  # quantities.json and analysis.md
+    assert critic_calls[2].response_schema.__name__ == "CriticVerdict"
+
+    lines = (result.run_dir / "llm_transcript.jsonl").read_text(encoding="utf-8").splitlines()
+    critic_lines = [json.loads(line) for line in lines if '"stage": "critic"' in line]
+    assert critic_lines and {entry["pass_no"] for entry in critic_lines} == {0}
+    assert all(leaks(json.dumps(entry)) == [] for entry in critic_lines)
+    log = (result.run_dir / "run.log").read_text(encoding="utf-8")
+    assert log.index("stage analyst: ok") < log.index("stage critic: start")
+    assert log.index("stage critic: ok") < log.index("scorer: start")
 
 
 def test_scripted_run_hides_the_benchmark_from_every_file_an_agent_can_read(clean):
@@ -236,6 +280,8 @@ def steps_with_one_fix_loop(steps: list[dict]) -> list[dict]:
         for i in range(5)
     ]
     geometry, mesh, case_setup, solver, analyst = stages
+    critic = steps[PLANNER_STEPS + 5 * STAGE_STEPS :]
+    assert len(critic) == CRITIC_STEPS
     return (
         steps[:PLANNER_STEPS]
         + geometry
@@ -244,6 +290,7 @@ def steps_with_one_fix_loop(steps: list[dict]) -> list[dict]:
         + in_pass_one(case_setup, "case_setup")
         + solver
         + in_pass_one(analyst, "analyst")
+        + critic
     )
 
 
@@ -263,6 +310,7 @@ def test_scripted_pipeline_recovers_through_route_to_case_setup(tmp_path, repair
         ("case_setup", 1, True),  # the fix
         ("solver_runner", 1, True),  # every later stage runs again
         ("analyst", 1, True),
+        ("critic", 1, True),
     ]
     (loop,) = result.record.fix_loops
     assert (loop.n, loop.source, loop.target, loop.origin) == (
@@ -303,6 +351,7 @@ def test_scripted_pipeline_recovers_through_route_to_case_setup(tmp_path, repair
         ("case_setup", 1),
         ("solver_runner", 1),
         ("analyst", 1),
+        ("critic", 1),
     }
     assert result.comparison["passed"] is True, result.comparison
     assert "fix loop 1" in (run / "run.log").read_text(encoding="utf-8")

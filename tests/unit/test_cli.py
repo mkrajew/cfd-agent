@@ -232,13 +232,13 @@ def test_a_task_file_of_exactly_the_limit_is_accepted(runner, root, fake_run_tas
     assert invoke(runner, "run", str(path)).exit_code == 0
 
 
-def test_model_and_effort_apply_to_all_six_agents(runner, root, fake_run_task, task_file):
+def test_model_and_effort_apply_to_all_seven_agents(runner, root, fake_run_task, task_file):
     result = invoke(
         runner, "run", str(task_file), "--model", "gpt-oss-120b", "--reasoning-effort", "high"
     )
     assert result.exit_code == 0, result.output
     models = fake_run_task.calls[0]["config"].models
-    assert len(models) == 6
+    assert len(models) == 7
     assert {m.deployment for m in models.values()} == {"gpt-oss-120b"}
     assert {m.reasoning_effort for m in models.values()} == {"high"}
     assert {m.max_tokens for m in models.values()} == {8192}  # the rest of the default stays
