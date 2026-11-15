@@ -27,3 +27,15 @@ The notes follow the generality rule (no case-specific content). A later benchma
 ## 2026-11-15 observation: deferred items
 
 The notes README is visible to agents and ranks first for some queries; there is no way to list the notes; note operations need `FOAM_TUTORIALS` to be set. Deferred under the lean review workflow.
+
+## 2026-11-15 obstacle: the wedge note advised a residualControl that does not work
+
+Rule 9 of `axisymmetric-wedge.md` advised `residualControl { p 1e-5; Ux 1e-5; Uy 1e-5; }` (see the earlier observation on the `Uz` residual). The pipe calibration of Task 4 (PR 83, merged) showed that `residualControl` keys are field names and component keys are silently ignored: a run with `Ux` and `Uy` at 1e-14 still stopped at the iteration set by `p`. The `U` entry never converges in a wedge case (the `Uz` residual is noise, 1e-4 to 1e-2), and `p` at 1e-6 was too loose on a 4x finer mesh (profile error several times larger). The notes now say: control on `p` alone and prove convergence by invariance of the result under a tighter target.
+
+## 2026-11-15 milestone: notes extended after the pipe calibration, with a guard test
+
+Added to the notes: margin of the box locator, r/R taken from the mesh wall radius (flat wall at R cos(a/2), area factor sin(a)/a), kinematic `p` multiplied by rho, r-weighted averages, and the laminar entrance length 0.0575 Re D (Langhaar, uniform inlet) as rule 11 of `steady-solver-setup.md`. `tests/unit/test_knowledge_notes_content.py` checks a line limit and that no `residualControl` block contains component keys. `cfd-reviewer`: round 1 `changes` (7 findings, small wording fixes, no physics error), round 2 `approve`.
+
+## 2026-11-15 observation: a check that cannot fail does not validate a note
+
+The wedge rule had been "checked" on one run, yet it was wrong, because that check could not tell an ignored key from an effective one. For the report: a check of a control must include a run in which the control is deliberately made impossible (here, a residual target no run can reach) and must show that the run then behaves differently.

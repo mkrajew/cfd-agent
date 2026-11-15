@@ -16,7 +16,9 @@ v2512). Statements marked "checked" were run: CadQuery wedge, Gmsh revolve, `gms
    than `center(...)`, which would move the revolve axis (see `cadquery-api.md`).
 2. The wedge has two planar side faces, one on the +z side and one on the -z side. Each is
    its own patch of type `wedge`; never put both faces in one patch (a wedge patch has one
-   plane). Select the tilted faces by bounding box in the manifest, not by a `plane` locator.
+   plane). Select the tilted faces and the curved outer wall by bounding box in the manifest, not by a
+   `plane` locator; give the box a small margin (the gate already tolerates about 1e-6 of the model size); the
+   bounding box of a curved face can be slightly larger than its geometric extent.
 3. The axis itself has no face when the mesh is built with Gmsh: the cells next to the axis are
    prisms (checked: a revolved structured quadrilateral layer, made with `setTransfiniteCurve`
    and `setTransfiniteSurface`, gave hexahedra plus one prism per cell along the axis, no
@@ -48,22 +50,36 @@ v2512). Statements marked "checked" were run: CadQuery wedge, Gmsh revolve, `gms
 7. The mesh has flat faces: its vertices lie on the true radii, but the outer wall in the
    mid-plane (z = 0) is at `R cos(a/2)`, not at `R` (checked: for a 5 degree wedge it lay at 0.99905 R). Sample lines and probe points must lie inside the mesh: take radial end points from
    the mesh bounding box, not from the ideal radius; points outside are dropped silently.
-   Put sampling lines in the plane z = 0, between the two wedge faces.
+   Put sampling lines in the plane z = 0, between the two wedge faces. For a profile
+   against `r / R`, divide by the radius of the mesh wall in that plane, so that the profile
+   spans exactly 0 to 1 (a mean velocity from a flow rate must use the mesh flow area, not the
+   ideal circle); the cross-section of the slice is smaller than the ideal one by the
+   factor `sin(a) / a` (checked: 0.13 % for a 5 degree wedge), which matters only for tight
+   comparisons.
 8. The solution is for the slice: forces, flow rates and sums over patches cover only `a`
    degrees. Multiply them by `360 / a` for the whole body, and use the reference area of the
    same slice or whole body consistently (see `forces-and-coefficients.md`). Averages
-   (`areaAverage`, `volAverage`) and point values need no scaling. A flow rate
+   (`areaAverage`, `volAverage`) and point values need no scaling. The pressure of a kinematic
+   incompressible solver is `p / rho`: multiply by the fluid density to report pascals. When
+   you average sampled line values or cell values yourself over a wedge cross-section, weight
+   them by the radius `r` (`sum(f r dr) / sum(r dr)`), not a plain mean; `areaAverage` and
+   `volAverage` already weight by face area or cell volume. A flow rate
    through a wedge cross-section is `sum` of `phi` times `360 / a`.
 9. Convergence of a steady wedge case: the solver also solves the component normal to the
-   wedge planes. Checked on a steady laminar run: the initial residuals of Ux, Uy and p fell
-   to 1e-10 and below, but that of Uz stayed of order 1e-4 to 1e-3 for over a thousand
-   iterations, although Uz itself was about 1e-15 (it is residual noise on a quantity that is
-   zero). A `residualControl` entry on `U` (the largest component) is then never met and the
-   run goes to `endTime`. Write the entries per component instead:
-   `residualControl { p 1e-5; Ux 1e-5; Uy 1e-5; }` (checked: accepted, and the run stopped with
-   "SIMPLE solution converged"). Confirm convergence also by the quantity of interest not
-   changing between the last write times (`solverInfo` columns `Ux_initial`, `Uy_initial`,
-   `p_initial`).
+   wedge planes. Checked on steady laminar runs: the initial residuals of Ux, Uy and p fell
+   to 1e-10 and below, but that of Uz stayed between 1e-4 and 1e-2 for thousands of
+   iterations, although Uz itself was about 1e-15 (residual noise on a quantity that is zero).
+   A `residualControl` entry on `U` takes the largest component, so it is never met and the
+   run goes to `endTime` (checked: the iteration cap was reached). The keys of `residualControl`
+   are field names: a component key such as `Ux` is accepted and silently ignored (checked:
+   with `Ux` and `Uy` at 1e-14 the run still stopped at the iteration set by `p`). So control a
+   wedge run on `p` alone: `residualControl { p <target>; }` with the linear-solver `tolerance`
+   far below the target, and compare the last initial residuals of each field in the log with
+   the targets. Prove convergence by invariance: tighten the target by two
+   orders of magnitude (or double the iterations) and check that the sampled quantities do not
+   move. A loose target can pass on a coarse mesh and not on a fine one (checked: one target
+   was enough at a few thousand cells and left a profile error several times larger at four
+   times the cells), so choose the target from this check, not from the answer.
 
 ## Snippet: wedge patches in a field file
 
@@ -86,5 +102,6 @@ boundaryField
 - A sample line reaching the ideal radius: part of it is outside the mesh and is dropped.
 - Forces or flow rates of the slice reported as those of the whole body.
 - A wedge angle of tens of degrees: the flat faces and the curvature error grow; keep it small.
-- Expecting `residualControl { U ... }` to stop the run (rule 9).
+- Expecting `residualControl { U ... }` to stop the run, or `Ux` / `Uy` keys to do anything
+  (rule 9): control on `p`.
 - An unstructured recombined face next to the axis: `defaultFaces` appears (rule 3).

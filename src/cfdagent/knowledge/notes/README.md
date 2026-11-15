@@ -26,7 +26,7 @@ tutorial shows a complete example. Notes are searched first.
 | `gmsh-api.md` | Gmsh Python API: OCC kernel, synchronize, one-cell layer, physical groups, MSH 2.2 |
 | `cadquery-api.md` | CadQuery primitives, booleans, revolve, STEP export and units |
 | `openfoam-function-objects.md` | v2512 function-object names, libraries, output files and columns |
-| `steady-solver-setup.md` | Steady SIMPLE set-up: relaxation, `residualControl`, schemes, pressure level |
+| `steady-solver-setup.md` | Steady SIMPLE set-up: relaxation, `residualControl`, schemes, pressure level, developing flow length |
 | `transient-time-step.md` | Time step from a Courant target, `adjustTimeStep`, write control |
 | `forces-and-coefficients.md` | `forces` and `forceCoeffs` entries and reference values |
 | `axisymmetric-wedge.md` | Wedge geometry, patches and pitfalls of axisymmetric cases |
