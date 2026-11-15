@@ -47,7 +47,8 @@ Full citations are in the `citation` field of each `benchmark.toml`.
   schema forbids extra keys) and must be kept in sync with `task.md`. Run
   `python benchmarks/pipe-re500/make_reference.py --check` to verify the committed CSV.
 - **Cylinder.** Scalar values from published experiments and converged numerical solutions for an
-  unbounded domain, taken from secondary comparison tables (the original papers were not available).
+  unbounded domain, taken from secondary comparison tables (the original papers were not available;
+  only Fornberg (1980) was read in full, see the citation of `cylinder-re20`).
   Where the literature scatters, the reference is the middle of the spread (Re = 20) or an interval
   (Strouhal number at Re = 100). The reasoning is in the comments of each `benchmark.toml`.
 
@@ -62,7 +63,8 @@ Full citations are in the `citation` field of each `benchmark.toml`.
   domain size; the agent has to choose a domain large enough that its boundaries do not influence
   the result. The references are for the unbounded case. Blockage raises Cd and shifts the other
   quantities; for example, computations on a 40D x 20D domain quoted in the literature give Cd of
-  2.16 to 2.23 at Re = 20 against 2.00 to 2.09 for large domains, which exceeds the 5 % threshold.
+  2.16 to 2.23 at Re = 20 against 2.00 to 2.09 for large domains, which exceeds the 4 % threshold
+  around the reference 2.025 (upper edge 2.106).
 - **Normalised quantities.** Profiles are reported as u/U or v/U (cavity, with U = 1 m/s) and u/U_mean
   (pipe), and positions as fractions of the cavity side or the pipe radius. `normalise_by` in the
   TOML is the factor in the units of the reported profile (1 for the cavity, 2 for the pipe, the

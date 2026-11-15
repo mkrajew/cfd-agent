@@ -1,19 +1,28 @@
 id = "cylinder-re20"
 family = "cylinder-crossflow"
 task_file = "task.md"
-citation = "Steady 2D flow past an isolated circular cylinder in an unbounded stream, Re = U*D/nu = 20. Drag coefficient: Dennis, S. C. R. and Chang, G.-Z. (1970), J. Fluid Mech. 42(3), 471-489 (2.045); Fornberg, B. (1980), J. Fluid Mech. 98(4), 819-855 (2.000); Park, J., Kwon, K. and Choi, H. (1998), KSME Int. J. 12(6), 1200-1205 (2.01); Tritton, D. J. (1959), J. Fluid Mech. 6(4), 547-567 (about 2.09, experiment). Recirculation length measured from the rear surface of the cylinder: Coutanceau, M. and Bouard, R. (1977), J. Fluid Mech. 79(2), 231-256 (0.93 D, experiment); Fornberg (1980) 0.91 D. Values were taken from secondary comparison tables, not from the original papers."
+citation = "Steady 2D flow past an isolated circular cylinder in an unbounded stream, Re = U*D/nu = 20. Drag coefficient: Dennis, S. C. R. and Chang, G.-Z. (1970), J. Fluid Mech. 42(3), 471-489 (2.045); Fornberg, B. (1980), J. Fluid Mech. 98(4), 819-855 (2.000); Park, J., Kwon, K. and Choi, H. (1998), KSME Int. J. 12(6), 1200-1205 (2.01); Tritton, D. J. (1959), J. Fluid Mech. 6(4), 547-567 (about 2.09, experiment). Recirculation length measured from the rear surface of the cylinder: Coutanceau, M. and Bouard, R. (1977), J. Fluid Mech. 79(2), 231-256 (0.93 D, experiment); Fornberg (1980) 0.91 D. Checked against the full text of Fornberg (1980), Tables 3 and 6: Cd of Fornberg 2.0001, Dennis and Chang 2.045 (as quoted by Fornberg), Takami and Keller 2.0027, Nieuwstadt and Keller 2.053, Dennis (1973) 1.998; end of the wake bubble at 2.82 radii from the cylinder centre, i.e. 0.91 D from the rear surface. The other values were taken from secondary comparison tables, not from the original papers."
 
-# Reference Cd = 2.05: midpoint of the literature spread 2.00-2.09 (equal to Dennis & Chang, 2.045).
-# Threshold 0.05 covers 1.95-2.15: spread of the references (about +-2%) plus discretisation error.
-# Reference L/D = 0.93 (Coutanceau & Bouard); numerical literature 0.91-0.945.
+# Reference Cd = 2.025: midpoint of the numerical results for Re = 20 in Fornberg (1980), Table 6
+# (1.998 to 2.053). The lowest values, 1.998 (Dennis 1973) and 2.0001 (Fornberg), are the most
+# accurate large-domain results; the highest (2.045, 2.053) are probably affected by finite outer
+# boundaries (not verified). Changed from 2.05 by owner decision D4 (2026-11-15, after the
+# hand-written calibration of this benchmark).
+# Threshold 0.04 covers 1.944-2.106: spread of the numerical references (about +-1.4%), the
+# blockage error of a reasonable domain (about +1.5% at 30 D upstream, 60 D downstream and
+# +-30 D lateral extent, extrapolated from the hand-written calibration) and discretisation
+# error. Values of about 2.16-2.23 quoted for a 40 D x 20 D wall-bounded domain (secondary
+# tables, not verified) lie outside the band.
+# Reference L/D = 0.93 (Coutanceau & Bouard, not verified against the paper); Fornberg (1980),
+# Table 3, gives 0.91 D and the numerical values there range from 0.89 to 0.94 D.
 # Threshold 0.10 covers 0.84-1.02: L is read off a discrete field and depends on mesh and domain.
 
 [[criteria]]
 quantity = "cd"
 kind = "scalar"
 metric = "rel_error"
-threshold = 0.05
-reference_value = 2.05
+threshold = 0.04
+reference_value = 2.025
 
 [[criteria]]
 quantity = "recirculation_length_over_d"

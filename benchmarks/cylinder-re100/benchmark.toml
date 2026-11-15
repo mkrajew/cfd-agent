@@ -6,7 +6,8 @@ citation = "Unsteady 2D flow past an isolated circular cylinder in an unbounded 
 # St: literature 0.164-0.166, widened by 0.004 (about 2.5%) for the finite record length of the
 # shedding signal and a small residual blockage. Passes if 0.160 <= St <= 0.170.
 # Reference mean Cd = 1.34 (large-domain 2D results 1.325-1.34); the threshold 0.05 covers
-# 1.27-1.41, which also contains the experimental values of about 1.39-1.40 quoted in the literature.
+# 1.27-1.41. Experimental values of about 1.39-1.40 are quoted in the literature but were not
+# verified against the original papers; they are not the reference.
 
 [[criteria]]
 quantity = "strouhal"
