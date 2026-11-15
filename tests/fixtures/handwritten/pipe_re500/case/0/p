@@ -1,0 +1,44 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volScalarField;
+    object      p;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// Kinematic pressure p/rho [m^2/s^2], the pressure of the incompressible solvers. The reported
+// pressure drop in Pa is p * rho (post.py). Gauge pressure 0 at the outlet, as the task states.
+dimensions      [0 2 -2 0 0 0 0];
+
+internalField   uniform 0;
+
+boundaryField
+{
+    inlet
+    {
+        type            zeroGradient;
+    }
+
+    outlet
+    {
+        type            fixedValue;
+        value           uniform 0;
+    }
+
+    wall
+    {
+        type            zeroGradient;
+    }
+
+    wedgeNegative
+    {
+        type            wedge;
+    }
+    wedgePositive
+    {
+        type            wedge;
+    }
+}
+
+// ************************************************************************* //

@@ -1,0 +1,48 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volVectorField;
+    object      U;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// Initial guess of the steady solver: the inlet velocity everywhere. It only sets where the
+// iteration starts; the converged solution does not depend on it. The velocity is along the axis
+// (x) and must not have a component through the wedge planes.
+dimensions      [0 1 -1 0 0 0 0];
+
+internalField   uniform (0.05 0 0);
+
+boundaryField
+{
+    // Uniform axial velocity of 0.05 m/s (the mean velocity of Re = 500).
+    inlet
+    {
+        type            fixedValue;
+        value           uniform (0.05 0 0);
+    }
+
+    // The outlet pressure is fixed (see p), the velocity leaves with a zero normal gradient.
+    outlet
+    {
+        type            zeroGradient;
+    }
+
+    wall
+    {
+        type            noSlip;
+    }
+
+    // Axisymmetry: the two planes of the wedge.
+    wedgeNegative
+    {
+        type            wedge;
+    }
+    wedgePositive
+    {
+        type            wedge;
+    }
+}
+
+// ************************************************************************* //
