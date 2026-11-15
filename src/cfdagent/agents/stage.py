@@ -175,30 +175,46 @@ class Stage(ABC):
         ``StageOutcome.route``. The default is ``None``: the failure ends the run."""
         return None
 
-    def _seed(self, ctx: StageContext, attempt_dir: Path, sources: dict[str, str]) -> list[str]:
+    def _seed(
+        self,
+        ctx: StageContext,
+        attempt_dir: Path,
+        sources: dict[str, str],
+        skip: frozenset[str] = frozenset(),
+    ) -> list[str]:
         """``seed_from_canonical`` for a stage whose files are ``sources``: canonical path (a file
         or a directory, run-relative) -> where it goes inside the attempt directory (``''`` for the
-        directory itself). A link where a canonical file should be is skipped, never followed."""
+        directory itself). A link where a canonical file should be is skipped, never followed.
+        ``skip`` names canonical files (run-relative) that are not copied: files a tool made in the
+        stage's place, which the agent did not write."""
         root = ctx.run.relative(attempt_dir)
         carried: list[str] = []
         for source_rel, inside in sources.items():
             target = f"{root}/{inside}" if inside else root
             try:
-                carried += self._copy_writable(ctx, source_rel, target)
+                carried += self._copy_writable(ctx, source_rel, target, skip)
             except UnsafePath:
                 continue
         return sorted(carried)
 
-    def _copy_writable(self, ctx: StageContext, source_rel: str, target_rel: str) -> list[str]:
+    def _copy_writable(
+        self,
+        ctx: StageContext,
+        source_rel: str,
+        target_rel: str,
+        skip: frozenset[str] = frozenset(),
+    ) -> list[str]:
         """Copy the regular files of ``source_rel`` (a directory, or one file) to ``target_rel``:
-        those the scope lets the agent write, judged by their new path. Returns the new paths,
-        sorted. A link on the way to ``source_rel`` raises ``UnsafePath``; a link below it is
-        skipped."""
+        those the scope lets the agent write, judged by their new path, except those named in
+        ``skip`` (run-relative paths of the source). Returns the new paths, sorted. A link on the
+        way to ``source_rel`` raises ``UnsafePath``; a link below it is skipped."""
         run = ctx.run
         carried: list[str] = []
         try:
             top = run.path(source_rel)  # refuses a link on the way, also as the last component
             for source_candidate, target in self._candidates(top, source_rel, target_rel):
+                if source_candidate in skip:
+                    continue
                 try:
                     if not self.scope.can_write(target):
                         continue

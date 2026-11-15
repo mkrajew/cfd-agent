@@ -9,10 +9,13 @@
    for the whole run, so that the VM's daily shutdown waits (``infra/vm/idle-shutdown.sh`` looks
    only at the file's modification time, which the heartbeat refreshes; the content is the process
    id). A state directory that cannot be written is a warning in ``run.log``, not an error.
-3. Run the pipeline steps in order: Planner, Geometry, Mesh, Case Setup, Solver Runner, Analyst.
-   A pipeline is a list of step factories, so a later milestone can insert the Critic. A failed
+3. Run the pipeline steps in order: Planner, Geometry, Mesh, Case Setup, Solver Runner, Analyst
+   and the Critic (ADR-0007). A pipeline is a list of step factories. A failed
    step ends the run ``failed`` with ``failed_stage`` and ``failure_reason``, unless its outcome
-   carries a route (ADR-0006): a request to run an earlier stage again. Then, while the run-wide
+   carries a route (ADR-0006): a request to run an earlier stage again. The Critic's send-back is
+   such a route (``origin="critic"``, at most ``limits.max_critic_rounds`` of them); its verdict is
+   kept in the record beside the status, and a Critic that gives none does not fail the run. Then,
+   while the run-wide
    budget of fix loops (``limits.max_fix_loops``) lasts, the outputs of the stages after the target
    move to ``superseded/pass-<n>/``, the target gets the request in its opening message (and, in
    repair mode ``in_place``, starts from its own accepted files) and every later stage runs again,
@@ -77,6 +80,7 @@ from cfdagent.agents.analyst import (
 )
 from cfdagent.agents.case_setup import CaseSetupStage
 from cfdagent.agents.casespec import CaseSpec
+from cfdagent.agents.critic import run_critic
 from cfdagent.agents.geometry import GeometryStage
 from cfdagent.agents.loop import SeededAttempt, StageOutcome, internal, run_stage
 from cfdagent.agents.mesh import MeshStage
@@ -183,12 +187,22 @@ class GatedStep(Step):
         return list(getattr(self.stage, "knowledge_reads", []))
 
 
+class CriticStep(Step):
+    """The Critic is a function, not a ``Stage``; this wraps it so the list is uniform. It is the
+    last step: a send-back is a route to an earlier step, and its verdict is in the run record."""
+
+    name = "critic"
+
+    def run(self, ctx: StageContext, task_text: str) -> StageOutcome:
+        return run_critic(ctx, task_text)
+
+
 StepFactory = Callable[[], Step]
 Pipeline = list[StepFactory]
 
 
 def default_pipeline() -> Pipeline:
-    """Planner, Geometry, Mesh, Case Setup, Solver Runner, Analyst (a fresh stage per run)."""
+    """Planner, Geometry, Mesh, Case Setup, Solver Runner, Analyst, Critic (fresh per run)."""
     return [
         PlannerStep,
         lambda: GatedStep(GeometryStage()),
@@ -196,6 +210,7 @@ def default_pipeline() -> Pipeline:
         lambda: GatedStep(CaseSetupStage()),
         lambda: GatedStep(SolverRunnerStage()),
         lambda: GatedStep(AnalystStage()),
+        CriticStep,
     ]
 
 
@@ -696,7 +711,9 @@ class _Session:
                     return None
                 index, made = routed
                 continue
-            self.log(f"stage {label}: ok after {outcome.attempts} attempt(s)")
+            # A step can pass and still say something (the Critic that gave no verdict).
+            note = f" ({redact(outcome.reason, MAX_LOG_REASON_CHARS)})" if outcome.reason else ""
+            self.log(f"stage {label}: ok after {outcome.attempts} attempt(s){note}")
             self.write_status("running", name)
             index += 1
         self.current = None

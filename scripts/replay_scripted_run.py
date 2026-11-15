@@ -5,7 +5,7 @@ Usage, on the VM, from the host checkout (the host environment is enough: no too
     /opt/cfdagent-host/bin/python scripts/replay_scripted_run.py \\
         tests/fixtures/scripted/cavity_pipeline.json [--image IMAGE]
 
-``ScriptedBackend`` plays all six agents from the JSON file, so no model is called and the only
+``ScriptedBackend`` plays all seven agents from the JSON file, so no model is called and the only
 cost is VM time. Everything else is real: executor containers in ``docker`` mode, the real Scorer
 against the benchmark's reference data, and the upload of the run folder to the ``runs`` container.
 
@@ -14,10 +14,11 @@ Configuration comes from the environment that ``/etc/cfdagent/env`` provides: ``
 ``CFDAGENT_RUNS_DIR`` and ``CFDAGENT_STATE_DIR``. The benchmark folder is found from this script's
 own location, so the working directory does not matter.
 
-The summary lists the run id, the status, the wall time per stage, the Scorer result, the last
-``upload:`` line of ``run.log``, the size of the run directory and the read-only command that lists
-the run in Blob storage. Exit status: 0 only when the status is ``completed``, the comparison
-passed and the upload finished; 1 otherwise; 2 for a configuration problem.
+The summary lists the run id, the status, the wall time per stage, the Critic's verdict, the Scorer
+result, the last ``upload:`` line of ``run.log``, the size of the run directory and the read-only
+command that lists the run in Blob storage. Exit status: 0 only when the status is ``completed``,
+the Critic's verdict is ``success``, the comparison passed and the upload finished; 1 otherwise; 2
+for a configuration problem.
 """
 
 from __future__ import annotations
@@ -92,6 +93,21 @@ def stage_lines(record: Any) -> list[str]:
     return lines
 
 
+def critic_line(record: Any) -> str:
+    """One line about the Critic's final verdict: what it said, how many checks passed and how
+    many send-backs were followed."""
+    verdict = getattr(record, "critic_verdict", None)
+    if verdict is None:
+        return "Critic: no verdict"
+    checks = list(verdict.checks)
+    passed = sum(1 for check in checks if check.passed)
+    followed = getattr(record, "critic_rounds", 0)
+    return (
+        f"Critic: {verdict.verdict} ({passed} of {len(checks)} checks passed; "
+        f"send-backs followed: {followed})"
+    )
+
+
 def summary_lines(result: Any, upload: str | None, size: int, account: str) -> list[str]:
     record, comparison = result.record, result.comparison or {}
     lines = [
@@ -101,6 +117,7 @@ def summary_lines(result: Any, upload: str | None, size: int, account: str) -> l
         f"wall time: {record.wall_seconds:.1f} s, cost: ${record.cost_usd:.4f}",
         "stages (wall time of the attempts):",
         *stage_lines(record),
+        critic_line(record),
         f"Scorer: passed: {comparison.get('passed')}",
     ]
     for criterion in comparison.get("criteria", []):
@@ -167,7 +184,9 @@ def main(
     print("\n".join(lines), file=out)
     uploaded = upload is not None and _UPLOAD_DONE.match(upload) is not None
     passed = (result.comparison or {}).get("passed") is True
-    return 0 if result.status == "completed" and passed and uploaded else 1
+    verdict = getattr(result.record, "critic_verdict", None)
+    accepted = verdict is not None and verdict.verdict == "success"
+    return 0 if result.status == "completed" and accepted and passed and uploaded else 1
 
 
 if __name__ == "__main__":

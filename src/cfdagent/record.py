@@ -54,6 +54,12 @@ MAX_DIAGNOSIS_CHARS = 1500  # the agent's own account of why an attempt failed
 MAX_FIX_REASON_CHARS = 1000  # why a fix loop was started (the same cap as a route request)
 MAX_FIX_MOVED = 200  # paths a fix loop moved aside that the record lists
 MAX_FIX_PATH_CHARS = 200
+MAX_CRITIC_CHECKS = 30  # checks in one verdict
+MAX_CRITIC_REASONS = 20
+MAX_CRITIC_NAME_CHARS = 100
+MAX_CRITIC_EVIDENCE_CHARS = 500  # the evidence of one check
+MAX_CRITIC_REASON_CHARS = 500
+MAX_CRITIC_INSTRUCTION_CHARS = 1000  # the same cap as a route request
 MAX_KNOWLEDGE_READS = 200  # paths an agent asked to read from the knowledge base
 MAX_KNOWLEDGE_PATH_CHARS = 200
 SOFT_RECORD_BYTES = 1_500_000  # above this the attempt errors are cut down (limit is 2 MB)
@@ -185,6 +191,68 @@ class FixLoopRecord(BaseModel):
         return [redact(item, MAX_FIX_PATH_CHARS) for item in value[:MAX_FIX_MOVED]]
 
 
+class CriticCheck(BaseModel):
+    """One check of the Critic's review: its name, whether it passed and the evidence for it.
+
+    Plain text only (the reply schema of the Critic has no maps and no tuples); the text is bounded
+    and cleaned like the errors of an attempt.
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    name: str
+    passed: bool
+    evidence: str
+
+    @field_validator("name")
+    @classmethod
+    def _clean_name(cls, value: str) -> str:
+        return redact(value, MAX_CRITIC_NAME_CHARS)
+
+    @field_validator("evidence")
+    @classmethod
+    def _clean_evidence(cls, value: str) -> str:
+        return redact(value, MAX_CRITIC_EVIDENCE_CHARS)
+
+
+class CriticVerdict(BaseModel):
+    """The Critic's judgement of a finished run (design 6.2 row 7, ADR-0007).
+
+    ``verdict`` is reported beside the run status and never replaces it. ``send_back_to`` names the
+    stage the Critic wants run again and ``instruction`` says what to change there; the fields
+    carry no defaults so that the strict reply schema lists them all (``None`` says "no send-back").
+    More than ``MAX_CRITIC_CHECKS`` checks or ``MAX_CRITIC_REASONS`` reasons are refused (not cut),
+    so that a failed check cannot be dropped silently.
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    verdict: Literal["success", "partial", "failed"]
+    checks: list[CriticCheck]
+    reasons: list[str]
+    send_back_to: Literal["planner", "geometry", "mesh", "case_setup", "analyst"] | None
+    instruction: str | None
+
+    @field_validator("checks")
+    @classmethod
+    def _bound_checks(cls, value: list[CriticCheck]) -> list[CriticCheck]:
+        if len(value) > MAX_CRITIC_CHECKS:
+            raise ValueError(f"at most {MAX_CRITIC_CHECKS} checks are allowed, got {len(value)}")
+        return value
+
+    @field_validator("reasons")
+    @classmethod
+    def _clean_reasons(cls, value: list[str]) -> list[str]:
+        if len(value) > MAX_CRITIC_REASONS:
+            raise ValueError(f"at most {MAX_CRITIC_REASONS} reasons are allowed, got {len(value)}")
+        return [redact(item, MAX_CRITIC_REASON_CHARS) for item in value]
+
+    @field_validator("instruction")
+    @classmethod
+    def _clean_instruction(cls, value: str | None) -> str | None:
+        return None if value is None else redact(value, MAX_CRITIC_INSTRUCTION_CHARS)
+
+
 class RunRecord(BaseModel):
     """Everything worth knowing about one run; see the module docstring.
 
@@ -214,7 +282,10 @@ class RunRecord(BaseModel):
     cost_estimated: bool = False
     repair_mode: Literal["fresh", "in_place"] = "fresh"  # runs of both modes are never mixed
     wall_seconds: float = Field(default=0.0, ge=0)
-    critic_verdict: None = None  # filled from M2 on
+    # The Critic's final verdict (ADR-0007); ``None`` for a run without one (the Critic did not run
+    # or failed). A send-back that was followed is not a verdict of the run: it is a fix loop.
+    critic_verdict: CriticVerdict | None = None
+    critic_rounds: int = Field(default=0, ge=0)  # send-backs of the Critic that were followed
     comparison: dict[str, Any] | None = None
     # Blind-evaluation audit: every file path an agent asked to read through ``read_knowledge``.
     knowledge_reads: list[str] = Field(default_factory=list)

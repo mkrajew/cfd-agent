@@ -11,6 +11,8 @@ from cfdagent.llm.config import ModelConfig
 from cfdagent.record import (
     NO_REFERENCE_SENTENCE,
     AttemptRecord,
+    CriticCheck,
+    CriticVerdict,
     FixLoopRecord,
     RunRecord,
     StageRecord,
@@ -105,6 +107,69 @@ def test_record_fields_and_defaults():
         make_record(endpoint="https://example.invalid")
     with pytest.raises(ValidationError):
         make_record(critic_verdict="approve")
+    assert record.critic_rounds == 0
+
+
+def make_verdict(**changes) -> CriticVerdict:
+    fields = {
+        "verdict": "partial",
+        "checks": [
+            CriticCheck(name="convergence", passed=False, evidence="the residuals did not fall"),
+            CriticCheck(name="plausibility", passed=True, evidence="the values are in range"),
+        ],
+        "reasons": ["The run did not converge."],
+        "send_back_to": "case_setup",
+        "instruction": "Run longer and set a residual criterion.",
+    }
+    fields.update(changes)
+    return CriticVerdict(**fields)
+
+
+def test_old_run_record_without_critic_fields_loads(run):
+    write_record(run, make_record(status="completed", finished_at=NOW))
+    document = json.loads((run.root / "run_record.json").read_text())
+    assert document["critic_verdict"] is None and document["critic_rounds"] == 0
+    del document["critic_verdict"]  # an M1 record has the placeholder, an early M2 one neither
+    del document["critic_rounds"]
+    (run.root / "run_record.json").write_text(json.dumps(document), encoding="utf-8")
+    loaded = read_record(run)
+    assert loaded.critic_verdict is None and loaded.critic_rounds == 0
+    document["critic_verdict"] = None  # the M1 form: the field exists and holds null
+    (run.root / "run_record.json").write_text(json.dumps(document), encoding="utf-8")
+    assert read_record(run).critic_verdict is None
+
+
+def test_a_critic_verdict_survives_the_round_trip(run):
+    verdict = make_verdict()
+    record = make_record(
+        status="completed", finished_at=NOW, critic_verdict=verdict, critic_rounds=2
+    )
+    write_record(run, record)
+    loaded = read_record(run)
+    assert loaded.critic_verdict == verdict and loaded.critic_rounds == 2
+    document = json.loads((run.root / "run_record.json").read_text())
+    assert document["critic_verdict"]["checks"][0] == {
+        "name": "convergence",
+        "passed": False,
+        "evidence": "the residuals did not fall",
+    }
+    assert document["critic_verdict"]["send_back_to"] == "case_setup"
+
+
+def test_the_critic_verdict_in_a_record_is_validated_and_cleaned():
+    with pytest.raises(ValidationError):
+        make_record(critic_verdict={"verdict": "approve"})
+    with pytest.raises(ValidationError):
+        make_record(critic_rounds=-1)
+    with pytest.raises(ValidationError):
+        make_verdict(send_back_to="solver_runner")  # the Solver Runner edits nothing
+    with pytest.raises(ValidationError):
+        make_verdict(extra="field")
+    cleaned = make_verdict(reasons=[f"write to a{AT}b.example from {IP1}"])
+    assert AT not in cleaned.reasons[0] and IP1 not in cleaned.reasons[0]
+    record = make_record(critic_verdict=make_verdict())
+    record.critic_verdict = None  # a record can be reset: a failed Critic leaves no verdict
+    assert record.critic_verdict is None
 
 
 def test_the_repair_mode_is_recorded_and_defaults_to_fresh(run):

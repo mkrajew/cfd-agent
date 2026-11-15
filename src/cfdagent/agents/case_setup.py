@@ -66,6 +66,10 @@ POLYMESH_REL = "constant/polyMesh"
 MESH_NOTES = "mesh/notes.md"  # what the Mesh stage may have left for this stage
 MESH_LOGS = ("mesh/mesh.log", "mesh/case/checkMesh.log")  # its script output and checkMesh report
 CONTROL_DICT_REL = "system/controlDict"
+# Files of the case that the tool of a later stage writes and that are not the agent's work
+# (relative to ``case/``): the Solver Runner's tool makes ``system/decomposeParDict`` for a
+# parallel run.
+TOOL_MADE_FILES = ("system/decomposeParDict",)
 # The solvers the executor runs (``tools.foam.SOLVERS``); host code must not import the tool
 # layer, so a unit test keeps the two in step.
 KNOWN_SOLVERS = ("icoFoam", "simpleFoam", "pimpleFoam")
@@ -338,11 +342,17 @@ class CaseSetupStage(KnowledgeTools, Stage):
     def seed_from_canonical(self, ctx: StageContext, attempt_dir: Path) -> list[str]:
         """The dictionaries of the case the stage last accepted: ``0/``, ``constant/`` and
         ``system/``. The mesh is not seeded (``prepare_attempt`` copies it from the run, and the
-        file scope excludes it), nor are time directories, ``postProcessing/`` or logs."""
+        file scope excludes it), nor are time directories, ``postProcessing/`` or logs, nor the
+        files a tool made (``TOOL_MADE_FILES``): after a passed parallel solve the canonical case
+        holds a ``system/decomposeParDict`` that the agent did not write, and seeding it would hand
+        the agent a dictionary it is told never to write and fix the next run to a number of
+        subdomains that nobody chose."""
+        skip = frozenset(f"{CASE_NAME}/{name}" for name in TOOL_MADE_FILES)
         return self._seed(
             ctx,
             attempt_dir,
             {f"{CASE_NAME}/{name}": f"{CASE_NAME}/{name}" for name in ("0", "constant", "system")},
+            skip,
         )
 
     def extra_tools(self, ctx: StageContext, attempt_dir: Path) -> list[Tool]:

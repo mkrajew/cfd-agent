@@ -17,7 +17,15 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from cfdagent.llm.config import LLMSettings, ModelConfig
 from cfdagent.sandbox.config import SandboxConfig
 
-AGENT_NAMES = ("planner", "geometry", "mesh", "case_setup", "solver_runner", "analyst")
+AGENT_NAMES = (
+    "planner",
+    "geometry",
+    "mesh",
+    "case_setup",
+    "solver_runner",
+    "analyst",
+    "critic",
+)
 DEFAULT_DEPLOYMENT = "gpt-oss-120b"
 # Case Setup writes a whole set of dictionaries and checks them before its attempt ends; two runs
 # of M1 used all 40 turns without reaching a passing check.
@@ -43,6 +51,9 @@ class RunLimits(BaseModel):
     # Fix loops of the whole run (ADR-0006): a failed gate or the Critic sending the run back to an
     # earlier stage. Zero turns the mechanism off: the first request then ends the run.
     max_fix_loops: int = Field(default=10, ge=0, le=100)
+    # Send-backs of the Critic that are followed (ADR-0007); each one is also a fix loop and uses
+    # the budget above. Zero means the Critic only reports.
+    max_critic_rounds: int = Field(default=2, ge=0, le=100)
     wall_clock_s: float = 7200
     max_cost_usd: float = 1.0
     max_ranks: int = Field(default=MAX_RANKS_LIMIT, ge=1, le=MAX_RANKS_LIMIT)
@@ -88,7 +99,7 @@ class RunConfig(BaseModel):
 
     @classmethod
     def default(cls, image: str = DEFAULT_IMAGE) -> Self:
-        """All six agents on the primary model with medium reasoning effort."""
+        """All seven agents on the primary model with medium reasoning effort."""
         models = {
             name: ModelConfig(
                 deployment=DEFAULT_DEPLOYMENT, reasoning_effort="medium", max_tokens=8192

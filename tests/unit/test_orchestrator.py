@@ -12,17 +12,18 @@ from pathlib import Path
 
 import pytest
 from test_casespec import SPEC
+from test_critic import CHECK_NAMES, verdict_json
 
 from cfdagent import orchestrator
 from cfdagent.agents.casespec import CaseSpec
 from cfdagent.agents.geometry import GeometryStage
 from cfdagent.agents.loop import StageOutcome
-from cfdagent.agents.routing import RouteRequest
+from cfdagent.agents.routing import STAGE_ORDER, RouteRequest
 from cfdagent.config import RunConfig, RunLimits
 from cfdagent.errors import ToolFailure
 from cfdagent.llm.client import ChatResult, ToolCall, Usage
 from cfdagent.llm.scripted import ScriptedBackend
-from cfdagent.orchestrator import GatedStep, RunExistsError, Step, run_task
+from cfdagent.orchestrator import CriticStep, GatedStep, RunExistsError, Step, run_task
 from cfdagent.record import AttemptRecord, StageRecord, read_record
 from cfdagent.rundir import RunDir
 from cfdagent.sandbox.client import SandboxClient
@@ -126,10 +127,10 @@ def steps(*made):
 def go(tmp_path, *made, task=TASK, config=None, **kwargs):
     kwargs.setdefault("uploader", FakeUploader())
     kwargs.setdefault("now", TICKER)
+    kwargs.setdefault("backend", ScriptedBackend([]))
     return run_task(
         task,
         config or RunConfig.default(),
-        backend=ScriptedBackend([]),
         run_root=tmp_path / "runs",
         pipeline=steps(*made),
         state_dir=tmp_path / "state",
@@ -917,6 +918,237 @@ def test_an_ad_hoc_task_names_the_run_after_its_first_line(tmp_path):
     assert result.run_id.endswith("-simulate-a-heated-plate")
 
 
+# ---------------------------------------------------------------------- the Critic (ADR-0007)
+
+
+def critic_reply(content, finish_reason="stop"):
+    return ChatResult(
+        content=content,
+        tool_calls=[],
+        usage=Usage(100, 50, None),
+        parsed=None,
+        raw={},
+        finish_reason=finish_reason,
+    )
+
+
+def critic_backend(*verdicts):
+    """A scripted Critic: for each verdict one plain-text reply and the structured verdict."""
+    steps = []
+    for verdict in verdicts:
+        steps += [critic_reply("I have read what I need."), critic_reply(verdict)]
+    return ScriptedBackend(steps)
+
+
+def sent_back(target="analyst", instruction="Recompute the values with the right units."):
+    return verdict_json(
+        "partial",
+        failed=("plausibility",),
+        reasons=("The values are not plausible.",),
+        send_back_to=target,
+        instruction=instruction,
+    )
+
+
+def with_critic(calls, *verdicts, solver_script=(True,), **actions):
+    """The six fake stages and the real ``CriticStep`` on a scripted model."""
+    made = pipeline_of(calls, list(solver_script), **actions)
+    return made, critic_backend(*verdicts)
+
+
+def critic_config(**limits) -> RunConfig:
+    return RunConfig.default().model_copy(update={"limits": RunLimits(**limits)})
+
+
+def test_the_default_pipeline_ends_with_the_critic_after_the_analyst():
+    names = [factory().name for factory in orchestrator.default_pipeline()]
+    assert names == list(STAGE_ORDER)
+    assert names[-2:] == ["analyst", "critic"]
+
+
+def test_a_success_verdict_is_recorded_beside_a_completed_status(tmp_path):
+    made, backend = with_critic([], verdict_json())
+    result = go(tmp_path, *made.values(), CriticStep(), backend=backend)
+    assert result.status == "completed" and result.record.failure_reason is None
+    assert result.record.critic_verdict.verdict == "success"
+    assert result.record.critic_rounds == 0 and result.record.fix_loops == []
+    assert [s.name for s in result.record.stages][-2:] == ["analyst", "critic"]
+    assert read_record(RunDir(result.run_dir)).critic_verdict.verdict == "success"
+    assert "stage critic: ok after 1 attempt(s)" in log_text(result)
+
+
+def test_a_failed_verdict_does_not_fail_the_run(tmp_path):
+    verdict = verdict_json("failed", failed=CHECK_NAMES, reasons=("Nothing was computed.",))
+    made, backend = with_critic([], verdict)
+    result = go(tmp_path, *made.values(), CriticStep(), backend=backend)
+    assert result.status == "completed"  # what the pipeline did; the verdict is reported beside it
+    assert result.record.critic_verdict.verdict == "failed"
+    assert result.record.failed_stage is None
+
+
+def test_a_critic_send_back_reruns_the_stages_from_its_target(tmp_path):
+    calls = []
+    made, backend = with_critic(calls, sent_back("mesh", "Refine near the walls."), verdict_json())
+    result = go(tmp_path, *made.values(), CriticStep(), backend=backend)
+    assert result.status == "completed", result.record.failure_reason
+    assert [name for name, _ in calls] == [
+        "planner",
+        "geometry",
+        "mesh",
+        "case_setup",
+        "solver_runner",
+        "analyst",
+        "mesh",  # the Critic sent the run back here ...
+        "case_setup",  # ... and every stage after it runs again
+        "solver_runner",
+        "analyst",
+    ]
+    (loop,) = result.record.fix_loops
+    assert (loop.n, loop.source, loop.target, loop.origin) == (1, "critic", "mesh", "critic")
+    assert loop.reason == "The values are not plausible."
+    request = made["mesh"].seen[1][1]
+    assert request.origin == "critic" and request.instruction == "Refine near the walls."
+    assert made["case_setup"].seen == [(0, None), (1, None)]  # only the target is told
+    assert result.record.critic_rounds == 1
+    assert result.record.critic_verdict.verdict == "success"  # the verdict of the final pass
+    assert [(s.name, s.pass_no, s.ok) for s in result.record.stages if s.name == "critic"] == [
+        ("critic", 0, False),
+        ("critic", 1, True),
+    ]
+    assert "fix loop 1: critic -> mesh (critic)" in log_text(result)
+
+
+def test_critic_rounds_capped_then_final(tmp_path):
+    calls = []
+    verdicts = [sent_back("analyst")] * 3  # the third send-back finds no round left
+    made, backend = with_critic(calls, *verdicts)
+    result = go(tmp_path, *made.values(), CriticStep(), backend=backend)
+    assert result.status == "completed", result.record.failure_reason
+    assert [
+        (loop.n, loop.source, loop.target, loop.origin) for loop in result.record.fix_loops
+    ] == [
+        (1, "critic", "analyst", "critic"),
+        (2, "critic", "analyst", "critic"),
+    ]
+    assert result.record.critic_rounds == 2  # max_critic_rounds
+    final = result.record.critic_verdict
+    assert final.verdict == "partial" and final.send_back_to == "analyst"
+    assert (
+        final.instruction == "Recompute the values with the right units."
+    )  # recorded, not followed
+    assert made["analyst"].calls == 3 and len(backend.calls) == 6
+    assert [(s.pass_no, s.ok) for s in result.record.stages if s.name == "critic"] == [
+        (0, False),
+        (1, False),
+        (2, True),
+    ]
+    assert len(backend.calls) == len(verdicts) * 2  # every scripted reply was used
+
+
+def test_the_critic_round_limit_is_the_configured_one(tmp_path):
+    made, backend = with_critic([], sent_back(), sent_back())
+    result = go(
+        tmp_path,
+        *made.values(),
+        CriticStep(),
+        backend=backend,
+        config=critic_config(max_critic_rounds=1),
+    )
+    assert result.status == "completed"
+    assert result.record.critic_rounds == 1 and len(result.record.fix_loops) == 1
+    assert result.record.critic_verdict.send_back_to == "analyst"
+
+
+def test_send_back_without_fix_loop_budget_is_final_not_failed(tmp_path):
+    # one loop in the budget: the first send-back is followed, the second is final
+    made, backend = with_critic([], sent_back(), sent_back())
+    result = go(
+        tmp_path,
+        *made.values(),
+        CriticStep(),
+        backend=backend,
+        config=critic_config(max_fix_loops=1),
+    )
+    assert result.status == "completed" and result.record.failure_reason is None
+    assert len(result.record.fix_loops) == 1 and result.record.critic_rounds == 1
+    assert result.record.critic_verdict.send_back_to == "analyst"
+    # no budget at all: the send-back is recorded and nothing is followed
+    made, backend = with_critic([], sent_back())
+    result = go(
+        tmp_path / "zero",
+        *made.values(),
+        CriticStep(),
+        backend=backend,
+        config=critic_config(max_fix_loops=0),
+    )
+    assert result.status == "completed" and "fix-loop limit" not in (
+        result.record.failure_reason or ""
+    )
+    assert result.record.fix_loops == [] and result.record.critic_rounds == 0
+    assert result.record.critic_verdict.verdict == "partial"
+    assert made["analyst"].calls == 1
+
+
+def test_the_budget_used_by_gate_loops_counts_for_the_critic(tmp_path):
+    gate_route = RouteRequest(
+        source="solver_runner", target="case_setup", origin="gate", reason="not converged"
+    )
+    made, backend = with_critic([], sent_back(), solver_script=[gate_route, True])
+    result = go(
+        tmp_path,
+        *made.values(),
+        CriticStep(),
+        backend=backend,
+        config=critic_config(max_fix_loops=1),
+    )
+    assert result.status == "completed"
+    assert [loop.origin for loop in result.record.fix_loops] == [
+        "gate"
+    ]  # the whole budget is spent
+    assert (
+        result.record.critic_rounds == 0 and result.record.critic_verdict.send_back_to == "analyst"
+    )
+
+
+def test_critic_failure_leaves_verdict_none_and_run_continues(tmp_path):
+    root = make_benchmarks(tmp_path)
+    invalid = verdict_json("success", failed=("convergence",))  # a success with a failed check
+    backend = ScriptedBackend(
+        [critic_reply("Read."), critic_reply(invalid), critic_reply(invalid), critic_reply(invalid)]
+    )
+    analyst = FakeStep("analyst", action=write_quantities(GOOD_QUANTITIES))
+    result = go(
+        tmp_path,
+        analyst,
+        CriticStep(),
+        backend=backend,
+        config=bench_config(),
+        benchmarks_root=root,
+    )
+    assert result.status == "completed" and result.record.failure_reason is None
+    assert result.record.critic_verdict is None and result.record.critic_rounds == 0
+    assert result.comparison["passed"] is True  # the Scorer still ran
+    critic = [s for s in result.record.stages if s.name == "critic"]
+    assert len(critic) == 1 and not critic[0].ok and len(critic[0].attempts) == 3
+    assert "stage critic: ok after 3 attempt(s)" in log_text(result)
+    assert "3 invalid replies" in log_text(result)
+
+
+def test_a_critic_that_runs_into_the_cost_limit_leaves_the_run_completed(tmp_path):
+    made, backend = with_critic([], verdict_json())
+    config = critic_config(max_cost_usd=1e-9)
+    result = go(tmp_path, *made.values(), CriticStep(), backend=backend, config=config)
+    assert result.record.critic_verdict is None
+    assert result.status == "completed" and result.record.failure_reason is None
+
+
+def test_the_critic_is_not_made_before_the_analyst_has_passed(tmp_path):
+    made, backend = with_critic([], verdict_json(), solver_script=[False])
+    result = go(tmp_path, *made.values(), CriticStep(), backend=backend)
+    assert result.status == "failed" and result.record.failed_stage == "solver_runner"
+    assert backend.calls == [] and result.record.critic_verdict is None
+
+
 # ---------------------------------------------------------------------- benchmarks and the Scorer
 
 
@@ -1132,6 +1364,78 @@ def test_transcript_contains_no_reference_data(tmp_path):
     assert "bench-one" not in mid_run["status"]
     # the final record and summary do name it
     assert read_record(RunDir(result.run_dir)).benchmark_id == "bench-one"
+
+
+# the Analyst's own numbers, close to the reference but not equal to any value of it
+CLOSE_QUANTITIES = {
+    "profile_q": {"x": [0.0, 0.25, 0.5, 0.75, 1.0], "value": [0.0, 0.2, 0.31, 0.5, 0.72]}
+}
+
+
+def test_transcript_has_no_reference_values_with_critic(tmp_path):
+    """The Critic runs before the Scorer and may not read what could carry a reference value: the
+    comparison file, the benchmark folder, an earlier pass. Whatever it asks for, no line of the
+    run's transcript (its own lines included) holds a reference value."""
+    root = make_benchmarks(tmp_path)
+    values = reference_values(root)
+    assert "0.31416" in values
+    snooping = [
+        ("c1", "results/comparison.json"),
+        ("c2", "benchmarks/reference/ref.csv"),
+        ("c3", "superseded/pass-1/results/quantities.json"),
+        ("c4", "../benchmarks/reference/ref.csv"),
+        ("c5", "results/quantities.json"),
+    ]
+    calls = [
+        ToolCall(id=call_id, name="read_file", arguments={"path": path})
+        for call_id, path in snooping
+    ]
+
+    def stale_files(ctx):
+        # files a careless setup could leave in the run directory: they must stay unseen
+        ctx.run.write_text("results/comparison.json", json.dumps({"reference": 0.31416}))
+        ctx.run.write_text("superseded/pass-1/results/quantities.json", '{"profile_q": 0.31416}')
+        ctx.run.write_text("benchmarks/reference/ref.csv", "x,value\n0.5,0.31416\n")
+        write_quantities(CLOSE_QUANTITIES)(ctx)
+
+    backend = ScriptedBackend(
+        [
+            ChatResult(
+                content="Reading.",
+                tool_calls=calls,
+                usage=Usage(100, 50, None),
+                parsed=None,
+                raw={},
+                finish_reason="tool_calls",
+            ),
+            critic_reply("Enough."),
+            critic_reply(verdict_json()),
+        ]
+    )
+    analyst = FakeStep("analyst", action=stale_files)
+    result = go(
+        tmp_path,
+        analyst,
+        CriticStep(),
+        backend=backend,
+        config=bench_config(),
+        benchmarks_root=root,
+    )
+    assert result.status == "completed" and result.record.critic_verdict.verdict == "success"
+    lines = (result.run_dir / "llm_transcript.jsonl").read_text(encoding="utf-8").splitlines()
+    entries = [json.loads(line) for line in lines]
+    assert {entry["stage"] for entry in entries} == {"critic"}  # the Critic's own lines are there
+    assert len(entries) >= 3
+    answers = [m["content"] for m in backend.calls[1].messages if m["role"] == "tool"]
+    assert [a.startswith("error:") for a in answers] == [True, True, True, True, False]
+    for name in ("llm_transcript.jsonl", "task.md", "status.json", "run.log"):
+        text = (result.run_dir / name).read_text(encoding="utf-8")
+        assert leaks(text, benchmark_id="bench-one", reference_values=values) == [], name
+    for call in backend.calls:  # nothing the model was sent holds a reference value
+        assert (
+            leaks(json.dumps(call.messages), benchmark_id="bench-one", reference_values=values)
+            == []
+        )
 
 
 def test_the_run_id_does_not_name_the_benchmark(tmp_path):

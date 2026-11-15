@@ -5,10 +5,10 @@ from datetime import datetime
 import pytest
 from pydantic import ValidationError
 
-from cfdagent.config import RunConfig, RunLimits, make_run_id, slugify
+from cfdagent.config import AGENT_NAMES, RunConfig, RunLimits, make_run_id, slugify
 from cfdagent.llm.config import LLMSettings
 
-AGENTS = {"planner", "geometry", "mesh", "case_setup", "solver_runner", "analyst"}
+AGENTS = {"planner", "geometry", "mesh", "case_setup", "solver_runner", "analyst", "critic"}
 
 
 def test_run_id_format_and_slug_sanitised():
@@ -38,6 +38,7 @@ def test_default_config_models_and_limits():
     assert limits == RunLimits(max_turns_per_attempt_by_stage={"case_setup": 60})
     assert limits.max_attempts_per_stage == 3
     assert limits.max_fix_loops == 10  # design 6.5
+    assert limits.max_critic_rounds == 2  # ADR-0007
     assert limits.wall_clock_s == 7200
     assert limits.max_cost_usd == 1.0
     assert limits.max_ranks == 4
@@ -65,6 +66,8 @@ def test_limits_reject_nonsense():
         ("max_attempts_per_stage", 0),
         ("max_fix_loops", -1),
         ("max_fix_loops", 101),
+        ("max_critic_rounds", -1),
+        ("max_critic_rounds", 101),
         ("max_cost_usd", -1),
         ("max_cost_usd", float("nan")),
         ("wall_clock_s", 0),
@@ -98,13 +101,25 @@ def test_default_image_is_the_shipped_runtime_image():
     assert RunConfig.default().sandbox.image == "cfdagent:runtime"
 
 
-def test_models_must_cover_exactly_the_six_agents():
+def test_models_must_cover_exactly_the_seven_agents():
     data = RunConfig.default().model_dump()
-    missing = {k: v for k, v in data["models"].items() if k != "analyst"}
+    for name in ("analyst", "critic"):
+        missing = {k: v for k, v in data["models"].items() if k != name}
+        with pytest.raises(ValidationError):
+            RunConfig(**{**data, "models": missing})
     with pytest.raises(ValidationError):
-        RunConfig(**{**data, "models": missing})
-    with pytest.raises(ValidationError):
-        RunConfig(**{**data, "models": {**data["models"], "critic": data["models"]["mesh"]}})
+        RunConfig(**{**data, "models": {**data["models"], "oracle": data["models"]["mesh"]}})
+
+
+def test_the_critic_is_the_seventh_agent():
+    assert AGENT_NAMES[-1] == "critic" and len(AGENT_NAMES) == 7
+    assert RunConfig.default().models["critic"].reasoning_effort == "medium"
+
+
+def test_old_limits_without_critic_rounds_load():
+    data = RunConfig.default().model_dump()
+    del data["limits"]["max_critic_rounds"]
+    assert RunConfig(**data).limits.max_critic_rounds == 2
 
 
 def test_turn_limit_override_per_stage():
