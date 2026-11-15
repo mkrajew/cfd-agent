@@ -206,6 +206,15 @@ docker image ls ghcr.io/mkrajew/cfd-agent
 
 Then deallocate: `infra/scripts/vm-down.ps1` (or wait for the idle shutdown).
 
+### 3.5 Leftover executor containers
+
+Executor containers are not started with `--rm` (the client must inspect a container that was killed for lack of memory before it removes it) and the client removes each one itself after the call. If the orchestrator is killed hard, or the VM restarts during a call, exited `cfd-*` containers can stay behind. They are small and harmless; remove them with:
+
+```bash
+docker ps -a --filter "name=cfd-" --filter "status=exited"   # look first
+docker container prune -f                                    # removes every stopped container
+```
+
 ## 4. Entra-only redeploy and container-scoped blob role (S7)
 
 This part changes Azure resources: show the owner the `what-if` and this cost note first. Until the steps
