@@ -1,0 +1,13 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      turbulenceProperties;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// The task states a laminar flow: no turbulence model. At Re = 100 the wake is unsteady but still laminar (2D periodic shedding).
+simulationType  laminar;
+
+// ************************************************************************* //

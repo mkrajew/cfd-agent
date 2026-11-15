@@ -1,0 +1,16 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      decomposeParDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// Four ranks (the maximum for the machine). The solver tool decomposes and reconstructs the case
+// itself; the method balances the cells by graph partitioning.
+numberOfSubdomains 4;
+
+method          scotch;
+
+// ************************************************************************* //

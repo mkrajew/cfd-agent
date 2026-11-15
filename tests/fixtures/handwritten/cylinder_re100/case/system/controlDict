@@ -1,0 +1,82 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      controlDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+application     pimpleFoam;
+
+startFrom       startTime;
+
+startTime       0;
+
+stopAt          endTime;
+
+// Transient run: the flow starts impulsively, the shedding of the wake grows from the tilted
+// start (see 0/U) and has to saturate; then enough periods must remain for the analysis.
+endTime         30;
+
+// The first steps are impulsive (uniform field against a no-slip wall): start small, the step
+// grows by at most 20 % per step until the Courant limit takes over.
+deltaT          0.0001;
+
+adjustTimeStep  yes;
+
+maxCo           1;
+
+// Cell width at the cylinder is 0.002 and the speed up to 1.7 U at the shoulders; a larger cap
+// would only matter far away, where the Courant number is the limit anyway.
+maxDeltaT       0.002;
+
+// Only the final fields are needed (the force coefficients are written at every step below).
+writeControl    adjustableRunTime;
+
+writeInterval   10;
+
+purgeWrite      2;
+
+writeFormat     ascii;
+
+writePrecision  8;
+
+writeCompression off;
+
+timeFormat      general;
+
+timePrecision   6;
+
+runTimeModifiable false;
+
+functions
+{
+    // Force coefficients of the cylinder at every time step: the lift record gives the shedding
+    // frequency, the drag record its time average. Writing at every step matters: a coarser
+    // output can alias the frequency. Cd = F_x / (0.5 rho U^2 Aref). The pressure is kinematic
+    // (the solver has no density), so the force is scaled with rhoInf = 1 kg/m^3, the density of
+    // the task. The mesh is one cell thick (0.1 m), so the force acts on a 0.1 m slab of the
+    // cylinder: Aref = D * thickness = 0.1 * 0.1 = 0.01 m^2 makes Cd the usual two-dimensional
+    // drag coefficient, the force per unit length over (0.5 rho U^2 D). magUInf is the free-stream
+    // speed 1 m/s (not the tilted inlet of the first seconds).
+    forceCoeffs
+    {
+        type            forceCoeffs;
+        libs            (forces);
+        patches         (cylinder);
+        rho             rhoInf;
+        rhoInf          1;
+        CofR            (0 0 0);
+        liftDir         (0 1 0);
+        dragDir         (1 0 0);
+        pitchAxis       (0 0 1);
+        magUInf         1;
+        lRef            0.1;
+        Aref            0.01;
+        writeControl    timeStep;
+        writeInterval   1;
+    }
+}
+
+// ************************************************************************* //

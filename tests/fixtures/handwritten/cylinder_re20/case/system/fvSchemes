@@ -1,0 +1,49 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      fvSchemes;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// Steady state: there is no time derivative; the iteration is pseudo-time stepping only.
+ddtSchemes
+{
+    default         steadyState;
+}
+
+gradSchemes
+{
+    default         Gauss linear;
+}
+
+// Convection of momentum: second-order linear-upwind with the gradient of U. The cell Reynolds
+// number U dx / nu is below 1 at the cylinder (dx = 0.002) and about 2 in the near wake
+// (dx = 0.01), so the scheme is well inside its robust range. "bounded" subtracts the
+// continuity error, which only matters while the iteration is unconverged and keeps it stable.
+divSchemes
+{
+    default         none;
+    div(phi,U)      bounded Gauss linearUpwind grad(U);
+    div((nuEff*dev2(T(grad(U))))) Gauss linear;
+}
+
+// The mesh is an unstructured quad mesh: faces are not orthogonal to the line between the cell
+// centres, so the non-orthogonal correction ("corrected") is needed.
+laplacianSchemes
+{
+    default         Gauss linear corrected;
+}
+
+interpolationSchemes
+{
+    default         linear;
+}
+
+snGradSchemes
+{
+    default         corrected;
+}
+
+// ************************************************************************* //

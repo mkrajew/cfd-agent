@@ -1,0 +1,63 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volVectorField;
+    object      U;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// Initial field: the free stream everywhere (impulsive start against the no-slip wall).
+dimensions      [0 1 -1 0 0 0 0];
+
+internalField   uniform (1 0 0);
+
+boundaryField
+{
+    // Free stream: along +x, 1 m/s. A perfectly symmetric start would keep the wake symmetric for
+    // a very long time (the shedding grows from round-off). For the first 2 s the stream is
+    // tilted by 5.7 degrees (v = 0.1 m/s), then it is brought back to exactly along +x at 3 s
+    // (linear table, clamped outside). The tilt is gone long before the shedding is analysed.
+    inlet
+    {
+        type            uniformFixedValue;
+        uniformValue    table
+        (
+            (0 (1 0.1 0))
+            (2 (1 0.1 0))
+            (3 (1 0 0))
+        );
+    }
+
+    // Fluid leaves; if it ever flows back in, it comes in at rest.
+    outlet
+    {
+        type            inletOutlet;
+        inletValue      uniform (0 0 0);
+        value           uniform (1 0 0);
+    }
+
+    // Lateral boundaries are open, not walls: they are far from the cylinder, so fluid may be
+    // drawn in or pushed out through them (a closed lateral boundary would act as blockage).
+    // Where fluid enters it carries the free stream; where it leaves the velocity follows the
+    // interior.
+    sides
+    {
+        type            inletOutlet;
+        inletValue      uniform (1 0 0);
+        value           uniform (1 0 0);
+    }
+
+    cylinder
+    {
+        type            noSlip;
+    }
+
+    // One cell in z: the 2D case has no flow through the front and back planes.
+    frontAndBack
+    {
+        type            empty;
+    }
+}
+
+// ************************************************************************* //
