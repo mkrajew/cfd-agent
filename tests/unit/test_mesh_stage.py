@@ -1000,7 +1000,8 @@ def test_stage_identity_and_extra_tools(tmp_path):
     stage = MeshStage()
     ctx = stage_ctx(tmp_path)
     assert (stage.name, stage.agent) == ("mesh", "mesh")
-    assert stage.extra_tools(ctx, ctx.run.attempt_dir("mesh", 1)) == []
+    tools = stage.extra_tools(ctx, ctx.run.attempt_dir("mesh", 1))
+    assert [tool.name for tool in tools] == ["search_knowledge", "read_knowledge"]
     assert stage.system_prompt() == load_prompt("mesh").text
 
 
@@ -1132,6 +1133,8 @@ def test_stage_loop_passes_promotes_and_records_one_attempt(tmp_path):
         "list_dir",
         "write_file",
         "check_stage",
+        "search_knowledge",
+        "read_knowledge",
     }
     assert [(a.n, a.ok) for a in ctx.record.stages[0].attempts] == [(1, True)]
 

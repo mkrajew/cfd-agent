@@ -41,9 +41,10 @@ from cfdagent.agents.casespec import BoundarySpec, CaseSpec
 from cfdagent.agents.gatehelp import last_bytes, names, read_manifest
 from cfdagent.agents.geometry import PROMOTED_DIR as GEOMETRY_DIR
 from cfdagent.agents.geometry import STEP_NAME
+from cfdagent.agents.knowledge_tools import KnowledgeTools
 from cfdagent.agents.planner import RESOURCE_PREFIX
 from cfdagent.agents.stage import CASESPEC_FROM_ATTEMPT, Stage, StageContext
-from cfdagent.agents.tools import FileScope
+from cfdagent.agents.tools import FileScope, Tool
 from cfdagent.errors import ToolFailure
 from cfdagent.executor.protocol import CheckMeshArgs, ConvertMeshArgs, OpResponse, RunScriptArgs
 from cfdagent.gates import GateResult
@@ -272,7 +273,7 @@ def _mesh_expected_bbox(spec: CaseSpec) -> list[float]:
     return box
 
 
-class MeshStage(Stage):
+class MeshStage(KnowledgeTools, Stage):
     """Stage 3: a Gmsh script, run in the sandbox, converted and gated against the ``CaseSpec``."""
 
     name = STAGE
@@ -281,6 +282,9 @@ class MeshStage(Stage):
         readable=("casespec.json", "attempts/mesh-*/*"),
         writable=("attempts/mesh-*/mesh.py", "attempts/mesh-*/*.md"),
     )
+
+    def extra_tools(self, ctx: StageContext, attempt_dir: Path) -> list[Tool]:
+        return self.knowledge_tools(ctx)
 
     def opening_message(self, ctx: StageContext) -> str:
         spec = self._spec(ctx)

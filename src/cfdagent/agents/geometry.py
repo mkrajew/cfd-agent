@@ -25,8 +25,9 @@ from pathlib import Path
 
 from cfdagent.agents.casespec import CaseSpec
 from cfdagent.agents.gatehelp import last_bytes, names, read_manifest
+from cfdagent.agents.knowledge_tools import KnowledgeTools
 from cfdagent.agents.stage import CASESPEC_FROM_ATTEMPT, Stage, StageContext
-from cfdagent.agents.tools import FileScope
+from cfdagent.agents.tools import FileScope, Tool
 from cfdagent.errors import ToolFailure
 from cfdagent.executor.protocol import CheckGeometryArgs, OpResponse, RunScriptArgs
 from cfdagent.gates import GateResult
@@ -154,7 +155,7 @@ def _manifest_problems(spec: CaseSpec, manifest: BoundaryManifest) -> list[str]:
     return problems + _structural_problems(spec, manifest)
 
 
-class GeometryStage(Stage):
+class GeometryStage(KnowledgeTools, Stage):
     """Stage 2: a CadQuery script, run in the sandbox, gated against the ``CaseSpec``."""
 
     name = STAGE
@@ -163,6 +164,9 @@ class GeometryStage(Stage):
         readable=("casespec.json", "attempts/geometry-*/*"),
         writable=("attempts/geometry-*/geometry.py", "attempts/geometry-*/*.md"),
     )
+
+    def extra_tools(self, ctx: StageContext, attempt_dir: Path) -> list[Tool]:
+        return self.knowledge_tools(ctx)
 
     def opening_message(self, ctx: StageContext) -> str:
         spec = self._spec(ctx)

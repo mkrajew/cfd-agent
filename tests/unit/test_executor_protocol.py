@@ -626,13 +626,55 @@ def tutorials(tmp_path, monkeypatch):
     return root
 
 
-def test_search_knowledge_returns_ranked_hits_from_the_tutorial_directory(run, tutorials):
+@pytest.fixture
+def notes_dir(tmp_path, monkeypatch):
+    """A notes directory of its own, so that the tests do not depend on the shipped notes."""
+    root = tmp_path / "notes"
+    root.mkdir()
+    monkeypatch.setattr("cfdagent.knowledge.search.NOTES_DIR", root)
+    return root
+
+
+def test_search_knowledge_returns_ranked_hits_from_the_tutorial_directory(
+    run, tutorials, notes_dir
+):
     code, answer = _call(run, "search_knowledge", {"query": "fvSchemes", "max_hits": 5})
     assert code == 0 and answer.ok, answer
     assert answer.data["hits"] == [
-        {"path": "flow/alpha/system/fvSchemes", "line": 0, "text": "(the file name matches)"},
-        {"path": "flow/beta/notes", "line": 1, "text": "mentions fvSchemes once"},
+        {
+            "source": "tutorial",
+            "path": "flow/alpha/system/fvSchemes",
+            "line": 0,
+            "text": "(the file name matches)",
+        },
+        {
+            "source": "tutorial",
+            "path": "flow/beta/notes",
+            "line": 1,
+            "text": "mentions fvSchemes once",
+        },
     ]
+
+
+def test_search_and_read_knowledge_ops_reach_the_notes_before_the_tutorials(
+    run, tutorials, notes_dir
+):
+    (notes_dir / "schemes.md").write_bytes(b"# Schemes\nWrite fvSchemes with care.\n")
+    code, answer = _call(run, "search_knowledge", {"query": "fvSchemes", "max_hits": 5})
+    assert code == 0 and answer.ok, answer
+    hits = answer.data["hits"]
+    assert hits[0] == {
+        "source": "note",
+        "path": "note:schemes.md",
+        "line": 2,
+        "text": "Write fvSchemes with care.",
+    }
+    assert [h["source"] for h in hits] == ["note", "tutorial", "tutorial"]
+    code, answer = _call(run, "read_knowledge", {"path": "note:schemes.md"})
+    assert code == 0 and answer.ok and answer.data["text"].startswith("# Schemes")
+    for path in ("note:../README.md", "note:nope.md", "note:sub/x.md", "note:schemes.txt"):
+        code, answer = _call(run, "read_knowledge", {"path": path})
+        assert code == 0 and answer.ok is False and answer.internal is False, path
 
 
 def test_search_knowledge_bad_query_is_the_agents_failure(run, tutorials):

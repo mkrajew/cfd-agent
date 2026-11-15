@@ -205,6 +205,28 @@ def test_knowledge_and_prompts_dirs_do_not_leak_benchmarks(tmp_path):
     assert all("cavity-re100" in leak for leak in leaks)
 
 
+def test_generality_lint_rejects_planted_note(tmp_path):
+    # The curated notes sit under knowledge/, a scanned directory: a banned word in a note, or a
+    # benchmark marker, must be reported. Works on a copy of the real notes.
+    assert "knowledge" in SCANNED_DIRS
+    source = SRC / "knowledge" / "notes"
+    copy = tmp_path / "cfdagent"
+    notes = copy / "knowledge" / "notes"
+    assert source.is_dir()
+    shutil.copytree(source, notes, ignore=shutil.ignore_patterns("__pycache__"))
+    assert scan_tree(copy)[0] == []
+    assert find_leaks(copy, benchmark_markers()) == []
+
+    (notes / "planted-note.md").write_text(
+        "# Setup\nValues from the lid-driven Cavity.\n", encoding="utf-8"
+    )
+    violations = [v.replace("\\", "/") for v in scan_tree(copy)[0]]
+    assert any(v.startswith("knowledge/notes/planted-note.md:2:") for v in violations), violations
+    (notes / "planted-note.md").write_text("Compare with cavity-re100.\n", encoding="utf-8")
+    leaks = [leak.replace("\\", "/") for leak in find_leaks(copy, benchmark_markers())]
+    assert any(leak.startswith("knowledge/notes/planted-note.md") for leak in leaks), leaks
+
+
 def test_generality_lint_scans_prompts(tmp_path):
     # The prompt loader is real code under src/ and the prompts directory is part of the scanned
     # tree: a case name or a benchmark marker in a prompt file must be reported.

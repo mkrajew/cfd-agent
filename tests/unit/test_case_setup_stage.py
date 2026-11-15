@@ -769,7 +769,10 @@ def test_search_knowledge_tool_calls_the_op_and_lists_the_hits(tmp_path):
 def test_search_knowledge_without_hits_says_so_and_a_bad_query_is_a_tool_error(tmp_path):
     setup = Setup(tmp_path)
     registry = registry_of(setup)
-    assert "no tutorial file" in registry.dispatch(call("search_knowledge", query="zzz")).lower()
+    assert (
+        "no note or tutorial file"
+        in registry.dispatch(call("search_knowledge", query="zzz")).lower()
+    )
     assert registry.dispatch(call("search_knowledge", query="x" * 300)).startswith("error:")
     assert registry.dispatch(call("search_knowledge")).startswith("error:")
     refused = Setup(tmp_path / "b", search=failed("the query is empty"))

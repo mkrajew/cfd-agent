@@ -427,17 +427,27 @@ def _tutorial_root() -> Path:
     return Path(value)
 
 
+def _knowledge_roots() -> list[knowledge_search.KnowledgeRoot]:
+    """The notes of the package and the tutorials of the image: all the agents can look at."""
+    return [
+        knowledge_search.KnowledgeRoot("note", knowledge_search.NOTES_DIR),
+        knowledge_search.KnowledgeRoot("tutorial", _tutorial_root()),
+    ]
+
+
 @operation("search_knowledge")
 def search_knowledge(args: protocol.SearchKnowledgeArgs, jail: RunDir) -> dict[str, Any]:
-    """Lexical search over the tutorials in ``$FOAM_TUTORIALS``; nothing of the job directory."""
-    hits = knowledge_search.search_tutorials(args.query, _tutorial_root(), args.max_hits)
+    """Lexical search over the curated notes and the tutorials in ``$FOAM_TUTORIALS`` (notes
+    first); nothing of the job directory."""
+    hits = knowledge_search.search_knowledge(args.query, _knowledge_roots(), args.max_hits)
     return {"hits": [hit._asdict() for hit in hits]}
 
 
 @operation("read_knowledge")
 def read_knowledge(args: protocol.ReadKnowledgeArgs, jail: RunDir) -> dict[str, Any]:
-    """One tutorial file (or a directory listing); symbolic links and the outside are refused."""
-    return {"text": knowledge_search.read_tutorial(args.path, _tutorial_root(), args.max_bytes)}
+    """One note (``note:<file>``) or tutorial file, or a directory listing; symbolic links and the
+    outside are refused."""
+    return {"text": knowledge_search.read_knowledge(args.path, _knowledge_roots(), args.max_bytes)}
 
 
 # --------------------------------------------------------------------------------------------

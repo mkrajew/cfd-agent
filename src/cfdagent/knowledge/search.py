@@ -13,14 +13,21 @@ and line, so the result is the same on every run.
 ``read_tutorial`` returns the text of one file below the root, or the listing of a directory. It
 refuses a path that leaves the root (``..``, an absolute path elsewhere) and any path that goes
 through a symbolic link.
+
+``search_knowledge`` and ``read_knowledge`` put the curated notes of the package
+(``NOTES_DIR``) in front of the tutorials. Notes are plain Markdown files directly in the notes
+directory; their hits are shown as ``note:<file>`` and rank before every tutorial hit. Both
+functions reuse the two functions above, so the sandboxing rules are the same.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import stat
+from dataclasses import dataclass
 from pathlib import Path, PurePath
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 from cfdagent.errors import AgentInputError, ToolFailure
 
@@ -34,6 +41,12 @@ MAX_LISTING_ENTRIES = 200
 BINARY_PROBE_BYTES = 8192
 NAME_ONLY_TEXT = "(the file name matches)"
 _SEPARATORS = ("/", chr(92))
+NOTES_DIR = Path(__file__).resolve().parent / "notes"  # the curated notes shipped in the package
+NOTE_PREFIX = "note:"
+NOTE_SUFFIX = ".md"
+MAX_NOTE_NAME_CHARS = 100
+_ALL_NOTE_HITS = 10_000  # a notes directory holds a handful of files
+_UNKNOWN_PREFIX = re.compile(r"^[A-Za-z]{2,}:")  # a scheme-like prefix; one letter is a drive
 
 
 class Hit(NamedTuple):
@@ -259,3 +272,108 @@ def read_tutorial(path: str, root: Path, max_bytes: int = 20000) -> str:
         text = data[:max_bytes].decode("utf-8", "ignore")
         return text + f"\n[file truncated: only the first {max_bytes} bytes are shown]"
     return data.decode("utf-8", "replace")
+
+
+# ------------------------------------------------------------------ notes in front of tutorials
+
+
+@dataclass(frozen=True)
+class KnowledgeRoot:
+    """One tree the knowledge tools may look at: the curated notes or the tutorials."""
+
+    name: Literal["note", "tutorial"]
+    path: Path
+
+    def __post_init__(self) -> None:
+        if self.name not in ("note", "tutorial"):
+            raise ValueError(f"a knowledge root is 'note' or 'tutorial', got {self.name!r}")
+
+
+class SourcedHit(NamedTuple):
+    """A ``Hit`` that also says where it came from: ``source`` is ``"note"`` or ``"tutorial"``;
+    ``path`` is ``note:<file>`` for a note, else relative to the tutorial directory."""
+
+    source: str
+    path: str
+    line: int
+    text: str
+
+
+def _root_of(roots: list[KnowledgeRoot], name: str) -> Path | None:
+    for root in roots:
+        if root.name == name:
+            return Path(root.path)
+    return None
+
+
+def search_knowledge(
+    query: str, roots: list[KnowledgeRoot], max_hits: int = 10
+) -> list[SourcedHit]:
+    """Search the notes, then the tutorials, for the files that contain every word of ``query``.
+
+    Note hits come first whatever their score; each root keeps its own ordering (see
+    ``search_tutorials``); at most ``max_hits`` hits in all. A notes root or tutorial root that is
+    not a directory raises ``ToolFailure`` (the image is wrong, not the agent).
+    """
+    if isinstance(max_hits, bool) or not isinstance(max_hits, int) or max_hits < 1:
+        raise ValueError(f"max_hits must be an integer of at least 1, got {max_hits!r}")
+    _terms(query)  # a bad query is the agent's mistake even when no root exists
+    result: list[SourcedHit] = []
+    notes = _root_of(roots, "note")
+    if notes is not None:
+        _root_dir(notes)  # raises ToolFailure when the notes are missing from the image
+        for hit in search_tutorials(query, notes, _ALL_NOTE_HITS):
+            if "/" not in hit.path and hit.path.endswith(NOTE_SUFFIX):  # only readable notes
+                result.append(SourcedHit("note", NOTE_PREFIX + hit.path, hit.line, hit.text))
+    tutorials = _root_of(roots, "tutorial")
+    if tutorials is not None and len(result) < max_hits:
+        result.extend(
+            SourcedHit("tutorial", h.path, h.line, h.text)
+            for h in search_tutorials(query, tutorials, max_hits - len(result))
+        )
+    return result[:max_hits]
+
+
+def _note_file_name(path: str) -> str:
+    """The file name in ``note:<file>``; refuses anything but a plain ``*.md`` name."""
+    name = path[len(NOTE_PREFIX) :]
+    if (
+        not name
+        or len(name) > MAX_NOTE_NAME_CHARS
+        or name in (".", "..")
+        or any(sep in name for sep in _SEPARATORS)
+        or any(ord(char) < 32 for char in name)
+        or not name.endswith(NOTE_SUFFIX)
+        or name == NOTE_SUFFIX
+    ):
+        raise AgentInputError(
+            f"{path!r} is not a note: write note:<file>.md with the file name from the search "
+            "results (a plain file name, no directories)"
+        )
+    return name
+
+
+def read_knowledge(path: str, roots: list[KnowledgeRoot], max_bytes: int = 20000) -> str:
+    """The text of ``note:<file>`` (a note) or of a tutorial path, as ``read_tutorial`` gives it.
+
+    Anything else raises ``AgentInputError``: a note path with a directory, ``..``, another
+    extension or a symbolic link, an unknown prefix, a path whose root is not among ``roots``.
+    """
+    if not isinstance(path, str) or not path.strip():
+        raise AgentInputError("give a path as the search results show it")
+    if len(path) > MAX_PATH_CHARS or "\x00" in path:
+        raise AgentInputError("the path is too long or contains a control character")
+    if path.startswith(NOTE_PREFIX):
+        name = _note_file_name(path)
+        notes = _root_of(roots, "note")
+        if notes is None:
+            raise AgentInputError(f"{path!r} cannot be read: there is no notes directory")
+        return read_tutorial(name, notes, max_bytes)
+    if _UNKNOWN_PREFIX.match(path):
+        raise AgentInputError(
+            f"{path!r} has an unknown prefix; the only prefix is note:, as in note:<file>.md"
+        )
+    tutorials = _root_of(roots, "tutorial")
+    if tutorials is None:
+        raise AgentInputError(f"{path!r} cannot be read: there is no tutorial directory")
+    return read_tutorial(path, tutorials, max_bytes)
