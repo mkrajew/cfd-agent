@@ -35,6 +35,7 @@ BRIEF_OPS = {
     "search_knowledge",
     "read_knowledge",
     "check_case_consistency",
+    "convergence_report",
 }
 
 
@@ -762,3 +763,98 @@ def test_read_knowledge_refuses_an_absolute_path_with_dot_dot(run, tutorials):
     for path in (str(tutorials) + "/../../../etc/hostname", str(tutorials) + "/flow/../.."):
         _, answer = _call(run, "read_knowledge", {"path": path})
         assert answer.ok is False and answer.internal is False, path
+
+
+def test_convergence_report_arguments_are_checked():
+    good = {
+        "case_dir": "attempts/solver_runner-1/case",
+        "solver": "simpleFoam",
+        "time_dependence": "steady",
+        "periodic_outputs": False,
+        "dimensionality": "2D",
+    }
+    args = protocol.validate_args("convergence_report", good)
+    assert (args.time_dependence, args.periodic_outputs) == ("steady", False)
+    assert args.dimensionality == "2D"
+    for bad in (
+        {**good, "time_dependence": "slow"},
+        {**good, "periodic_outputs": "yes"},
+        {**good, "case_dir": "../case"},
+        {**good, "extra": 1},
+        {**good, "dimensionality": "4D"},
+        {k: v for k, v in good.items() if k != "periodic_outputs"},
+    ):
+        with pytest.raises(protocol.InvalidArgs):
+            protocol.validate_args("convergence_report", bad)
+
+
+def test_the_consistency_check_takes_an_optional_time_dependence():
+    base = {"case_dir": "case", "solver": "icoFoam"}
+    assert protocol.validate_args("check_case_consistency", base).time_dependence is None
+    steady = protocol.validate_args("check_case_consistency", {**base, "time_dependence": "steady"})
+    assert steady.time_dependence == "steady"
+    with pytest.raises(protocol.InvalidArgs):
+        protocol.validate_args("check_case_consistency", {**base, "time_dependence": "periodic"})
+
+
+def test_convergence_report_op_answers_a_gate_shaped_response(run):
+    run.write_text(
+        "case/log.simpleFoam", "Time = 1\n\nSIMPLE solution converged in 1 iterations\n\nEnd\n"
+    )
+    args = {
+        "case_dir": "case",
+        "solver": "simpleFoam",
+        "time_dependence": "steady",
+        "periodic_outputs": False,
+        "dimensionality": "2D",
+    }
+    code, response = _call(run, "convergence_report", args)
+    assert code == 0 and response.ok, response
+    assert response.data["errors"] == []
+    assert response.data["report"]["steadiness"]["criterion"] == "residual_control"
+    run.write_text("case/log.simpleFoam", "Time = 1\n\nEnd\n")
+    code, response = _call(run, "convergence_report", args, name="c2")
+    assert not response.ok and "steady" in response.error
+    assert response.data["errors"] and response.data["report"]["steadiness"]["ok"] is False
+
+
+def test_convergence_report_refuses_a_linked_log_or_post_processing_directory(run, tmp_path):
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "log.simpleFoam").write_text("Time = 1\n\nEnd\n", encoding="utf-8")
+    (run.root / "case").mkdir()
+    try:
+        os.symlink(outside / "log.simpleFoam", run.root / "case" / "log.simpleFoam")
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links cannot be created here")
+    args = {
+        "case_dir": "case",
+        "solver": "simpleFoam",
+        "time_dependence": "steady",
+        "periodic_outputs": False,
+        "dimensionality": "2D",
+    }
+    _code, response = _call(run, "convergence_report", args)
+    assert not response.ok and "symbolic link" in response.error.lower()
+
+
+def test_convergence_report_op_passes_the_dimensionality_on(run):
+    solve = "smoothSolver:  Solving for {f}, Initial residual = {r}, Final residual = 1e-08, "
+    solve += "No Iterations 1\n"
+    text = "".join(
+        f"Time = {t}\n\n" + solve.format(f="Ux", r="1e-08") + solve.format(f="Uz", r="0.03")
+        for t in (1, 500, 1000)
+    )
+    run.write_text("case/log.icoFoam", text + "\nEnd\n")
+    rows = ["# Time    Cd"] + [f"{t}  {2.0 + 0.5**t:.10g}" for t in range(1, 1001)]
+    run.write_text("case/postProcessing/forces/0/force.dat", "\n".join(rows) + "\n")
+    args = {
+        "case_dir": "case",
+        "solver": "icoFoam",
+        "time_dependence": "steady",
+        "periodic_outputs": False,
+    }
+    _code, wedge = _call(run, "convergence_report", {**args, "dimensionality": "axisymmetric"})
+    assert wedge.ok, wedge.error  # the swirl residual is not judged
+    _code, flat = _call(run, "convergence_report", {**args, "dimensionality": "2D"}, name="c2")
+    assert not flat.ok and "Uz" in flat.error

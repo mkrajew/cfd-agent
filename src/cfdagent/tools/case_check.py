@@ -517,8 +517,13 @@ def _passed_files(
     return sorted(found)
 
 
-def check_case_consistency(case_dir: Path, solver: str) -> GateResult:
+def check_case_consistency(
+    case_dir: Path, solver: str, time_dependence: str | None = None
+) -> GateResult:
     """Check the case in ``case_dir`` as described in the module docstring.
+
+    ``time_dependence`` is the plan's (``"steady"`` or ``"transient"``); a steady plan also demands
+    a stopping criterion (see ``case_requirements.steady_criterion_problems``).
 
     ``data`` holds ``patches`` (name -> type from the mesh), ``fields`` (the field files judged),
     ``passed`` (the files that are present and parsed and that no problem names),
@@ -535,7 +540,7 @@ def check_case_consistency(case_dir: Path, solver: str) -> GateResult:
     problems += control_problems
     from cfdagent.tools import case_requirements  # imported here: it imports this module
 
-    problems += case_requirements.solver_problems(case_dir, solver, skipped)
+    problems += case_requirements.solver_problems(case_dir, solver, skipped, time_dependence)
     data = {
         "patches": {name: kind for name, (kind, _groups_) in patches.items()},
         "fields": fields,

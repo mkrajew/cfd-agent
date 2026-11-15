@@ -701,6 +701,20 @@ def test_planner_prompt_states_the_required_instructions():
         assert phrase in text, phrase
 
 
+def test_planner_prompt_explains_periodic_outputs():
+    text = load_prompt("planner").text
+    assert "periodic_outputs" in text
+    assert "shedding" in text or "periodic" in text  # when to set it, in general words
+
+
+def test_a_steady_plan_cannot_ask_for_periodic_outputs():
+    errors = gate_errors(time_dependence="steady", periodic_outputs=True)
+    assert len(errors) == 1 and "periodic_outputs" in errors[0] and "transient" in errors[0]
+    assert gate_errors(time_dependence="steady", periodic_outputs=False) == []
+    transient = {**SPEC["solver"], "time_step_s": 0.5}
+    assert gate_errors(time_dependence="transient", periodic_outputs=True, solver=transient) == []
+
+
 def test_planner_gives_up_when_the_gate_rejects_every_attempt(tmp_path):
     bad = spec_json(solver={**SPEC["solver"], "end_time_s": 0.0})
     steps = [reply("Plan ready."), reply(bad), reply(bad), reply(bad)]

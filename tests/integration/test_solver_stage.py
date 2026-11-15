@@ -13,9 +13,10 @@ from pathlib import Path
 
 import pytest
 from test_case_setup_stage import CASE_FILES, fixture_text, pipeline
-from test_geometry_stage import call, reply
+from test_geometry_stage import CAVITY_SPEC, call, reply
 
 from cfdagent.agents.case_setup import CaseSetupStage
+from cfdagent.agents.casespec import CaseSpec
 from cfdagent.agents.loop import run_stage
 from cfdagent.agents.solver_runner import SolverRunnerStage
 from cfdagent.llm.client import ChatResult, Usage
@@ -76,6 +77,52 @@ def text_reply(text):
     )
 
 
+def diagnosis_reply(target, diagnosis, instruction):
+    """The structured reply of the diagnosis turn."""
+    return text_reply(
+        json.dumps({"diagnosis": diagnosis, "target": target, "instruction": instruction})
+    )
+
+
+STEADY_CASE = FIXTURES / "handwritten" / "cavity_re1000" / "case"
+STEADY_FILES = (
+    "0/U",
+    "0/p",
+    "constant/transportProperties",
+    "constant/turbulenceProperties",
+    "system/controlDict",
+    "system/fvSchemes",
+    "system/fvSolution",
+)
+
+
+def steady_case(tmp_path, control_changes=None):
+    """The Mesh stage's mesh with the dictionaries of a steady ``simpleFoam`` cavity (they stop the
+    run by ``residualControl``), and a steady plan for that solver. ``control_changes`` edits the
+    controlDict (old text -> new text)."""
+    ctx = pipeline(tmp_path)
+    ctx.casespec = CaseSpec.model_validate(
+        {
+            **CAVITY_SPEC,
+            "time_dependence": "steady",
+            "periodic_outputs": False,
+            "solver": {
+                "suggested_solver": "simpleFoam",
+                "end_time_s": 20000.0,
+                "time_step_s": None,
+            },
+        }
+    )
+    for rel in STEADY_FILES:
+        text = (STEADY_CASE / rel).read_bytes().decode("utf-8")
+        if rel == "system/controlDict":
+            for old, new in (control_changes or {}).items():
+                assert old in text, old
+                text = text.replace(old, new)
+        ctx.run.write_text(f"case/{rel}", text)
+    return ctx
+
+
 def tool_results(backend):
     """The tool messages the model was shown in its last turn, by tool call id."""
     messages = backend.calls[-1].messages
@@ -105,7 +152,9 @@ def test_solver_stage_passes_scripted_cavity(tmp_path):
     assert summary["end_time"] == 40 and summary["max_courant"] < 1
     last, first = summary["initial_residuals"], summary["first_initial_residuals"]
     assert first["p"] > 0.1 and last["p"] < first["p"] / 1000  # the start-up transient has decayed
-    assert summary["steady_expected"] is True and summary["warnings"] == []
+    # a transient plan without periodic outputs: no convergence check
+    assert summary["steady_expected"] is False and summary["warnings"] == []
+    assert summary["convergence"] is None
 
 
 def test_the_model_sees_the_summary_of_the_run(tmp_path):
@@ -137,7 +186,7 @@ def test_solver_stage_fails_on_divergent_case(tmp_path):
         reply(run_solver_call("r1")),
         reply(call("l1", "read_solver_log", offset_lines=0, n_lines=20)),
         reply(check_call("k1")),
-        text_reply("diagnosis: the Courant number is far too high; lower deltaT"),
+        diagnosis_reply("case_setup", "the Courant number is far too high", "lower deltaT"),
         text_reply("never asked"),
     ]
     backend = ScriptedBackend(steps)
@@ -147,7 +196,9 @@ def test_solver_stage_fails_on_divergent_case(tmp_path):
     assert not outcome.ok and outcome.attempts == 1 and "not retried" in outcome.reason
     (attempt,) = ctx.record.stages[-1].attempts
     assert not attempt.ok
-    assert attempt.diagnosis == "diagnosis: the Courant number is far too high; lower deltaT"
+    assert attempt.diagnosis == "the Courant number is far too high"
+    assert outcome.route is not None and outcome.route.target == "case_setup"  # routed back
+    assert outcome.route.instruction == "lower deltaT"
     errors = "\n".join(attempt.errors)
     assert "icoFoam run" in errors and "failed" in errors and "diverged" in errors
     assert len(errors.encode("utf-8")) <= 4000
@@ -237,3 +288,47 @@ def test_more_ranks_than_hardware_threads_is_refused_as_a_tool_error(tmp_path):
         if m["role"] == "tool" and m["tool_call_id"] == "r1"
     ][0]
     assert refused.startswith("error:") and "hardware threads" in refused
+
+
+def test_solver_stage_cavity_with_residual_control_passes(tmp_path):
+    ctx = steady_case(tmp_path)
+    backend = ScriptedBackend(
+        [reply(run_solver_call("r1", solver="simpleFoam")), reply(check_call("k1"))]
+    )
+    ctx.backend = backend
+    outcome = run_stage(SolverRunnerStage(), ctx)
+    assert outcome.ok, outcome
+    assert outcome.attempts == 1 and outcome.route is None
+    assert len(backend.calls) == 2  # no diagnosis turn: the gate passed
+    summary = json.loads((ctx.run.root / "logs" / "solver_run.json").read_text(encoding="utf-8"))
+    assert summary["stopped_by_residual_control"] is True
+    assert summary["end_time"] < 20000  # it stopped itself, before the iteration cap
+    steadiness = summary["convergence"]["steadiness"]
+    assert steadiness["ok"] is True and steadiness["criterion"] == "residual_control"
+    assert summary["convergence"]["periodicity"] is None
+
+
+def test_solver_stage_routes_unconverged_steady_case(tmp_path):
+    # the end time is too short for the residualControl to be met: the run reaches endTime
+    short = {"endTime         20000;": "endTime         40;"}
+    ctx = steady_case(tmp_path, short)
+    backend = ScriptedBackend(
+        [
+            reply(run_solver_call("r1", solver="simpleFoam")),
+            reply(check_call("k1")),
+            diagnosis_reply("case_setup", "stopped at endTime 40", "raise endTime to 5000"),
+            text_reply("never asked"),
+        ]
+    )
+    ctx.backend = backend
+    outcome = run_stage(SolverRunnerStage(), ctx)
+    assert not outcome.ok and outcome.attempts == 1 and "not retried" in outcome.reason
+    (attempt,) = ctx.record.stages[-1].attempts
+    assert any("steady state not reached" in e for e in attempt.errors)
+    assert attempt.diagnosis == "stopped at endTime 40"
+    route = outcome.route
+    assert route is not None
+    assert (route.source, route.target, route.origin) == ("solver_runner", "case_setup", "gate")
+    assert route.instruction == "raise endTime to 5000"
+    assert not (ctx.run.root / "logs").exists()  # nothing is promoted from a failed stage
+    assert len(backend.calls) == 3

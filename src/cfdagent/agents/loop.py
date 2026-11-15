@@ -361,7 +361,8 @@ class _StageRun(ModelConversation):
         self.passed = False
         self.exhausted = False
         self.no_retry = False  # the stage ended because the stage said a retry cannot help
-        self.diagnosis_due: tuple[AttemptRecord, str] | None = None  # failed attempt, question
+        # failed attempt, question, schema of a structured reply (None: free text)
+        self.diagnosis_due: tuple[AttemptRecord, str, type[BaseModel] | None] | None = None
         self.blank_replies = 0  # blank replies in a row, answered with a nudge
         self.blank_streak_start = 0  # index of the first blank reply of the current streak
         self.did_work = False  # the model has sent a tool call or text in this attempt
@@ -461,7 +462,8 @@ class _StageRun(ModelConversation):
         repeated = bool(self.last_errors) and errors == self.last_errors
         self.last_errors = errors
         request = self.stage.diagnosis_request(self.ctx, list(errors))
-        self.diagnosis_due = (self.record.attempts[-1], request) if request else None
+        schema = self.stage.diagnosis_schema() if request else None
+        self.diagnosis_due = (self.record.attempts[-1], request, schema) if request else None
         listing = truncate_utf8(
             "\n".join(f"- {e}" for e in errors), CHECK_ERROR_BYTES, "\n[errors truncated]"
         )
@@ -621,7 +623,7 @@ class _StageRun(ModelConversation):
         asked for one. The conversation then ends in a user message (unless the stage is over)."""
         if self.diagnosis_due is None:
             return
-        attempt, request = self.diagnosis_due
+        attempt, request, schema = self.diagnosis_due
         self.diagnosis_due = None
         if self.abort is not None:
             return
@@ -631,7 +633,7 @@ class _StageRun(ModelConversation):
         turns_before, started = self.turns, self.ctx.clock()
         self.log_attempt = attempt.n
         try:
-            result = self._ask(with_tools=False)
+            result = self._ask(response_schema=schema, with_tools=False)
         finally:
             self.log_attempt = None
             self.turns = turns_before
@@ -643,10 +645,14 @@ class _StageRun(ModelConversation):
                 self.messages.append(
                     {"role": "tool", "tool_call_id": call.id, "content": DIAGNOSIS_TOOL_ANSWER}
                 )
-            text = (result.content or "").strip()
-            if text:
-                attempt.diagnosis = text
-                self._progress()
+        if schema is not None:
+            parsed = result.parsed if result is not None else None
+            text = self.stage.take_diagnosis(parsed if isinstance(parsed, schema) else None)
+        else:
+            text = (result.content or "").strip() if result is not None else ""
+        if text:
+            attempt.diagnosis = text
+            self._progress()
         if self.exhausted:
             return
         self.messages.append(

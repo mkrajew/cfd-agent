@@ -12,6 +12,7 @@ SPEC = {
     "dimensionality": "2D",
     "flow_regime": "laminar",
     "time_dependence": "steady",
+    "periodic_outputs": False,
     "fluid": {"density_kg_m3": 1.0, "kinematic_viscosity_m2_s": 0.01},
     "reference": {"length_m": 1.0, "velocity_m_s": 1.0, "reynolds_number": 100.0},
     "geometry": {
@@ -82,6 +83,19 @@ def test_casespec_schema_has_no_maps_or_tuples():
     # The service-facing form must be accepted by the strict-schema converter, which raises
     # SchemaError for maps and free-form objects.
     assert strict_schema(schema)["additionalProperties"] is False
+
+
+def test_casespec_periodic_outputs_in_strict_schema():
+    schema = CaseSpec.model_json_schema()
+    field = schema["properties"]["periodic_outputs"]
+    assert field["type"] == "boolean" and "periodic" in field["description"]
+    assert "periodic_outputs" in schema["required"]  # required, no default keyword
+    assert _violations(schema) == []
+    assert "periodic_outputs" in strict_schema(schema)["required"]
+    assert make_spec(periodic_outputs=True).periodic_outputs is True
+    incomplete = {k: v for k, v in SPEC.items() if k != "periodic_outputs"}
+    with pytest.raises(ValidationError):  # the Planner must decide; no silent default
+        CaseSpec.model_validate(incomplete)
 
 
 def test_casespec_schema_check_can_fail():

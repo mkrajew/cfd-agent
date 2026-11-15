@@ -37,7 +37,7 @@ from cfdagent.gates import GateResult
 from cfdagent.knowledge import search as knowledge_search
 from cfdagent.manifest import MANIFEST_FILE_NAME, BoundaryManifest
 from cfdagent.rundir import RunDir, split_relative
-from cfdagent.tools import case_check
+from cfdagent.tools import case_check, convergence
 from cfdagent.tools import foam as foam_tools
 from cfdagent.tools import geometry as geometry_tools
 from cfdagent.tools import mesh as mesh_tools
@@ -415,7 +415,25 @@ def check_case_consistency(args: protocol.CheckCaseConsistencyArgs, jail: RunDir
         args.case_dir,
         ("0", "constant", "constant/polyMesh", "constant/polyMesh/boundary", "system"),
     )
-    return _gate(case_check.check_case_consistency(case_dir, args.solver))
+    return _gate(case_check.check_case_consistency(case_dir, args.solver, args.time_dependence))
+
+
+@operation("convergence_report")
+def convergence_report(args: protocol.ConvergenceReportArgs, jail: RunDir) -> dict[str, Any]:
+    """The convergence gate of a solved case: the solver log and the function-object tables of
+    ``case_dir`` judged by ``tools.convergence``. Reads files only; never runs the solver."""
+    case_dir = _directory(jail, args.case_dir)
+    _check_solver(args.solver)
+    _no_links(jail, args.case_dir, (f"log.{args.solver}", convergence.POST_DIR))
+    return _gate(
+        convergence.check_convergence(
+            case_dir,
+            args.solver,
+            args.time_dependence,
+            args.periodic_outputs,
+            dimensionality=args.dimensionality,
+        )
+    )
 
 
 def _tutorial_root() -> Path:

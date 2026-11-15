@@ -4,24 +4,34 @@ The Case Setup stage has left the run directory a complete ``case/`` (``0/``, ``
 the mesh, ``system/``). Every attempt gets a fresh copy of it as ``attempts/solver_runner-N/case/``
 (``prepare_attempt``). The agent chooses the number of MPI ranks and runs the solver with the
 ``run_solver`` tool; it reads the solver log with ``read_solver_log``. It has no write tool: this
-stage runs the case exactly as it is, and a failure is diagnosed, not repaired (routing back to
-Case Setup or Mesh is M2).
+stage runs the case exactly as it is, and a failure is diagnosed, not repaired (the run is routed
+back to the stage that can repair it).
 
 Every ``run_solver`` call works on a fresh copy of the run's ``case/``: a second call in the same
 attempt never resumes from the time directories of the first. The call replaces the attempt's
 case, so the results of an earlier call are gone; the gate and the log reader see the last call.
 
-The gate is the last ``run_solver`` call of the attempt: ``SolverRun.ok`` (the solver completed,
-nothing is non-finite, the last time reaches ``endTime`` within one step, or a steady solver
-announced its own convergence). No call, or none that reached the solver, fails the gate. The gate
-does NOT judge convergence of a steady run: a run that reached ``endTime`` without the
-``residualControl`` line passes, because this agent cannot change the case. The tool summary, the
-gate's data and ``solver_run.json`` (promoted to ``logs/``) state whether a steady run converged, so
-that the Analyst sees it.
+The gate is the last ``run_solver`` call of the attempt (ADR-0006, design 6.2 row 5):
+
+1. ``SolverRun.ok``: the solver completed, nothing is non-finite, the last time reaches ``endTime``
+   within one step, or a steady solver announced its own convergence. No call, or none that reached
+   the solver, fails the gate.
+2. The convergence check, for a run that is ok (op ``convergence_report``, ``tools.convergence``):
+   a steady plan (``time_dependence == "steady"``, also when solved with a transient solver) needs
+   a steady state, shown by ``residualControl`` or by the monitored quantities; a plan with
+   ``periodic_outputs`` needs a developed periodic regime on its force coefficients. An aperiodic
+   transient plan has no convergence check. The report is stored in the run summary
+   (``solver_run.json``, promoted to ``logs/``), where the Analyst sees it.
+
+This stage cannot edit the case, so a failed gate of a run that happened (divergence included, an
+unconverged steady run, too few periods) is not retried here: the diagnosis turn is one structured
+call (``SolverDiagnosis``) that names the stage that can fix the cause, and ``route_after_failure``
+turns it into a ``RouteRequest`` back to Case Setup or Mesh. Only the failure "the solver was not
+run" is retried in the stage.
 
 After a failed gate the loop asks the agent for a diagnosis (``diagnosis_request``): the cause, with
-evidence from the log, and the specific fix. The text is stored in ``AttemptRecord.diagnosis``,
-also for the last attempt.
+evidence from the log, and the specific fix. The diagnosis text is stored in
+``AttemptRecord.diagnosis``, also for the last attempt.
 
 Errors the agent can fix (a wrong solver name, a rank count out of range, more ranks than hardware
 threads) are tool errors and do not count as a run. A failed executor or tool
@@ -39,16 +49,17 @@ import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, StrictInt
 
 from cfdagent.agents.case_setup import KNOWN_SOLVERS
 from cfdagent.agents.casespec import CaseSpec
+from cfdagent.agents.routing import RouteRequest
 from cfdagent.agents.stage import Stage, StageContext
 from cfdagent.agents.tools import FileScope, Tool
 from cfdagent.errors import AgentInputError, ToolFailure
-from cfdagent.executor.protocol import OpResponse, RunSolverArgs
+from cfdagent.executor.protocol import ConvergenceReportArgs, OpResponse, RunSolverArgs
 from cfdagent.gates import GateResult
 from cfdagent.rundir import FileTooLarge, RunDirError
 from cfdagent.sandbox.client import outer_timeout
@@ -77,6 +88,7 @@ _CHECKMESH_MAX_BYTES = 1_000_000
 _READ_CHUNK = 4096
 LOG_FILE_PREFIX = "log."
 NOT_RUN_PREFIX = "the solver was not run"  # the gate error of an attempt without a run
+CONVERGENCE_TIMEOUT_S = 300.0  # the convergence check only reads files; a generous bound
 RESERVE_S = 600.0  # kept back from the solver for the diagnosis, the Analyst and the upload ...
 RESERVE_FRACTION = 0.2  # ... or this share of the remaining time, whichever is smaller
 COURANT_WARNING = 10.0  # a transient run above this is suspect even when it finishes
@@ -96,6 +108,28 @@ class ReadSolverLogToolArgs(BaseModel):
     )
     n_lines: StrictInt = Field(
         default=100, description=f"Number of lines to return, 1 to {MAX_LOG_LINES}"
+    )
+
+
+class SolverDiagnosis(BaseModel):
+    """The structured reply of the diagnosis turn after a failed gate (ADR-0006, decision 7).
+
+    ``target`` is the stage that can fix the cause: the Case Setup stage for anything in the
+    dictionaries of the case (schemes, time step, relaxation, end time, boundary conditions, a
+    missing monitor or stopping criterion), the Mesh stage for a cause in the mesh (cell quality,
+    resolution, a wrong domain)."""
+
+    diagnosis: str = Field(
+        description="The most likely cause, with the evidence from the log, in at most about "
+        "150 words"
+    )
+    target: Literal["case_setup", "mesh"] = Field(
+        description="The stage that can fix the cause: case_setup for the dictionaries of the "
+        "case, mesh for the mesh"
+    )
+    instruction: str = Field(
+        description="The specific fix for that stage: which file or setting, which new value, "
+        "and why"
     )
 
 
@@ -168,6 +202,8 @@ class SolverRunnerStage(Stage):
     def __init__(self) -> None:
         self._last: dict[Path, _Run | None] = {}  # attempt directory -> its last run
         self._copies: dict[Path, int] = {}  # attempt directory -> runs started in it
+        self._ran = False  # the failure judged last is one of a run that happened
+        self._diagnosis: SolverDiagnosis | None = None  # the reply to the last diagnosis turn
 
     # ------------------------------------------------------------------ the agent's task
 
@@ -263,9 +299,12 @@ class SolverRunnerStage(Stage):
     # ------------------------------------------------------------------ the gate
 
     def execute_and_gate(self, ctx: StageContext, attempt_dir: Path) -> GateResult:
-        solver = self._solver(self._spec(ctx))
+        spec = self._spec(ctx)
+        solver = self._solver(spec)
+        self._diagnosis = None  # a diagnosis belongs to the failure that was judged before it
         run = self._last.get(attempt_dir)
         if run is None:
+            self._ran = False
             return GateResult(
                 False,
                 [
@@ -273,26 +312,114 @@ class SolverRunnerStage(Stage):
                     "n_procs=...) and wait for it to finish before check_stage"
                 ],
             )
-        if run.ok:
-            return GateResult(True, [], run.summary)
-        return GateResult(False, [self._failure_text(run)], run.summary)
+        self._ran = True
+        if not run.ok:
+            return GateResult(False, [self._failure_text(run)], run.summary)
+        errors = self._convergence_errors(ctx, attempt_dir, spec, solver, run)
+        return GateResult(not errors, errors, run.summary)
+
+    def _convergence_errors(
+        self, ctx: StageContext, attempt_dir: Path, spec: CaseSpec, solver: str, run: _Run
+    ) -> list[str]:
+        """Ask the executor for the convergence report of a run that is ok (a steady plan, or one
+        with periodic outputs), store it in the run summary and return the errors of a failed
+        check."""
+        run.summary["convergence"] = None  # a report of an earlier check no longer applies
+        if spec.time_dependence != "steady" and not spec.periodic_outputs:
+            return []  # an aperiodic transient case has no convergence check
+        rel = ctx.run.relative(attempt_dir)
+        response = ctx.sandbox.call(
+            "convergence_report",
+            ConvergenceReportArgs(
+                case_dir=f"{rel}/{CASE_NAME}",
+                solver=solver,
+                time_dependence=spec.time_dependence,
+                periodic_outputs=spec.periodic_outputs,
+                dimensionality=spec.dimensionality,
+            ),
+            outer_timeout(ctx.inner_timeout(CONVERGENCE_TIMEOUT_S)),
+        )
+        if response.internal:
+            raise _internal(response, "the convergence check")
+        data = response.data if isinstance(response.data, dict) else {}
+        report = data.get("report")
+        if not isinstance(report, dict):
+            # a refusal (a missing directory, a link) or a broken answer is not a verdict on the
+            # case: it must not send the run back to an earlier stage
+            raise ToolFailure(
+                f"the convergence check answered without a report: {response.error or 'no message'}"
+            )
+        run.summary["convergence"] = report
+        try:
+            ctx.run.write_text(f"{rel}/{SUMMARY_FILE}", json.dumps(run.summary, indent=2) + "\n")
+        except (RunDirError, OSError) as exc:
+            raise ToolFailure(f"could not write {SUMMARY_FILE}: {type(exc).__name__}") from exc
+        if response.ok:
+            return []
+        listed = data.get("errors")
+        errors = [str(e) for e in listed] if isinstance(listed, list) else []
+        return errors or [response.error or "the convergence check failed without a message"]
 
     def diagnosis_request(self, ctx: StageContext, errors: list[str]) -> str | None:
+        if not self._ran:
+            return (
+                "This attempt failed; the message of the check is above. You cannot edit the "
+                "case, so do not try to repair it. This turn has no tools: use only what you "
+                "have already read. Reply in plain text in at most about 150 words: the solver "
+                "was not run; say what you will do in the next attempt."
+            )
         return (
             "This attempt failed; the message of the check is above. You cannot edit the case, so "
-            "do not try to repair it. This turn has no tools: use only what you have already "
-            "read. Reply in plain text in at most about 150 words: (1) the most likely cause, "
-            "with the evidence from the log (the FOAM FATAL ERROR message, or the signs of "
-            "divergence: which residual or the Courant number started to grow, and at which "
-            "time); if the solver was not run, say so; (2) the specific fix that a person "
-            "editing the case would make: which file, which keyword, which new value, and why "
-            "that value."
+            "do not try to repair it: the run goes back to the stage that can. This turn has no "
+            "tools: use only what you have already read. Reply with the structured answer: "
+            "`diagnosis`: in at most about 150 words, the most likely cause with the evidence "
+            "(the FOAM FATAL ERROR message, or the signs of divergence: which residual or the "
+            "Courant number started to grow, and at which time; for a run that finished but did "
+            "not pass, what the check measured); `target`: `case_setup` if the cause is in the "
+            "dictionaries of the case, `mesh` if it is in the mesh; `instruction`: the specific "
+            "fix that a person editing the files of that stage would make: which file, which "
+            "keyword, which new value, and why that value."
+        )
+
+    def diagnosis_schema(self) -> type[BaseModel] | None:
+        """A structured diagnosis for the failure of a run that happened; the free-text turn for
+        the failure 'the solver was not run' (the stage retries that one itself)."""
+        return SolverDiagnosis if self._ran else None
+
+    def take_diagnosis(self, parsed: BaseModel | None) -> str | None:
+        self._diagnosis = parsed if isinstance(parsed, SolverDiagnosis) else None
+        if self._diagnosis is None:
+            return None
+        return self._diagnosis.diagnosis.strip() or None
+
+    def route_after_failure(self, ctx: StageContext, errors: list[str]) -> RouteRequest | None:
+        """The fix request of a failed gate of a run that happened (ADR-0006): to the stage that
+        the diagnosis names, to Case Setup with the gate errors as the instruction when the reply
+        was missing or invalid. The failure 'the solver was not run' is not routed."""
+        if not errors or any(error.startswith(NOT_RUN_PREFIX) for error in errors):
+            return None
+        headline = _clip(errors[0].partition("\n")[0], 400)
+        diagnosis = self._diagnosis
+        if diagnosis is None:
+            return RouteRequest(
+                source=STAGE,
+                target="case_setup",
+                origin="gate",
+                reason=f"the solver run failed the gate: {headline}",
+                instruction="\n".join(errors),
+            )
+        return RouteRequest(
+            source=STAGE,
+            target=diagnosis.target,
+            origin="gate",
+            reason=f"the solver run failed the gate: {headline} Diagnosis: {diagnosis.diagnosis}",
+            instruction=diagnosis.instruction.strip() or "\n".join(errors),
         )
 
     def retry_after_failure(self, errors: list[str]) -> bool:
-        """Only a missing run is worth another attempt. A solver run that failed is a property
-        of the case, which this stage cannot change (routing back is M2), and the solver is
-        deterministic: the same case fails the same way."""
+        """Only a missing run is worth another attempt. A solver run that failed the gate is a
+        property of the case, which this stage cannot change, and the solver is deterministic: the
+        same case fails the same way. The run is routed back instead (``route_after_failure``)."""
         return len(errors) == 1 and errors[0].startswith(NOT_RUN_PREFIX)
 
     def retry_text(self, previous: str, carried: list[str] | None = None) -> str:
@@ -467,6 +594,7 @@ class SolverRunnerStage(Stage):
             "timed_out": bool(data.get("timed_out")),
             "steady": steady,
             "time_dependence": spec.time_dependence,
+            "periodic_outputs": spec.periodic_outputs,
             "steady_expected": steady or spec.time_dependence == "steady",
             "stopped_by_residual_control": (converged_at is not None) if steady and ok else None,
             "converged_at": converged_at,
@@ -483,6 +611,7 @@ class SolverRunnerStage(Stage):
             "warnings": warnings,
             "fatal_error": _clip(str(fatal)) if fatal else None,
             "error": _clip(str(error)) if error and not ok else None,
+            "convergence": None,  # the gate's report, once it has checked the run
         }
 
     @staticmethod
@@ -566,9 +695,14 @@ class SolverRunnerStage(Stage):
         elif s["steady_expected"] and run.ok:
             lines.append(
                 f"The plan expects a steady state, but {run.solver} is a transient solver with no "
-                "stopping test and ran to endTime: compare the initial residuals of the last step "
-                "with those of the first step above (a steady state shows them falling by orders "
-                "of magnitude and staying low)."
+                "stopping test and ran to endTime: the check after the run judges steadiness by "
+                "the monitored quantities of the case and the final initial residuals (a steady "
+                "state shows the residuals falling by orders of magnitude and staying low)."
+            )
+        elif s.get("periodic_outputs"):
+            lines.append(
+                "Transient run with periodic outputs: it ends at endTime; the check after the "
+                "run looks for a developed periodic regime in the force coefficients."
             )
         elif not s["steady_expected"]:
             lines.append("Transient run: no convergence criterion applies; it ends at endTime.")

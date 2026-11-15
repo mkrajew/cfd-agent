@@ -8,16 +8,18 @@ import pytest
 from test_geometry_stage import Clock, FakeSandbox, make_ctx, plan
 
 from cfdagent.agents.loop import run_stage
+from cfdagent.agents.routing import RouteRequest
 from cfdagent.agents.solver_runner import (
     MAX_LOG_LINES,
     MAX_PROCS,
+    SolverDiagnosis,
     SolverRunnerStage,
 )
 from cfdagent.agents.tools import ToolRegistry
 from cfdagent.config import RunLimits
 from cfdagent.errors import AgentInputError, ToolFailure
 from cfdagent.executor.protocol import OpResponse
-from cfdagent.llm.client import ChatResult, ToolCall, Usage
+from cfdagent.llm.client import ChatResult, ToolCall, Usage, strict_schema
 from cfdagent.prompts import load_prompt
 from cfdagent.sandbox.client import OUTER_TIMEOUT_MARGIN_S
 
@@ -56,22 +58,58 @@ def run_data(**changes):
 RUN_OK = OpResponse(ok=True, data=run_data())
 
 
+def steady_report(ok=True, criterion="monitored_change", details="every monitor is steady"):
+    return {"ok": ok, "criterion": criterion, "details": details}
+
+
+# What the executor answers to ``convergence_report`` (the shape of ``ops._gate``).
+CONVERGED = OpResponse(
+    ok=True,
+    data={"errors": [], "report": {"steadiness": steady_report(), "periodicity": None}},
+)
+
+
+def not_converged(*errors):
+    report = {"steadiness": steady_report(False, "none", errors[0]), "periodicity": None}
+    return OpResponse(
+        ok=False,
+        data={"errors": list(errors), "report": report},
+        error="\n".join(errors),
+    )
+
+
 def run_failed(message="the solver step exited with code 1", **changes):
     data = run_data(**{"completed": False, "returncode": 1, **changes})
     return OpResponse(ok=False, data=data, error=message)
 
 
-def solver_spec(name="icoFoam"):
-    return plan(solver={"suggested_solver": name, "end_time_s": 40.0, "time_step_s": 0.005})
+def solver_spec(name="icoFoam", **changes):
+    """A plan for ``name``. It is transient and not periodic by default: such a run has no
+    convergence check, so most tests below see only the run itself."""
+    solver = {"suggested_solver": name, "end_time_s": 40.0, "time_step_s": 0.005}
+    changes = {"time_dependence": "transient", "periodic_outputs": False, **changes}
+    return plan(solver=solver, **changes)
 
 
 class Setup:
     """A context whose run directory holds the Case Setup stage's result and a fake sandbox."""
 
-    def __init__(self, tmp_path, solver="icoFoam", run=RUN_OK, with_case=True, **ctx_kwargs):
-        self.sandbox = FakeSandbox({"run_solver": run})
+    def __init__(
+        self,
+        tmp_path,
+        solver="icoFoam",
+        run=RUN_OK,
+        with_case=True,
+        convergence=None,
+        spec_changes=None,
+        **ctx_kwargs,
+    ):
+        self.sandbox = FakeSandbox(
+            {"run_solver": run, "convergence_report": convergence or CONVERGED}
+        )
         tmp_path.mkdir(parents=True, exist_ok=True)
-        self.ctx = make_ctx(tmp_path, self.sandbox, spec=solver_spec(solver), **ctx_kwargs)
+        spec = solver_spec(solver, **(spec_changes or {}))
+        self.ctx = make_ctx(tmp_path, self.sandbox, spec=spec, **ctx_kwargs)
         if with_case:
             write_run_case(self.ctx)
         self.stage = SolverRunnerStage()
@@ -818,12 +856,24 @@ def test_the_prompt_is_general():
 
 
 def test_the_diagnosis_question_asks_for_a_cause_and_a_specific_fix(tmp_path):
-    setup = prepared(tmp_path)
-    question = setup.stage.diagnosis_request(setup.ctx, ["the solver diverged"])
+    setup = Setup(tmp_path, run=run_failed("the solver diverged", diverged=True))
+    setup.prepare()
+    setup.tool("run_solver", solver="icoFoam", n_procs=1)
+    errors = setup.gate().errors
+    question = setup.stage.diagnosis_request(setup.ctx, errors)
     assert question and "cause" in question.lower() and "fix" in question.lower()
     assert "cannot" in question.lower()  # the agent is told it cannot edit the case
-    assert "solver run failed" not in question  # also asked when the solver was never run
     assert "no tools" in question.lower()
+    assert "`target`" in question and "case_setup" in question and "mesh" in question
+    assert setup.stage.diagnosis_schema() is SolverDiagnosis
+
+
+def test_the_diagnosis_question_after_a_missing_run_is_plain_text(tmp_path):
+    setup = prepared(tmp_path)
+    errors = setup.gate().errors  # the solver was never run
+    question = setup.stage.diagnosis_request(setup.ctx, errors)
+    assert question and "not run" in question and "no tools" in question.lower()
+    assert setup.stage.diagnosis_schema() is None
 
 
 # ------------------------------------------------------------------ the whole loop
@@ -866,7 +916,11 @@ def test_diagnosis_stored_in_record(tmp_path):
             reply("I forgot to run the solver."),
             reply(None, run_call("r2")),
             reply(None, tool_call("k2", "check_stage")),
-            reply("Divergence from the first step; the time step is too large for the mesh."),
+            diagnosis_reply(
+                "case_setup",
+                "Divergence from the first step; the time step is too large for the mesh.",
+                "halve deltaT",
+            ),
             reply("never asked"),
         ],
     )
@@ -877,6 +931,7 @@ def test_diagnosis_stored_in_record(tmp_path):
     assert "time step is too large" in second.diagnosis  # on the attempt that failed
     asked = backend.calls[4]
     assert asked.tools is None and "cause" in asked.messages[-1]["content"].lower()
+    assert asked.response_schema is SolverDiagnosis and backend.calls[1].response_schema is None
     assert len(backend.calls) == 5
     assert not (setup.ctx.run.root / "logs").exists()
 
@@ -906,7 +961,7 @@ def test_a_failed_solver_run_ends_the_stage_after_its_diagnosis(tmp_path):
         [
             reply(None, run_call("r1")),
             reply(None, tool_call("k1", "check_stage")),
-            reply("diagnosis 1"),
+            diagnosis_reply(diagnosis="diagnosis 1"),
             reply("never asked"),
         ],
     )
@@ -950,3 +1005,327 @@ def test_a_stage_that_checks_before_running_the_solver_fails_the_attempt(tmp_pat
     first = setup.ctx.record.stages[0].attempts[0]
     assert "solver was not run" in first.errors[0]
     assert first.diagnosis == "I did not run the solver."
+
+
+# ------------------------------------------------------------------ the convergence gate (ADR-0006)
+
+UNCONVERGED = (
+    "steady state not reached: no residualControl stop and no monitored quantity (add a "
+    "function object that monitors a requested quantity)"
+)
+
+
+def diagnosis_reply(target="case_setup", diagnosis="the run is not steady", instruction="fix it"):
+    """The structured reply of the diagnosis turn, as the model would send it."""
+    text = json.dumps({"diagnosis": diagnosis, "target": target, "instruction": instruction})
+    return reply(text)
+
+
+def gate_ran(setup):
+    """Whether the stage asked the executor for the convergence report."""
+    return "convergence_report" in setup.calls()
+
+
+def steady_setup(tmp_path, **kwargs):
+    kwargs.setdefault("convergence", not_converged(UNCONVERGED))
+    return Setup(tmp_path, spec_changes={"time_dependence": "steady"}, **kwargs)
+
+
+def test_a_steady_case_is_checked_for_convergence_after_the_run(tmp_path):
+    setup = Setup(tmp_path, spec_changes={"time_dependence": "steady"})
+    setup.prepare()
+    setup.tool("run_solver", solver="icoFoam", n_procs=1)
+    result = setup.gate()
+    assert result.ok and result.errors == []
+    assert setup.calls() == ["run_solver", "convergence_report"]
+    _op, args, _timeout = setup.sandbox.calls[1]
+    assert (args.case_dir, args.solver) == (CASE, "icoFoam")
+    assert (args.time_dependence, args.periodic_outputs) == ("steady", False)
+    assert args.dimensionality == "2D"  # the plan's: a wedge plan leaves the swirl residual out
+    report = result.data["convergence"]
+    assert report["steadiness"]["criterion"] == "monitored_change"
+    saved = json.loads((setup.attempt / "solver_run.json").read_text(encoding="utf-8"))
+    assert saved["convergence"] == report  # the Analyst sees it in logs/solver_run.json
+
+
+def test_a_periodic_transient_case_is_checked_for_periodicity(tmp_path):
+    setup = Setup(tmp_path, spec_changes={"periodic_outputs": True})
+    setup.prepare()
+    setup.tool("run_solver", solver="icoFoam", n_procs=1)
+    assert setup.gate().ok
+    args = setup.sandbox.calls[1][1]
+    assert (args.time_dependence, args.periodic_outputs) == ("transient", True)
+
+
+def test_aperiodic_transient_is_not_checked_for_periodicity(tmp_path):
+    setup = Setup(tmp_path)  # transient, periodic_outputs false
+    setup.prepare()
+    setup.tool("run_solver", solver="icoFoam", n_procs=1)
+    result = setup.gate()
+    assert result.ok
+    assert setup.calls() == ["run_solver"]  # the executor was not asked about convergence
+    assert result.data["convergence"] is None
+
+
+def test_a_failed_convergence_check_fails_the_gate_with_its_errors(tmp_path):
+    setup = steady_setup(tmp_path)
+    setup.prepare()
+    setup.tool("run_solver", solver="icoFoam", n_procs=1)
+    result = setup.gate()
+    assert not result.ok and result.errors == [UNCONVERGED]
+    assert result.data["convergence"]["steadiness"]["ok"] is False
+
+
+def test_the_convergence_check_is_not_run_for_a_run_that_failed(tmp_path):
+    setup = Setup(
+        tmp_path,
+        run=run_failed("the solver diverged", diverged=True),
+        spec_changes={"time_dependence": "steady"},
+    )
+    setup.prepare()
+    setup.tool("run_solver", solver="icoFoam", n_procs=1)
+    result = setup.gate()
+    assert not result.ok and "diverged" in result.errors[0]
+    assert not gate_ran(setup)
+
+
+def test_the_convergence_check_failing_inside_the_executor_is_a_tool_failure(tmp_path):
+    broken = OpResponse(ok=False, error="OSError: disk", internal=True)
+    setup = steady_setup(tmp_path, convergence=broken)
+    setup.prepare()
+    setup.tool("run_solver", solver="icoFoam", n_procs=1)
+    with pytest.raises(ToolFailure, match="convergence"):
+        setup.gate()
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        OpResponse(ok=False, data={"report": None}, error=None),  # no verdict at all
+        OpResponse(ok=False, data=None, error="'case' is not a directory in the run directory"),
+        OpResponse(ok=True, data={"errors": []}),  # a pass without a report is not a verdict
+    ],
+)
+def test_an_answer_without_a_report_is_a_tool_failure_not_a_verdict_on_the_case(tmp_path, answer):
+    setup = steady_setup(tmp_path, convergence=answer)
+    setup.prepare()
+    setup.tool("run_solver", solver="icoFoam", n_procs=1)
+    with pytest.raises(ToolFailure, match="without a report"):
+        setup.gate()  # it must not route the run back to an earlier stage
+
+
+def test_unconverged_steady_run_routes_back(tmp_path):
+    setup = steady_setup(tmp_path)
+    backend = scripted(
+        setup,
+        [
+            reply(None, run_call("r1")),
+            reply(None, tool_call("k1", "check_stage")),
+            diagnosis_reply("case_setup", "the end time is too short", "raise endTime to 4000"),
+            reply("never asked"),
+        ],
+    )
+    outcome = run_stage(setup.stage, setup.ctx)
+    assert not outcome.ok and outcome.attempts == 1  # no retry in the stage
+    assert "not retried" in outcome.reason
+    route = outcome.route
+    assert isinstance(route, RouteRequest)
+    assert (route.source, route.target, route.origin) == ("solver_runner", "case_setup", "gate")
+    assert "steady state not reached" in route.reason
+    assert "the end time is too short" in route.reason
+    assert route.instruction == "raise endTime to 4000"
+    assert len(backend.calls) == 3
+    (attempt,) = setup.ctx.record.stages[0].attempts
+    assert attempt.diagnosis == "the end time is too short"  # the text is still in the record
+
+
+def test_the_diagnosis_turn_is_one_structured_call_without_tools(tmp_path):
+    setup = steady_setup(tmp_path)
+    backend = scripted(
+        setup,
+        [
+            reply(None, run_call("r1")),
+            reply(None, tool_call("k1", "check_stage")),
+            diagnosis_reply(),
+        ],
+    )
+    run_stage(setup.stage, setup.ctx)
+    asked = backend.calls[2]
+    assert asked.tools is None and asked.response_schema is SolverDiagnosis
+    assert "target" in asked.messages[-1]["content"]  # the question names the choice
+
+
+def test_the_diagnosis_schema_fits_strict_structured_output():
+    schema = strict_schema(SolverDiagnosis.model_json_schema())
+    assert set(schema["required"]) == {"diagnosis", "target", "instruction"}
+    assert schema["properties"]["target"]["enum"] == ["case_setup", "mesh"]
+    with pytest.raises(ValueError):
+        SolverDiagnosis(diagnosis="x", target="analyst", instruction="y")  # not a valid target
+
+
+def test_divergence_routes_back(tmp_path):
+    setup = Setup(tmp_path, run=run_failed("the solver diverged", diverged=True))
+    scripted(
+        setup,
+        [
+            reply(None, run_call("r1")),
+            reply(None, tool_call("k1", "check_stage")),
+            diagnosis_reply("mesh", "highly skewed cells at the wall", "regenerate the mesh"),
+        ],
+    )
+    outcome = run_stage(setup.stage, setup.ctx)
+    assert not outcome.ok and outcome.attempts == 1
+    assert outcome.route is not None
+    assert (outcome.route.target, outcome.route.instruction) == ("mesh", "regenerate the mesh")
+    assert "diverged" in outcome.route.reason
+
+
+def test_invalid_diagnosis_reply_defaults_to_case_setup(tmp_path):
+    setup = steady_setup(tmp_path)
+    scripted(
+        setup,
+        [
+            reply(None, run_call("r1")),
+            reply(None, tool_call("k1", "check_stage")),
+            reply("I think the mesh is bad."),  # not the structured reply that was asked for
+        ],
+    )
+    outcome = run_stage(setup.stage, setup.ctx)
+    assert not outcome.ok
+    route = outcome.route
+    assert route is not None and (route.source, route.target) == ("solver_runner", "case_setup")
+    assert "steady state not reached" in route.instruction  # the gate errors are the instruction
+    (attempt,) = setup.ctx.record.stages[0].attempts
+    assert attempt.diagnosis is None
+
+
+def test_a_diagnosis_with_an_empty_instruction_falls_back_to_the_gate_errors(tmp_path):
+    setup = steady_setup(tmp_path)
+    scripted(
+        setup,
+        [
+            reply(None, run_call("r1")),
+            reply(None, tool_call("k1", "check_stage")),
+            diagnosis_reply("mesh", "something", "  "),
+        ],
+    )
+    route = run_stage(setup.stage, setup.ctx).route
+    assert route is not None and route.target == "mesh"
+    assert "steady state not reached" in route.instruction
+
+
+def test_a_missing_run_is_retried_and_never_routed(tmp_path):
+    setup = steady_setup(tmp_path)
+    steps = []
+    for i in range(1, 4):
+        steps += [reply(None, tool_call(f"k{i}", "check_stage")), reply(f"diagnosis {i}")]
+    backend = scripted(setup, steps)
+    outcome = run_stage(setup.stage, setup.ctx)
+    assert not outcome.ok and outcome.attempts == 3 and outcome.route is None
+    assert all(call.response_schema is None for call in backend.calls)  # plain-text diagnosis
+    assert not gate_ran(setup)
+
+
+def test_a_diagnosis_of_an_earlier_failure_does_not_route_a_missing_run(tmp_path):
+    setup = steady_setup(tmp_path)
+    scripted(
+        setup,
+        [
+            reply(None, run_call("r1")),
+            reply(None, tool_call("k1", "check_stage")),
+            diagnosis_reply("mesh"),
+        ],
+    )
+    assert run_stage(setup.stage, setup.ctx).route.target == "mesh"
+    missing = ["the solver was not run in this attempt: call run_solver"]
+    assert setup.stage.route_after_failure(setup.ctx, missing) is None
+
+
+def test_a_diagnosis_of_one_pass_does_not_leak_into_the_next(tmp_path):
+    """The stage object is reused by a later pass: an invalid reply there must give the default
+    target, not the one the earlier pass was told."""
+    setup = steady_setup(tmp_path)
+    scripted(
+        setup,
+        [
+            reply(None, run_call("r1")),
+            reply(None, tool_call("k1", "check_stage")),
+            diagnosis_reply("mesh", "bad cells", "remesh"),
+        ],
+    )
+    first = run_stage(setup.stage, setup.ctx)
+    assert first.route is not None and first.route.target == "mesh"
+    setup.ctx.pass_no = 1
+    scripted(
+        setup,
+        [
+            reply(None, run_call("r2")),
+            reply(None, tool_call("k2", "check_stage")),
+            reply("not the structured reply"),
+        ],
+    )
+    second = run_stage(setup.stage, setup.ctx)
+    assert second.route is not None
+    assert second.route.target == "case_setup" and "bad cells" not in second.route.reason
+
+
+def test_the_diagnosis_schema_has_no_length_keywords():
+    """Strict structured output has historically refused minLength and maxLength."""
+    text = json.dumps(strict_schema(SolverDiagnosis.model_json_schema()))
+    assert "maxLength" not in text and "minLength" not in text
+
+
+def test_the_prompt_numbers_follow_the_thresholds():
+    from cfdagent.tools.convergence import THRESHOLDS
+
+    text = load_prompt("solver_runner").text
+    assert f"{THRESHOLDS.steady_rel_change * 100:g} %" in text  # 0.1 %
+    assert f"{THRESHOLDS.final_residual_max:.0e}".replace("e-0", "e-") in text  # 1e-4
+    assert f"{THRESHOLDS.min_periods} periods" in text
+    assert f"{THRESHOLDS.periodic_rel_change * 100:g} %" in text  # 2 %
+    assert THRESHOLDS.steady_window == 0.1 and "last tenth" in text
+
+
+def test_a_passing_convergence_check_ends_the_stage_without_a_diagnosis(tmp_path):
+    setup = Setup(tmp_path, spec_changes={"time_dependence": "steady"})
+    backend = scripted(
+        setup, [reply(None, run_call("r1")), reply(None, tool_call("k1", "check_stage"))]
+    )
+    outcome = run_stage(setup.stage, setup.ctx)
+    assert outcome.ok and outcome.route is None
+    assert len(backend.calls) == 2
+    saved = json.loads((setup.ctx.run.root / "logs" / "solver_run.json").read_text("utf-8"))
+    assert saved["convergence"]["steadiness"]["ok"] is True
+
+
+def test_the_prompt_tells_the_agent_that_convergence_is_part_of_the_check():
+    text = load_prompt("solver_runner").text
+    assert "convergence" in text.lower() and "steady" in text.lower()
+    assert "periodic" in text.lower()
+
+
+def test_the_dimensionality_of_the_plan_reaches_the_convergence_check(tmp_path):
+    setup = Setup(tmp_path, spec_changes={"time_dependence": "steady"})
+    setup.prepare()
+    setup.tool("run_solver", solver="icoFoam", n_procs=1)
+    setup.ctx.casespec = setup.ctx.casespec.model_copy(update={"dimensionality": "axisymmetric"})
+    assert setup.gate().ok
+    assert setup.sandbox.calls[-1][1].dimensionality == "axisymmetric"
+
+
+def test_the_run_text_says_what_a_periodic_plan_will_be_checked_for(tmp_path):
+    setup = Setup(tmp_path, spec_changes={"periodic_outputs": True})
+    setup.prepare()
+    text = setup.tool("run_solver", solver="icoFoam", n_procs=1)
+    assert "periodic outputs" in text and "no convergence criterion applies" not in text
+    plain = Setup(tmp_path / "plain")
+    plain.prepare()
+    assert "no convergence criterion applies" in plain.tool(
+        "run_solver", solver="icoFoam", n_procs=1
+    )
+
+
+def test_the_prompt_says_where_the_periods_are_counted_and_names_the_new_signs():
+    lowered = load_prompt("solver_runner").text.lower()
+    assert "second half" in lowered and "20 times per period" in lowered
+    assert "swirl" in lowered and "residualcontrol" in lowered

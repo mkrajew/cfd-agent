@@ -36,7 +36,8 @@ CAVITY_SPEC = {
     "summary": "A unit square domain, one cell thick.",
     "dimensionality": "2D",
     "flow_regime": "laminar",
-    "time_dependence": "steady",
+    "time_dependence": "transient",
+    "periodic_outputs": False,
     "fluid": {"density_kg_m3": 1.0, "kinematic_viscosity_m2_s": 0.01},
     "reference": {"length_m": 1.0, "velocity_m_s": 1.0, "reynolds_number": 100.0},
     "geometry": {

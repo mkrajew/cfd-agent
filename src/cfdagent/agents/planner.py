@@ -242,6 +242,12 @@ def _solver_errors(spec: CaseSpec) -> list[str]:
             f"solver.end_time_s is {_num(end)} but must be a finite number greater than 0; give "
             "the end time in seconds (the iteration count for a steady case)"
         )
+    if spec.periodic_outputs and spec.time_dependence != "transient":
+        errors.append(
+            'periodic_outputs is true but time_dependence is "steady"; a periodic regime is '
+            'unsteady: set time_dependence to "transient" (or periodic_outputs to false if the '
+            "requested outputs are steady values)"
+        )
     if spec.time_dependence == "transient":
         if step is None or not _positive(step):
             shown = "missing" if step is None else _num(step)

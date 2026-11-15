@@ -277,6 +277,7 @@ class CaseSetupStage(KnowledgeTools, Stage):
             "dimensionality": spec.dimensionality,
             "flow_regime": spec.flow_regime,
             "time_dependence": spec.time_dependence,
+            "periodic_outputs": spec.periodic_outputs,
             "fluid": spec.fluid.model_dump(),
             "reference": spec.reference.model_dump(),
             "geometry": spec.geometry.model_dump(),
@@ -493,7 +494,9 @@ class CaseSetupStage(KnowledgeTools, Stage):
             raise _internal(parsed, "checking the dictionaries")
         consistent = ctx.sandbox.call(
             "check_case_consistency",
-            CheckCaseConsistencyArgs(case_dir=case_rel, solver=solver),
+            CheckCaseConsistencyArgs(
+                case_dir=case_rel, solver=solver, time_dependence=self._spec(ctx).time_dependence
+            ),
             outer_timeout(ctx.inner_timeout(GATE_TIMEOUT_S)),
         )
         if consistent.internal:
