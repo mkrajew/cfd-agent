@@ -1,0 +1,61 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      fvSolution;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+solvers
+{
+    // Linear solves inside one SIMPLE iteration only need to reduce the error by a factor of 10
+    // (relTol 0.1): the outer iteration converges the non-linearity anyway. The absolute
+    // tolerance is far below the residualControl targets below, so it never stops a solve early
+    // at the end.
+    p
+    {
+        solver          GAMG;
+        smoother        GaussSeidel;
+        tolerance       1e-10;
+        relTol          0.1;
+    }
+
+    U
+    {
+        solver          smoothSolver;
+        smoother        symGaussSeidel;
+        tolerance       1e-10;
+        relTol          0.1;
+    }
+}
+
+SIMPLE
+{
+    // The mesh is not orthogonal: one correction of the pressure equation per iteration.
+    nNonOrthogonalCorrectors 1;
+
+    // SIMPLEC: the pressure equation is consistent with the relaxed momentum equation, which
+    // allows the large velocity relaxation factor below and no relaxation of the pressure.
+    consistent      yes;
+
+    // No pRefCell: the outlet and lateral boundaries fix the pressure.
+
+    // The run stops when the INITIAL residuals (the residual of the equation before it is
+    // solved in an iteration) of both the pressure and the velocity fall below these values.
+    residualControl
+    {
+        p               1e-6;
+        U               1e-6;
+    }
+}
+
+relaxationFactors
+{
+    equations
+    {
+        U               0.9;
+    }
+}
+
+// ************************************************************************* //

@@ -1,0 +1,52 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      fvSolution;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+solvers
+{
+    // Pressure: every step ends with a tight solve ("Final"), the intermediate ones only
+    // reduce the error by a factor of 100.
+    p
+    {
+        solver          GAMG;
+        smoother        GaussSeidel;
+        tolerance       1e-7;
+        relTol          0.01;
+    }
+
+    pFinal
+    {
+        $p;
+        relTol          0;
+    }
+
+    "(U|UFinal)"
+    {
+        solver          smoothSolver;
+        smoother        symGaussSeidel;
+        tolerance       1e-8;
+        relTol          0;
+    }
+}
+
+PIMPLE
+{
+    // One outer iteration with two pressure correctors: the PISO algorithm, which is why the
+    // Courant number is kept at or below 1 (maxCo in the controlDict).
+    nOuterCorrectors 1;
+    nCorrectors      2;
+
+    // The mesh is not orthogonal: one correction of the pressure equation.
+    nNonOrthogonalCorrectors 1;
+
+    momentumPredictor yes;
+
+    // No pRefCell: the outlet and lateral boundaries fix the pressure.
+}
+
+// ************************************************************************* //

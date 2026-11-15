@@ -1,0 +1,56 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volVectorField;
+    object      U;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// Initial guess of the steady solver: the free stream everywhere. It only sets where the
+// iteration starts; the converged solution does not depend on it.
+dimensions      [0 1 -1 0 0 0 0];
+
+internalField   uniform (1 0 0);
+
+boundaryField
+{
+    // Free stream: uniform, along +x, 1 m/s.
+    inlet
+    {
+        type            fixedValue;
+        value           uniform (1 0 0);
+    }
+
+    // Fluid leaves; if it ever flows back in, it comes in at rest.
+    outlet
+    {
+        type            inletOutlet;
+        inletValue      uniform (0 0 0);
+        value           uniform (1 0 0);
+    }
+
+    // Lateral boundaries are open, not walls: they are far from the cylinder, so fluid may be
+    // drawn in or pushed out through them (a closed lateral boundary would act as blockage).
+    // Where fluid enters it carries the free stream; where it leaves the velocity follows the
+    // interior.
+    sides
+    {
+        type            inletOutlet;
+        inletValue      uniform (1 0 0);
+        value           uniform (1 0 0);
+    }
+
+    cylinder
+    {
+        type            noSlip;
+    }
+
+    // One cell in z: the 2D case has no flow through the front and back planes.
+    frontAndBack
+    {
+        type            empty;
+    }
+}
+
+// ************************************************************************* //

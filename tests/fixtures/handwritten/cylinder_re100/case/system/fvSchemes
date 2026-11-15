@@ -1,0 +1,49 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      fvSchemes;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// Second-order implicit time scheme (the time step is limited by the Courant number, not by
+// stability, so the scheme is chosen for accuracy: the shedding frequency is the result).
+ddtSchemes
+{
+    default         backward;
+}
+
+gradSchemes
+{
+    default         Gauss linear;
+}
+
+// Convection of momentum: second-order linear-upwind with the gradient of U (low numerical
+// diffusion, so the wake is not damped; the cell Reynolds number U dx / nu is about 6 in the near
+// wake at dx = 0.006).
+divSchemes
+{
+    default         none;
+    div(phi,U)      Gauss linearUpwind grad(U);
+    div((nuEff*dev2(T(grad(U))))) Gauss linear;
+}
+
+// The mesh is an unstructured quad mesh: faces are not orthogonal to the line between the cell
+// centres, so the non-orthogonal correction ("corrected") is needed.
+laplacianSchemes
+{
+    default         Gauss linear corrected;
+}
+
+interpolationSchemes
+{
+    default         linear;
+}
+
+snGradSchemes
+{
+    default         corrected;
+}
+
+// ************************************************************************* //

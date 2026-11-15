@@ -1,0 +1,72 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      controlDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+application     simpleFoam;
+
+startFrom       startTime;
+
+startTime       0;
+
+stopAt          endTime;
+
+// Steady solver: "time" is the iteration counter and deltaT = 1 is the iteration step.
+// endTime is only a safety cap on the number of SIMPLE iterations. The run is meant to end
+// earlier, by the residualControl of the SIMPLE dictionary in fvSolution ("SIMPLE solution
+// converged in N iterations").
+deltaT          1;
+
+endTime         20000;
+
+writeControl    timeStep;
+
+// Write rarely; the final write happens when residualControl stops the run.
+writeInterval   5000;
+
+purgeWrite      0;
+
+writeFormat     ascii;
+
+writePrecision  8;
+
+writeCompression off;
+
+timeFormat      general;
+
+timePrecision   6;
+
+runTimeModifiable false;
+
+functions
+{
+    // Drag coefficient of the cylinder, written at every iteration (a convergence trace as well).
+    // Cd = F_x / (0.5 rho U^2 Aref). The pressure is kinematic (the solver has no density), so
+    // the force is scaled with rhoInf = 1 kg/m^3, the density of the task. The mesh is one cell
+    // thick (0.1 m), so the force acts on a 0.1 m slab of the cylinder: Aref = D * thickness =
+    // 0.1 * 0.1 = 0.01 m^2 makes Cd the usual two-dimensional drag coefficient, the force per
+    // unit length over (0.5 rho U^2 D).
+    forceCoeffs
+    {
+        type            forceCoeffs;
+        libs            (forces);
+        patches         (cylinder);
+        rho             rhoInf;
+        rhoInf          1;
+        CofR            (0 0 0);
+        liftDir         (0 1 0);
+        dragDir         (1 0 0);
+        pitchAxis       (0 0 1);
+        magUInf         1;
+        lRef            0.1;
+        Aref            0.01;
+        writeControl    timeStep;
+        writeInterval   1;
+    }
+}
+
+// ************************************************************************* //
