@@ -1165,3 +1165,11 @@ def test_mesh_stage_gate_errors_are_fed_back(tmp_path):
     assert (second_dir / "boundary_manifest.json").is_file()
     assert [(a.n, a.ok) for a in ctx.record.stages[0].attempts] == [(1, False), (2, True)]
     assert (ctx.run.root / "case" / "constant" / "polyMesh").is_dir()
+
+
+def test_opening_messages_state_input_paths(tmp_path):
+    text = MeshStage().opening_message(stage_ctx(tmp_path))
+    assert "working directory" in text
+    assert "../../casespec.json" in text
+    for name in ("geometry.step", "boundary_manifest.json", "mesh.msh"):
+        assert name in text

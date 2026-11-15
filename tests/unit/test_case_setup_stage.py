@@ -22,6 +22,7 @@ from cfdagent.agents.loop import run_stage
 from cfdagent.agents.tools import ToolRegistry
 from cfdagent.errors import ToolFailure
 from cfdagent.executor.protocol import OpResponse
+from cfdagent.gates import GateResult
 from cfdagent.llm.client import ChatResult, ToolCall, Usage
 from cfdagent.llm.scripted import ScriptedBackend
 from cfdagent.prompts import load_prompt
@@ -1294,3 +1295,87 @@ def test_the_stage_remembers_every_knowledge_path_it_was_asked_to_read(tmp_path)
     registry.dispatch(call("search_knowledge", query="div phi"))  # a search reads no file
     assert setup.stage.knowledge_reads == ["a/b/controlDict", "../escape"]
     assert CaseSetupStage().knowledge_reads == []  # per instance, never shared
+
+
+# ------------------------------------------------------------------ directive check messages
+
+
+def test_completeness_error_names_file_and_skeleton(tmp_path):
+    case = make_case(tmp_path)
+    edit(
+        case,
+        "system/fvSchemes",
+        "laplacianSchemes\n{\n    default         Gauss linear orthogonal;\n}\n",
+        "",
+    )
+    assert errors_of(case) == [
+        'system/fvSchemes: missing laplacianSchemes; add "laplacianSchemes { default Gauss linear '
+        'corrected; }"'
+    ]
+    (case / "system" / "fvSolution").unlink()
+    errors = errors_of(case)
+    solution = [e for e in errors if e.startswith("system/fvSolution: ")]
+    assert len(solution) == 1
+    assert "does not exist" in solution[0] and "solvers {" in solution[0] and "PISO" in solution[0]
+
+
+def test_passed_items_listed_per_attempt(tmp_path):
+    case = make_case(tmp_path)
+    edit(
+        case,
+        "system/fvSchemes",
+        "laplacianSchemes\n{\n    default         Gauss linear orthogonal;\n}\n",
+        "",
+    )
+    data = check_case_consistency(case, "icoFoam").data
+    assert data["passed"] == [
+        "0/U",
+        "0/p",
+        "constant/transportProperties",
+        "system/controlDict",
+        "system/fvSolution",
+    ]  # system/fvSchemes has a problem, so it is not listed
+    # an unreadable file is not "present and parsed" either
+    (case / "0" / "p").write_text("a { b {\n", encoding="utf-8")
+    assert "0/p" not in check_case_consistency(case, "icoFoam").data["passed"]
+
+    # the stage hands the list to the loop, which shows it with the errors of every failed attempt
+    report = {"passed": ["0/U", "system/controlDict"], "adjust_time_step": False, "delta_t": 0.005}
+    bad = OpResponse(ok=False, data={"errors": ["system/fvSchemes: missing x"], "report": report})
+    setup = Setup(tmp_path / "stage", consistency=bad)
+    result = setup.gate()
+    assert not result.ok and result.data == {"passed": ["0/U", "system/controlDict"]}
+    note = setup.stage.passed_text(result)
+    assert "0/U, system/controlDict" in note and "static checks" in note
+    assert setup.stage.passed_text(GateResult(False, ["e"])) == ""
+    assert "0/U, system/controlDict" in setup.stage._validate(setup.ctx, CASE, "icoFoam")
+
+
+def test_a_file_that_any_error_names_is_not_listed_as_in_order(tmp_path):
+    # the consistency check lists system/fvSolution as present and parsed, but the syntax check
+    # (a different op) reports that it cannot be parsed: it must not appear as in order
+    report = {"passed": ["0/U", "system/fvSolution"], "adjust_time_step": False, "delta_t": 0.005}
+    consistent_ok = OpResponse(ok=True, data={"ok": True, "errors": [], "report": report})
+    parse_error = failed("system/fvSolution cannot be parsed:\nmissing semicolon")
+    setup = Setup(tmp_path, dictionaries=parse_error, consistency=consistent_ok)
+    result = setup.gate()
+    assert not result.ok and result.data == {"passed": ["0/U"]}
+    note = setup.stage.passed_text(result)
+    assert "0/U" in note and "fvSolution" not in note
+    shown = setup.stage._validate(setup.ctx, CASE, "icoFoam")
+    assert (
+        "Already in order" in shown
+        and "0/U." in shown
+        and "fvSolution" not in shown.split("Already in order")[1]
+    )
+
+
+def test_only_a_static_failure_carries_the_list_of_files_in_order(tmp_path):
+    report = {"passed": ["0/U"], "adjust_time_step": False, "delta_t": 0.005}
+    consistent_ok = OpResponse(ok=True, data={"ok": True, "errors": [], "report": report})
+    trial_failed = Setup(tmp_path / "a", consistency=consistent_ok, trial=failed("solver stopped"))
+    result = trial_failed.gate()
+    assert not result.ok and result.data is None
+    assert trial_failed.stage.passed_text(result) == ""
+    courant = Setup(tmp_path / "b", consistency=consistent_ok, trial=trial_with(114.0)).gate()
+    assert not courant.ok and courant.data is None

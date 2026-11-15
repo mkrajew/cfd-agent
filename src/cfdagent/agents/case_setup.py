@@ -217,6 +217,23 @@ def _errors(response: OpResponse, fallback: str) -> list[str]:
     return [response.error or fallback]
 
 
+def _passed(report: dict) -> list[str]:
+    """The files the consistency check found present and parsed, without a problem."""
+    found = report.get("passed")
+    return [str(name) for name in found] if isinstance(found, list) else []
+
+
+def _passed_sentence(passed: list[str]) -> str:
+    """What the static checks found nothing to report in (empty if there are no such files)."""
+    if not passed:
+        return ""
+    return (
+        "Already in order (the static checks, which look at presence, syntax and consistency, "
+        f"found nothing to report in these files): {', '.join(passed)}. A later solver error "
+        "that names one of them still needs an edit there."
+    )
+
+
 def _clip(text: str, limit: int = HEADLINE_CHARS) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
@@ -380,8 +397,8 @@ class CaseSetupStage(Stage):
         if problem:
             return GateResult(False, [problem])
         errors, settings = self._static_problems(ctx, case_rel, solver)
-        if errors:
-            return GateResult(False, errors)
+        if errors:  # only a static failure lists the files in order
+            return GateResult(False, errors, data={"passed": _passed(settings)})
         response = ctx.sandbox.call(
             "trial_run",
             TrialRunArgs(case_dir=case_rel, solver=solver, steps=TRIAL_STEPS),
@@ -393,6 +410,10 @@ class CaseSetupStage(Stage):
             return GateResult(False, [_trial_failure(response, solver)])
         courant = self._courant_problem(response, solver, settings)
         return GateResult(courant is None, [] if courant is None else [courant])
+
+    def passed_text(self, result: GateResult) -> str:
+        data = result.data if isinstance(result.data, dict) else {}
+        return _passed_sentence(_passed(data))
 
     def promote(self, ctx: StageContext, attempt_dir: Path) -> None:
         """``case/``: the attempt's case (0/, constant/ with the unchanged mesh, system/), replacing
@@ -510,7 +531,12 @@ class CaseSetupStage(Stage):
         if not consistent.ok:
             errors += _errors(consistent, "the case is not consistent")
         report = (consistent.data or {}).get("report")
-        return errors, report if isinstance(report, dict) else {}
+        report = dict(report) if isinstance(report, dict) else {}
+        # a file that any error names (the syntax check names files too) is not in order
+        report["passed"] = [
+            name for name in _passed(report) if not any(name in error for error in errors)
+        ]
+        return errors, report
 
     @staticmethod
     def _courant_problem(response: OpResponse, solver: str, settings: dict) -> str | None:
@@ -580,11 +606,13 @@ class CaseSetupStage(Stage):
         return text
 
     def _validate(self, ctx: StageContext, case_rel: str, solver: str) -> str:
-        problems, _ = self._static_problems(ctx, case_rel, solver)
+        problems, report = self._static_problems(ctx, case_rel, solver)
         if not problems:
             return (
                 "No problems found: every dictionary parses and the case is consistent with the "
                 "mesh and the solver. The solver itself has not been run; check_stage runs "
                 f"{TRIAL_STEPS} time steps."
             )
-        return "Problems found:\n" + "\n".join(f"- {p}" for p in problems)
+        listing = "Problems found:\n" + "\n".join(f"- {p}" for p in problems)
+        passed = _passed_sentence(_passed(report))
+        return f"{listing}\n{passed}" if passed else listing

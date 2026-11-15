@@ -452,7 +452,7 @@ def _build_config(
     benchmark_id: str | None,
     repair_mode: RepairMode | None = None,
 ) -> Any:
-    from cfdagent.config import DEFAULT_DEPLOYMENT, RunConfig
+    from cfdagent.config import DEFAULT_DEPLOYMENT, HIGH_EFFORT_STRUCTURED_TOKENS, RunConfig
     from cfdagent.llm.cost import PRICING
 
     # The host environment file names the image it pulled; without it the default local tag is used.
@@ -472,6 +472,10 @@ def _build_config(
             changes["reasoning_effort"] = None  # the default effort belongs to the default model
         models = {name: cfg.model_copy(update=changes) for name, cfg in config.models.items()}
         config = config.model_copy(update={"models": models})
+    if effort is not None and effort.value == "high":
+        config = config.model_copy(
+            update={"planner_structured_max_tokens": HIGH_EFFORT_STRUCTURED_TOKENS}
+        )
     if benchmark_id is not None:
         config = config.model_copy(update={"benchmark_id": benchmark_id, "task_set": "development"})
     if repair_mode is not None:

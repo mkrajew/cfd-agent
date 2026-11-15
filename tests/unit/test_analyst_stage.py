@@ -724,3 +724,12 @@ def test_stage_loop_passes_scripted_fixture_and_promotes(tmp_path):
     }
     assert [(a.n, a.ok) for a in setup.ctx.record.stages[0].attempts] == [(1, True)]
     assert setup.ctx.record.stages[0].name == "analyst"
+
+
+def test_opening_messages_state_input_paths(tmp_path):
+    setup = prepared(tmp_path)
+    text = setup.stage.opening_message(setup.ctx)
+    assert "working directory" in text
+    assert "../../casespec.json" in text
+    for name in ("`case/`", "quantities.json", "plots/", "analysis.md"):
+        assert name in text

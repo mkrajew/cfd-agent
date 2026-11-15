@@ -32,6 +32,9 @@ if TYPE_CHECKING:
     from cfdagent.agents.casespec import CaseSpec
 
 MIN_INNER_TIMEOUT_S = 1.0  # sandbox calls refuse a timeout of zero or less
+# The plan as a script finds it: scripts run with an attempt directory (``attempts/<stage>-<n>``)
+# as their working directory, and ``casespec.json`` sits in the run directory two levels above.
+CASESPEC_FROM_ATTEMPT = "../../casespec.json"
 MAX_CARRIED_LISTED = 30  # carried files named in a retry message; the rest is counted
 
 
@@ -171,6 +174,11 @@ class Stage(ABC):
         failures are deterministic and outside the agent's reach returns ``False``: the loop then
         ends the stage after the diagnosis. The default is ``True``."""
         return True
+
+    def passed_text(self, result: GateResult) -> str:
+        """What the gate found in order, shown after the errors of a failed gate (the loop adds
+        it to the check result of every failed attempt). Empty by default."""
+        return ""
 
     def retry_text(self, previous: str, carried: list[str] | None = None) -> str:
         """What the agent is told about the new attempt directory after a failed gate

@@ -23,6 +23,11 @@ solvers are not demanded when ``momentumPredictor`` is off; the viscous stress t
 only for the laminar models that certainly have it. Anything it cannot read is left to
 ``check_dictionaries`` and the trial run.
 
+Every message starts with the file to create or edit and shows the minimal skeleton of the missing
+entry in double quotes, for example ``system/fvSchemes: missing laplacianSchemes; add
+"laplacianSchemes { default Gauss linear corrected; }"``. A skeleton holds what the solver requires
+(the keywords and the structure); where a value belongs to the case it is a ``<placeholder>``.
+
 Container-side module (``case_check`` calls it); host-side code does not import it.
 """
 
@@ -60,6 +65,28 @@ LINEAR_VISCOUS_LAMINAR = frozenset({"Stokes", "generalisedNewtonian"})
 _COMMENT = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
 VISCOUS_DIV = "div((nuEff*dev2(T(grad(U)))))"
 MOMENTUM_DIV = "div(phi,U)"
+LAPLACIAN_SKELETON = "laplacianSchemes { default Gauss linear corrected; }"
+GRAD_SKELETON = "gradSchemes { default Gauss linear; }"
+MOMENTUM_SKELETON = f"{MOMENTUM_DIV} <convection scheme>;"
+VISCOUS_SKELETON = f"{VISCOUS_DIV} Gauss linear;"
+LINEAR_SOLVER_SKELETONS = {
+    "p": "p { solver PCG; preconditioner DIC; tolerance <tolerance>; "
+    "relTol <relative tolerance>; }",
+    "pFinal": "pFinal { $p; relTol 0; }",
+    "U": "U { solver smoothSolver; smoother symGaussSeidel; tolerance <tolerance>; "
+    "relTol <relative tolerance>; }",
+    "UFinal": "UFinal { $U; relTol 0; }",
+}
+PRESSURE_REFERENCE_SKELETON = "pRefCell 0; pRefValue 0;"
+ALGORITHM_SKELETON = (
+    "{algorithm} {{ nNonOrthogonalCorrectors <number of non-orthogonal correctors>; }}"
+)
+RELAXATION_SKELETON = "relaxationFactors { fields { p <factor>; } equations { U <factor>; } }"
+# Said when a missing file's skeleton is incomplete because the flow may be turbulent.
+TURBULENCE_NOTE = (
+    " The skeleton lists the momentum and pressure entries only; the fields of a turbulence "
+    "model need their own schemes and linear solvers."
+)
 
 
 @dataclass(frozen=True)
@@ -69,6 +96,15 @@ class _Needs:
     ddt_schemes: bool  # read by the laminar case (a steady turbulent case reads it too)
     transport_model: bool  # `transportModel` and `constant/turbulenceProperties`
     viscous_div: bool
+
+    @property
+    def steady(self) -> bool:
+        return self.algorithm == "SIMPLE"
+
+    @property
+    def time_scheme(self) -> str:
+        """A time scheme that fits the solver (the steady solver has no time derivative)."""
+        return "steadyState" if self.steady else "Euler"
 
 
 NEEDS = {
@@ -91,25 +127,25 @@ def _transport_problems(
 ) -> list[str]:
     rel = "constant/transportProperties"
     transport, exists = _load(case_dir, rel, skipped)
-    kinematic = (
-        "`transportModel Newtonian;` and `nu [0 2 -1 0 0 0 0] <value>;`"
-        if needs.transport_model
-        else "`nu [0 2 -1 0 0 0 0] <value>;` (kinematic viscosity)"
-    )
+    nu_entry = "nu [0 2 -1 0 0 0 0] <value>;"
+    kinematic = f"transportModel Newtonian; {nu_entry}" if needs.transport_model else nu_entry
     if not exists:
-        return [f"{rel} does not exist; {solver} reads it. Write it with {kinematic}"]
+        return [
+            f'{rel}: file does not exist; {solver} reads it; create it with "{kinematic}" '
+            "(nu is the kinematic viscosity in m^2/s)"
+        ]
     if transport is None or cc.DIRECTIVES in transport:
         return []
     problems = []
     model = cc._word(transport.get("transportModel"))
     if needs.transport_model and "transportModel" not in transport:
         problems.append(
-            f"{rel} has no `transportModel`; {solver} reads it. Add `transportModel Newtonian;`"
+            f'{rel}: missing transportModel; {solver} reads it; add "transportModel Newtonian;"'
         )
     # icoFoam always reads `nu`; the others read it for the Newtonian model (the default here)
     reads_nu = not needs.transport_model or (not cc._macro(model) and model in (None, "Newtonian"))
     if "nu" not in transport and reads_nu:
-        problems.append(f"{rel} has no `nu`; add `nu [0 2 -1 0 0 0 0] <value>;` (m^2/s)")
+        problems.append(f'{rel}: missing `nu`; add "{nu_entry}" (the kinematic viscosity in m^2/s)')
     return problems
 
 
@@ -117,12 +153,16 @@ def _turbulence_problems(turbulence: Dictionary | None, exists: bool, solver: st
     rel = "constant/turbulenceProperties"
     if not exists:
         return [
-            f"{rel} does not exist; {solver} reads it even for a laminar flow. Write it with "
-            "`simulationType laminar;` (or `RAS { ... }` for a turbulence model)"
+            f"{rel}: file does not exist; {solver} reads it even for a laminar flow; create it "
+            'with "simulationType laminar;" (for a turbulence model: "simulationType RAS;" and '
+            "a `RAS` dictionary)"
         ]
     if turbulence is None or cc.DIRECTIVES in turbulence or "simulationType" in turbulence:
         return []
-    return [f"{rel} has no `simulationType`; add `simulationType laminar;` or `RAS`/`LES`"]
+    return [
+        f'{rel}: missing simulationType; add "simulationType laminar;" (or RAS or LES for a '
+        "turbulence model)"
+    ]
 
 
 def _simulation_type(turbulence: Dictionary | None) -> str | None:
@@ -156,23 +196,32 @@ def _has_scheme(body: str, name: str) -> bool:
     return re.search(r"(?:^|[\s;{])" + re.escape(name) + r"\s", body) is not None
 
 
+def _div_skeleton(viscous: bool) -> str:
+    entries = [MOMENTUM_SKELETON] + ([VISCOUS_SKELETON] if viscous else [])
+    return "divSchemes { default none; " + " ".join(entries) + " }"
+
+
 def _schemes_problems(
-    case_dir: Path, needs: _Needs, ddt: bool, viscous: bool, skipped: list[str]
+    case_dir: Path, needs: _Needs, ddt: bool, viscous: bool, skipped: list[str], note: str
 ) -> list[str]:
     rel = "system/fvSchemes"
     schemes, exists = _load(case_dir, rel, skipped)
-    if not exists:
-        return [
-            f"{rel} does not exist; write it with the scheme dictionaries gradSchemes, "
-            "divSchemes and laplacianSchemes" + (" and ddtSchemes" if ddt else "")
-        ]
-    if schemes is None or cc.DIRECTIVES in schemes:
-        return []
+    skeletons = {
+        "ddtSchemes": f"ddtSchemes {{ default {needs.time_scheme}; }}",
+        "gradSchemes": GRAD_SKELETON,
+        "divSchemes": _div_skeleton(viscous),
+        "laplacianSchemes": LAPLACIAN_SKELETON,
+    }
     required = ["gradSchemes", "divSchemes", "laplacianSchemes"]
     if ddt:
         required.insert(0, "ddtSchemes")
+    if not exists:
+        listing = " ".join(skeletons[name] for name in required)
+        return [f'{rel}: file does not exist; create it with "{listing}".{note}']
+    if schemes is None or cc.DIRECTIVES in schemes:
+        return []
     problems = [
-        f"{rel} has no `{name}` dictionary; add `{name} {{ default ...; }}`"
+        f'{rel}: missing {name}; add "{skeletons[name]}"'
         for name in required
         if not isinstance(schemes.get(name), dict)
     ]
@@ -189,12 +238,14 @@ def _schemes_problems(
     body = _scheme_names(text)
     if body is None:
         return problems
-    wanted = [MOMENTUM_DIV] + ([VISCOUS_DIV] if viscous else [])
-    for name in wanted:
+    wanted = [(MOMENTUM_DIV, MOMENTUM_SKELETON)]
+    if viscous:
+        wanted.append((VISCOUS_DIV, VISCOUS_SKELETON))
+    for name, skeleton in wanted:
         if not _has_scheme(body, name):
             problems.append(
                 f"{rel}: divSchemes has no `{name}` entry and its default is `none`; add "
-                f"`{name} <scheme>;` (the solver reads this term)"
+                f'"{skeleton}" inside divSchemes (the solver reads this term)'
             )
     return problems
 
@@ -247,14 +298,20 @@ def _momentum_solved(solution: Dictionary, algorithm: str) -> bool:
     return word.lower() not in cc._OFF
 
 
-def _solution_problems(case_dir: Path, needs: _Needs, skipped: list[str]) -> list[str]:
+def _solution_problems(case_dir: Path, needs: _Needs, skipped: list[str], note: str) -> list[str]:
     rel = "system/fvSolution"
     solution, exists = _load(case_dir, rel, skipped)
     if not exists:
-        return [
-            f"{rel} does not exist; write it with `solvers` ({', '.join(needs.solvers)}) and the "
-            f"`{needs.algorithm}` dictionary"
-        ]
+        skeleton = f"{_solvers_skeleton(needs.solvers)} {_algorithm_skeleton(needs.algorithm)}"
+        advice = ""
+        if needs.steady:
+            skeleton += f" {RELAXATION_SKELETON}"
+            advice = (
+                " A steady run is also best given a `residualControl` dictionary inside "
+                f"`{needs.algorithm}` (optional, but it stops the run when the residuals are "
+                "small enough)."
+            )
+        return [f'{rel}: file does not exist; create it with "{skeleton}".{advice}{note}']
     if solution is None or cc.DIRECTIVES in solution:
         return []
     problems = []
@@ -263,20 +320,28 @@ def _solution_problems(case_dir: Path, needs: _Needs, skipped: list[str]) -> lis
         wanted = tuple(name for name in wanted if not name.startswith("U"))
     solvers = solution.get("solvers")
     if not isinstance(solvers, dict):
-        problems.append(
-            f"{rel} has no `solvers` dictionary; add an entry for each of {', '.join(wanted)}"
-        )
+        problems.append(f'{rel}: missing `solvers`; add "{_solvers_skeleton(wanted)}"')
     elif cc.DIRECTIVES not in solvers:
         keys = [key for key in solvers if key != cc.DIRECTIVES]
         missing = [name for name in wanted if not _covers(keys, name)]
         if missing:
+            skeleton = " ".join(LINEAR_SOLVER_SKELETONS[name] for name in missing)
             problems.append(
-                f"{rel}: `solvers` has no entry for: {', '.join(missing)}. {_final_hint(missing)}"
+                f"{rel}: `solvers` has no entry for: {', '.join(missing)}; add "
+                f'"{skeleton}" inside `solvers`. {_final_hint(missing)}'
             )
     if _pressure_needs_reference(case_dir, skipped):
         problems += _reference_problems(rel, solution, needs.algorithm)
     problems += _relaxation_problems(rel, solution, needs.algorithm)
     return problems
+
+
+def _algorithm_skeleton(algorithm: str) -> str:
+    return ALGORITHM_SKELETON.format(algorithm=algorithm)
+
+
+def _solvers_skeleton(names: tuple[str, ...]) -> str:
+    return "solvers { " + " ".join(LINEAR_SOLVER_SKELETONS[name] for name in names) + " }"
 
 
 RELAXATION = "relaxationFactors"
@@ -303,18 +368,14 @@ def _relaxation_problems(rel: str, solution: Dictionary, algorithm: str) -> list
     return [
         f"{rel}: `{RELAXATION}` is written inside the `{algorithm}` dictionary, where "
         "OpenFOAM ignores it, so no under-relaxation is applied. It must be a top-level "
-        f"dictionary of {rel}, beside `{algorithm}` and not inside it: "
-        f"`{RELAXATION} {{ fields {{ p 0.3; }} equations {{ U 0.7; }} }}` (a steady solver "
-        "under-relaxes with it; the values are examples, choose them for the case)"
+        f'dictionary of {rel}, beside `{algorithm}` and not inside it: "{RELAXATION_SKELETON}" '
+        "(a steady solver under-relaxes with it; choose the factors for the case)"
     ]
 
 
 def _final_hint(missing: list[str]) -> str:
     if any(name.endswith("Final") for name in missing):
-        return (
-            "The final solves read `pFinal` (and `UFinal` for pimpleFoam); a quoted pattern such "
-            'as `"(p|pFinal)"` covers both'
-        )
+        return "The final solves read `pFinal` (and `UFinal` for pimpleFoam)"
     return "Add a linear solver entry for each field the solver solves"
 
 
@@ -331,9 +392,9 @@ def _reference_problems(rel: str, solution: Dictionary, algorithm: str) -> list[
     if not missing:
         return []
     return [
-        f"{rel}: the pressure level is not fixed by any boundary condition of 0/p, so "
-        f"`{algorithm}` needs `pRefCell 0;` (or `pRefPoint (x y z);`) and `pRefValue 0;`; "
-        f"missing: {', '.join(missing)}"
+        f"{rel}: missing {', '.join(missing)}; the pressure level is not fixed by any boundary "
+        f'condition of 0/p, so add "{PRESSURE_REFERENCE_SKELETON}" inside `{algorithm}` '
+        "(`pRefPoint (x y z);` may replace pRefCell)"
     ]
 
 
@@ -353,6 +414,10 @@ def solver_problems(case_dir: Path, solver: str, skipped: list[str]) -> list[str
         # a steady turbulent case reads ddtSchemes too (the turbulence equations have a time term)
         ddt = ddt or _simulation_type(turbulence) in ("RAS", "LES")
         viscous = needs.viscous_div and _linear_viscous(turbulence)
-    problems += _schemes_problems(case_dir, needs, ddt, viscous, skipped)
-    problems += _solution_problems(case_dir, needs, skipped)
+    # The skeletons of a missing file are the laminar core; a turbulence model, or a flow whose
+    # model is not known, needs more than they list.
+    incomplete = needs.transport_model and _simulation_type(turbulence) != "laminar"
+    note = TURBULENCE_NOTE if incomplete else ""
+    problems += _schemes_problems(case_dir, needs, ddt, viscous, skipped, note)
+    problems += _solution_problems(case_dir, needs, skipped, note)
     return problems

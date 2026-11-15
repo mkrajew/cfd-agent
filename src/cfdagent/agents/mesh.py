@@ -42,7 +42,7 @@ from cfdagent.agents.gatehelp import last_bytes, names, read_manifest
 from cfdagent.agents.geometry import PROMOTED_DIR as GEOMETRY_DIR
 from cfdagent.agents.geometry import STEP_NAME
 from cfdagent.agents.planner import RESOURCE_PREFIX
-from cfdagent.agents.stage import Stage, StageContext
+from cfdagent.agents.stage import CASESPEC_FROM_ATTEMPT, Stage, StageContext
 from cfdagent.agents.tools import FileScope
 from cfdagent.errors import ToolFailure
 from cfdagent.executor.protocol import CheckMeshArgs, ConvertMeshArgs, OpResponse, RunScriptArgs
@@ -316,7 +316,11 @@ class MeshStage(Stage):
             f"time was planned for); the hard limit of this run is {ctx.config.limits.max_cells} "
             f'cells, and a mesh above it fails the check ("{RESOURCE_PREFIX.rstrip(":")}"). Units '
             "are metres, as in the geometry."
-            f"{extra}"
+            f"{extra}\n\n"
+            "The script runs with the attempt directory as its working directory; every path in "
+            f"it is relative to that directory: it reads {STEP_NAME} and {MANIFEST_FILE_NAME} "
+            f"there, writes {MESH_NAME} there, and if it needs the plan, the plan is "
+            f"{CASESPEC_FROM_ATTEMPT}."
         )
 
     def prepare_attempt(self, ctx: StageContext, attempt_dir: Path) -> None:

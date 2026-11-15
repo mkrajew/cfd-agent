@@ -487,10 +487,41 @@ def _control_problems(
     return problems, settings
 
 
+PASSED_CANDIDATES = (
+    "system/controlDict",
+    "system/fvSchemes",
+    "system/fvSolution",
+    "constant/transportProperties",
+    "constant/turbulenceProperties",
+)
+
+
+def _passed_files(
+    case_dir: Path, fields: list[str], problems: list[str], skipped: list[str]
+) -> list[str]:
+    """The case files that are present, were read and parsed, and that no problem names; sorted.
+
+    This is what an agent need not touch while it fixes the problems (a file with a problem, an
+    unreadable file and a file this check does not look at are not listed).
+    """
+    found = []
+    for rel in [*PASSED_CANDIDATES, *(f"0/{name}" for name in fields)]:
+        path = case_dir / rel
+        if path.is_symlink() or not path.is_file():
+            continue
+        if any(rel in problem for problem in problems):
+            continue
+        if any(note.startswith(f"{rel} ") for note in skipped):
+            continue
+        found.append(rel)
+    return sorted(found)
+
+
 def check_case_consistency(case_dir: Path, solver: str) -> GateResult:
     """Check the case in ``case_dir`` as described in the module docstring.
 
     ``data`` holds ``patches`` (name -> type from the mesh), ``fields`` (the field files judged),
+    ``passed`` (the files that are present and parsed and that no problem names),
     ``skipped`` (what could not be read, with the reason) and the time settings the stage needs:
     ``adjust_time_step`` (bool) and ``delta_t`` (float or ``None``).
     """
@@ -508,6 +539,7 @@ def check_case_consistency(case_dir: Path, solver: str) -> GateResult:
     data = {
         "patches": {name: kind for name, (kind, _groups_) in patches.items()},
         "fields": fields,
+        "passed": _passed_files(case_dir, fields, problems, skipped),
         "skipped": skipped,
         **settings,
     }

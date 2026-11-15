@@ -19,7 +19,8 @@ question gets no extra turn. A stage whose failures no other attempt can fix say
 ``Stage.retry_after_failure``; the loop then ends the stage after the diagnosis.
 
 A stage ends, with a reason, when: the gate passes; ``max_attempts_per_stage`` gates have failed;
-``max_turns_per_attempt`` model turns pass without a check; the run's wall-clock budget is used;
+``max_turns_per_attempt`` model turns (or the stage's own limit in
+``max_turns_per_attempt_by_stage``) pass without a check; the run's wall-clock budget is used;
 the cost limit is exceeded; or the model service fails for good. A ``SchemaError`` is a
 programming error and propagates, as does any exception from the gate itself.
 
@@ -99,6 +100,8 @@ CUT_OFF_ADVICE = (
     "Reason briefly, then call tools with SMALLER arguments: split the work into several "
     "smaller files; do not put everything into one huge file."
 )
+# Put before the errors of a gate that reports exactly what the previous attempt's gate reported.
+SAME_PROBLEM = "This is the same problem as in the previous attempt; it was not fixed:"
 MAX_REASON_CHARS = 1500
 MAX_ECHOED_ERROR_CHARS = 600
 DIAGNOSIS_TOOL_ANSWER = "not run: this turn is for the diagnosis; reply with plain text"
@@ -389,6 +392,11 @@ class _StageRun(ModelConversation):
         self.registry = registry
         return carried
 
+    def _turn_limit(self) -> int:
+        """Model turns allowed per attempt: the stage's own limit if the configuration has one."""
+        by_stage = self.limits.max_turns_per_attempt_by_stage
+        return by_stage.get(self.stage.name, self.limits.max_turns_per_attempt)
+
     def _attempt_note(self) -> str:
         return (
             f"This is attempt {self.attempts + 1} of {self.limits.max_attempts_per_stage}. "
@@ -414,6 +422,7 @@ class _StageRun(ModelConversation):
         if result.ok:
             self.passed = True
             return "The checks passed. The stage is complete."
+        repeated = bool(self.last_errors) and errors == self.last_errors
         self.last_errors = errors
         request = self.stage.diagnosis_request(self.ctx, list(errors))
         self.diagnosis_due = (self.record.attempts[-1], request) if request else None
@@ -421,7 +430,11 @@ class _StageRun(ModelConversation):
             "\n".join(f"- {e}" for e in errors), CHECK_ERROR_BYTES, "\n[errors truncated]"
         )
         limit = self.limits.max_attempts_per_stage
-        text = f"The checks failed (attempt {self.attempts} of {limit}):\n{listing}"
+        same = f"{SAME_PROBLEM}\n" if repeated else ""
+        text = f"The checks failed (attempt {self.attempts} of {limit}):\n{same}{listing}"
+        passed = self.stage.passed_text(result)
+        if passed:
+            text += f"\n{passed}"
         if self.attempts >= limit:
             self.exhausted = True
             self._progress()
@@ -452,7 +465,7 @@ class _StageRun(ModelConversation):
             {"role": "user", "content": opening},
         ]
         while True:
-            if self.turns >= self.limits.max_turns_per_attempt:
+            if self.turns >= self._turn_limit():
                 return self._fail(
                     f"stage {self.stage.name!r}: {self.turns} model turns passed without a "
                     "passing check (max_turns_per_attempt)"
