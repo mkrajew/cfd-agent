@@ -1474,3 +1474,35 @@ def test_only_a_static_failure_carries_the_list_of_files_in_order(tmp_path):
     assert trial_failed.stage.passed_text(result) == ""
     courant = Setup(tmp_path / "b", consistency=consistent_ok, trial=trial_with(114.0)).gate()
     assert not courant.ok and courant.data is None
+
+
+def test_the_consistency_check_gets_the_time_dependence_of_the_plan(tmp_path):
+    for dependence in ("steady", "transient"):
+        setup = Setup(tmp_path / dependence)
+        setup.ctx.casespec = plan(
+            solver={"suggested_solver": "icoFoam", "end_time_s": 1.0, "time_step_s": 0.005},
+            time_dependence=dependence,
+        )
+        assert setup.gate().ok
+        check_args = next(
+            a for op, a, _t in setup.ctx.sandbox.calls if op == "check_case_consistency"
+        )
+        assert check_args.time_dependence == dependence
+
+
+def test_the_prompt_demands_a_stopping_criterion_for_a_steady_case():
+    lowered = load_prompt("case_setup").text.lower()
+    assert "residualcontrol" in lowered
+    assert "function object" in lowered and "monitor" in lowered
+
+
+def test_the_opening_message_shows_whether_the_outputs_are_periodic(tmp_path):
+    setup = Setup(tmp_path)
+    setup.ctx.casespec = plan(
+        solver={"suggested_solver": "pimpleFoam", "end_time_s": 30.0, "time_step_s": 0.001},
+        time_dependence="transient",
+        periodic_outputs=True,
+    )
+    assert '"periodic_outputs": true' in setup.stage.opening_message(setup.ctx)
+    lowered = load_prompt("case_setup").text.lower()
+    assert "periodic_outputs" in lowered and "forcecoeffs" in lowered

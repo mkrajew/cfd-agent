@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from pydantic import BaseModel
+
 from cfdagent.agents.routing import RouteRequest
 from cfdagent.agents.tools import FileScope, Tool
 from cfdagent.agents.transcript import TranscriptWriter
@@ -241,6 +243,21 @@ class Stage(ABC):
         gate, the last attempt's included; ``errors`` are the gate's errors. Return the question
         for the agent (one extra model turn without tools, whose text is stored as the attempt's
         ``diagnosis``) or ``None`` for no question. The default asks nothing."""
+        return None
+
+    def diagnosis_schema(self) -> type[BaseModel] | None:
+        """The schema of the diagnosis turn for the gate failure that has just been reported to
+        ``diagnosis_request``, or ``None`` for the free-text turn (the default). With a schema the
+        loop makes the turn one structured call (no tools) and hands the parsed reply to
+        ``take_diagnosis``. The loop asks right after ``diagnosis_request``, so a stage may decide
+        from the failure it has just judged."""
+        return None
+
+    def take_diagnosis(self, parsed: BaseModel | None) -> str | None:
+        """Receive the parsed reply of a structured diagnosis turn (``None`` when the reply was
+        missing or invalid) and return the text to store as ``AttemptRecord.diagnosis`` (``None``
+        for no text). A stage keeps what ``route_after_failure`` needs. Called only for a stage
+        with a ``diagnosis_schema``; the default stores nothing."""
         return None
 
     def retry_after_failure(self, errors: list[str]) -> bool:

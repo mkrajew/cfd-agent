@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pydantic import BaseModel
 
 from cfdagent.agents import loop
 from cfdagent.agents.loop import SeededAttempt, StageOutcome, run_stage
@@ -1726,3 +1727,96 @@ def test_an_unseeded_run_stage_call_is_unchanged(tmp_path):
     ctx, backend = make_ctx(tmp_path, [reply(None, check())])
     assert run_stage(ToyStage([GateResult(True, [])]), ctx, seeded=None).ok
     assert "already in the attempt directory" not in backend.calls[0].messages[1]["content"]
+
+
+# ------------------------------------------------------------------ the structured diagnosis hook
+# (ADR-0006, decision 7)
+
+
+ONE_TRY = RunLimits(max_attempts_per_stage=1)
+
+
+class Cause(BaseModel):
+    cause: str
+    target: str
+
+
+class StructuredStage(DiagnosingStage):
+    """A toy stage whose diagnosis turn is one structured call; it keeps the parsed reply."""
+
+    def __init__(self, gates, schema=Cause, **kwargs):
+        super().__init__(gates, **kwargs)
+        self.schema = schema
+        self.taken: list[BaseModel | None] = []
+
+    def diagnosis_schema(self):
+        return self.schema
+
+    def take_diagnosis(self, parsed):
+        self.taken.append(parsed)
+        return parsed.cause if parsed is not None else None
+
+    def route_after_failure(self, ctx, errors):
+        kept = self.taken[-1] if self.taken else None
+        target = kept.target if kept is not None else "case_setup"
+        return RouteRequest("solver_runner", target, "gate", "; ".join(errors), "retry")
+
+
+def structured(cause="too coarse", target="mesh"):
+    return reply(json.dumps({"cause": cause, "target": target}))
+
+
+def test_a_stage_without_a_schema_gets_the_plain_text_turn(tmp_path):
+    ctx, backend = make_ctx(tmp_path, [reply(None, check("k1")), reply("plain")], limits=ONE_TRY)
+    run_stage(DiagnosingStage([GateResult(False, ["bad"])]), ctx)
+    assert backend.calls[1].response_schema is None
+    assert ctx.record.stages[0].attempts[0].diagnosis == "plain"
+
+
+def test_a_stage_with_a_schema_gets_one_structured_call_without_tools(tmp_path):
+    ctx, backend = make_ctx(tmp_path, [reply(None, check("k1")), structured()], limits=ONE_TRY)
+    stage = StructuredStage([GateResult(False, ["bad"])])
+    outcome = run_stage(stage, ctx)
+    asked = backend.calls[1]
+    assert asked.response_schema is Cause and asked.tools is None
+    assert DIAGNOSE in asked.messages[-1]["content"]
+    assert [p.model_dump() for p in stage.taken] == [{"cause": "too coarse", "target": "mesh"}]
+    assert ctx.record.stages[0].attempts[0].diagnosis == "too coarse"  # the text the stage chose
+    assert outcome.route is not None and outcome.route.target == "mesh"  # built from the reply
+
+
+def test_an_unusable_structured_reply_is_given_to_the_stage_as_none(tmp_path):
+    steps = [reply(None, check("k1")), reply("not json at all")]
+    ctx, _ = make_ctx(tmp_path, steps, limits=ONE_TRY)
+    stage = StructuredStage([GateResult(False, ["bad"])])
+    outcome = run_stage(stage, ctx)
+    assert stage.taken == [None]
+    assert ctx.record.stages[0].attempts[0].diagnosis is None
+    assert outcome.route is not None and outcome.route.target == "case_setup"
+
+
+def test_a_structured_diagnosis_does_not_spend_a_turn_of_the_attempt(tmp_path):
+    steps = [reply(None, check("k1")), structured(), reply(None, check("k2"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    stage = StructuredStage([GateResult(False, ["bad"]), GateResult(True, [])])
+    assert run_stage(stage, ctx).ok
+    resumed = backend.calls[2].messages  # the model sees its own answer and then the resume note
+    assert resumed[-2]["role"] == "assistant" and "too coarse" in resumed[-2]["content"]
+    assert resumed[-1]["role"] == "user" and "attempt" in resumed[-1]["content"].lower()
+
+
+def test_the_schema_decision_belongs_to_the_gate_that_just_failed(tmp_path):
+    class Switching(StructuredStage):
+        def diagnosis_schema(self):
+            return Cause if len(self.requests) == 1 else None  # the first failure only
+
+    steps = [reply(None, check("k1")), structured(), reply(None, check("k2")), reply("text")]
+    ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_attempts_per_stage=2))
+    stage = Switching([GateResult(False, ["one"]), GateResult(False, ["two"])])
+    run_stage(stage, ctx)
+    assert [c.response_schema for c in backend.calls if c.tools is None] == [Cause, None]
+
+
+def test_the_default_stage_has_no_diagnosis_schema():
+    assert ToyStage([GateResult(True, [])]).diagnosis_schema() is None
+    assert ToyStage([GateResult(True, [])]).take_diagnosis(None) is None

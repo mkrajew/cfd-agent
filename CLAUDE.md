@@ -84,7 +84,7 @@ Calibration (a hand-written solution of a benchmark through the toolchain and th
 
 ```bash
 MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/work" -w /work cfdagent:dev pytest -m calibration tests/calibration/test_cavity_re1000.py -s
-MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/work" -w /work cfdagent:dev python scripts/run_calibration.py tests/fixtures/handwritten/cavity_re1000 --benchmark cavity-re1000   # prints the Scorer table; --keep DIR keeps the work directory
+MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD:/work" -w /work cfdagent:dev python scripts/run_calibration.py tests/fixtures/handwritten/cavity_re1000 --benchmark cavity-re1000   # prints the Scorer table; --keep DIR keeps the work directory; --gate also runs the Solver Runner convergence gate (fixture.json needs time_dependence and periodic_outputs)
 ```
 
 The command-line interface (`uv run cfdagent ...` on a development machine, plain `cfdagent` on the VM, where `/usr/local/bin/cfdagent` loads `/etc/cfdagent/env`). A live run calls the model and costs money, so rule 4 applies; it needs Docker, the sandbox image (`CFDAGENT_IMAGE`, default `cfdagent:runtime`) and `CFDAGENT_LLM_ENDPOINT`:

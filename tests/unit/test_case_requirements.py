@@ -403,3 +403,127 @@ def test_the_missing_final_solver_message_has_one_skeleton_and_no_pattern_advice
     (error,) = errors_of(write_case(tmp_path, "icoFoam", mutate), "icoFoam")
     assert "pFinal { $p; relTol 0; }" in error
     assert "(p|pFinal)" not in error and error.count('"') == 2
+
+
+# ------------------------------------------------------------------ a steady case needs a stopping
+# criterion (ADR-0006, decision 8)
+
+CRITERION = "a steady case needs"
+
+
+def with_residual_control(files, algorithm, body="p 1e-5; U 1e-5;"):
+    solution = files["system/fvSolution"]
+    old = f"{algorithm}\n{{\n"
+    assert old in solution
+    files["system/fvSolution"] = solution.replace(
+        old, f"{old}    residualControl {{ {body} }}\n", 1
+    )
+
+
+def with_function_object(files, kind="forceCoeffs", name="coeffs"):
+    files["system/controlDict"] += (
+        f"functions\n{{\n    {name}\n    {{\n        type {kind};\n"
+        "        libs (forces);\n        writeControl timeStep;\n    }\n}\n"
+    )
+
+
+def steady_errors(root, solver, mutate=None, time_dependence="steady"):
+    write_case(root, solver, mutate)
+    result = check_case_consistency(root, solver, time_dependence)
+    assert result.ok == (result.errors == [])
+    return result.errors
+
+
+def test_steady_case_without_criterion_fails_completeness(tmp_path):
+    errors = steady_errors(tmp_path, "simpleFoam")
+    assert len(errors) == 1 and CRITERION in errors[0]
+    assert "system/fvSolution" in errors[0]  # names the file
+    assert "residualControl" in errors[0] and "SIMPLE" in errors[0]  # and the skeleton
+    assert "<" in errors[0]  # values of the case are placeholders
+
+
+def test_a_steady_case_with_residual_control_passes_completeness(tmp_path):
+    assert steady_errors(tmp_path, "simpleFoam", lambda f: with_residual_control(f, "SIMPLE")) == []
+
+
+def test_an_empty_residual_control_is_not_a_criterion(tmp_path):
+    def mutate(files):
+        with_residual_control(files, "SIMPLE", body="")
+
+    errors = steady_errors(tmp_path, "simpleFoam", mutate)
+    assert len(errors) == 1 and CRITERION in errors[0]
+
+
+def test_the_criterion_is_only_demanded_when_the_plan_says_steady(tmp_path):
+    assert steady_errors(tmp_path, "simpleFoam", time_dependence="transient") == []
+    assert check_case_consistency(tmp_path, "simpleFoam").ok  # and not when the plan is unknown
+
+
+def test_a_steady_case_on_a_transient_solver_may_monitor_a_quantity_instead(tmp_path):
+    for solver in ("icoFoam", "pimpleFoam"):
+        root = tmp_path / solver
+        errors = steady_errors(root, solver)
+        assert len(errors) == 1 and CRITERION in errors[0], solver
+        assert "function object" in errors[0] and "forceCoeffs" in errors[0]
+        monitored = steady_errors(root / "m", solver, lambda f: with_function_object(f))
+        assert monitored == [], solver
+
+
+def test_residual_control_in_the_pimple_dictionary_is_not_a_stopping_criterion(tmp_path):
+    """It only ends the outer loop of a time step: the run goes on to endTime, and the gate then
+    needs a monitored quantity, so completeness asks for one."""
+
+    def mutate(files):
+        with_residual_control(files, "PIMPLE")
+
+    errors = steady_errors(tmp_path, "pimpleFoam", mutate)
+    assert len(errors) == 1 and CRITERION in errors[0] and "function object" in errors[0]
+
+
+def test_residual_control_of_a_steady_solver_cannot_be_replaced_by_a_monitor(tmp_path):
+    errors = steady_errors(tmp_path, "simpleFoam", lambda f: with_function_object(f))
+    assert len(errors) == 1 and CRITERION in errors[0]
+
+
+@pytest.mark.parametrize("kind", ["solverInfo", "residuals", "sets", "surfaces", "fieldAverage"])
+def test_a_function_object_that_monitors_nothing_physical_is_not_a_criterion(tmp_path, kind):
+    errors = steady_errors(tmp_path, "icoFoam", lambda f: with_function_object(f, kind))
+    assert len(errors) == 1 and CRITERION in errors[0]
+
+
+@pytest.mark.parametrize("kind", ["forces", "forceCoeffs", "probes", "volFieldValue"])
+def test_every_time_history_function_object_is_a_monitor(tmp_path, kind):
+    assert steady_errors(tmp_path, "icoFoam", lambda f: with_function_object(f, kind)) == []
+
+
+def test_an_include_may_supply_the_criterion(tmp_path):
+    def mutate(files):
+        files["system/fvSolution"] += '#include "criteria"\n'
+
+    assert steady_errors(tmp_path, "simpleFoam", mutate) == []  # not judged: it cannot be sure
+
+
+def test_an_include_func_may_supply_a_monitor(tmp_path):
+    def mutate(files):
+        files["system/controlDict"] += "functions\n{\n    #includeFunc probes(p)\n}\n"
+
+    assert steady_errors(tmp_path, "icoFoam", mutate) == []
+
+
+def test_the_steady_criterion_is_reported_with_the_other_problems(tmp_path):
+    def mutate(files):
+        files["system/fvSchemes"] = files["system/fvSchemes"].replace(
+            "laplacianSchemes\n{\n    default Gauss linear corrected;\n}\n", ""
+        )
+
+    errors = steady_errors(tmp_path, "simpleFoam", mutate)
+    assert len(errors) == 2
+    assert any("laplacianSchemes" in e for e in errors) and any(CRITERION in e for e in errors)
+
+
+def test_a_pison_dictionary_has_no_residual_control(tmp_path):
+    def mutate(files):
+        with_residual_control(files, "PISO")
+
+    errors = steady_errors(tmp_path, "icoFoam", mutate)
+    assert len(errors) == 1 and CRITERION in errors[0] and "function object" in errors[0]

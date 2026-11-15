@@ -3,7 +3,7 @@
 Usage, inside the Docker image (from the repository root, bind-mounted at /work):
 
     python scripts/run_calibration.py tests/fixtures/handwritten/cavity_re1000 \\
-        --benchmark cavity-re1000 [--n-procs N] [--keep DIR]
+        --benchmark cavity-re1000 [--n-procs N] [--keep DIR] [--gate]
 
 The fixture directory holds ``geometry.py``, ``mesh.py``, ``case/`` (the OpenFOAM dictionaries),
 ``post.py`` and ``fixture.json`` (``{"expected_bbox": [xmin, ymin, zmin, xmax, ymax, zmax]}``,
@@ -14,13 +14,22 @@ then the deterministic Scorer against ``benchmarks/<id>``. Everything happens in
 directory that is removed afterwards unless ``--keep DIR`` is given; nothing is written into the
 repository.
 
+With ``--gate`` the solved case is also judged by the Solver Runner's convergence gate
+(``cfdagent.tools.convergence``, ADR-0006): steadiness for a steady plan, periodicity for a plan
+with periodic outputs. ``fixture.json`` then also needs ``time_dependence`` ("steady" or
+"transient") and ``periodic_outputs`` (true or false), the entries of the CaseSpec that the
+gate reads, and optionally ``dimensionality`` ("2D" by default; "axisymmetric" leaves the swirl
+residual of a wedge out of the steadiness check). A failed gate does not stop the run: the
+Scorer still runs, and the report shows both.
+
 The report lists, per criterion, the value, the reference, the error, the threshold and the
 verdict. For a profile criterion value and reference are taken at the position of the largest
 error (``at``). It also gives cells, solver, the end time or iteration count, whether
 ``residualControl`` ended a steady run, the last residuals and the wall times.
 
-Exit status: 0 only if every step succeeded and every criterion passed; 1 otherwise; 2 for a
-usage error (missing fixture directory or ``fixture.json``, unknown benchmark).
+Exit status: 0 only if every step succeeded, every criterion passed and (with ``--gate``) the
+convergence gate passed; 1 otherwise; 2 for a usage error (missing fixture directory or
+``fixture.json``, unknown benchmark, ``--gate`` without the plan entries in ``fixture.json``).
 """
 
 from __future__ import annotations
@@ -83,6 +92,12 @@ class CalibrationResult:
     final_residuals: dict[str, float] = field(default_factory=dict)
     last_initial_residuals: dict[str, float] = field(default_factory=dict)
     sample_times: dict[str, float] = field(default_factory=dict)
+    gate: dict[str, Any] | None = None  # the convergence gate (``--gate``): ok, errors, report
+
+    @property
+    def gate_ok(self) -> bool:
+        """True when no gate was asked for or the convergence gate passed."""
+        return self.gate is None or bool(self.gate.get("ok"))
 
     @property
     def ended_by_residual_control(self) -> bool:
@@ -177,6 +192,35 @@ def _fixture_settings(fixture_dir: Path) -> tuple[float, ...]:
     return values
 
 
+def _gate_settings(fixture_dir: Path) -> tuple[str, bool, str]:
+    """``(time_dependence, periodic_outputs, dimensionality)`` from ``fixture.json``: what the
+    Planner would put in the CaseSpec for this benchmark. The first two are required (a usage error
+    otherwise); ``dimensionality`` defaults to ``"2D"``."""
+    path = fixture_dir / "fixture.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CalibrationUsageError(f"{path}: cannot read the plan entries ({exc})") from exc
+    dependence = data.get("time_dependence") if isinstance(data, dict) else None
+    periodic = data.get("periodic_outputs") if isinstance(data, dict) else None
+    if dependence not in ("steady", "transient"):
+        raise CalibrationUsageError(
+            f'{path}: --gate needs \'time_dependence\' ("steady" or "transient"), got '
+            f"{dependence!r}"
+        )
+    if not isinstance(periodic, bool):
+        raise CalibrationUsageError(
+            f"{path}: --gate needs 'periodic_outputs' (true or false), got {periodic!r}"
+        )
+    dimensionality = data.get("dimensionality", "2D")
+    if dimensionality not in ("2D", "axisymmetric", "3D"):
+        raise CalibrationUsageError(
+            f'{path}: \'dimensionality\' must be "2D", "axisymmetric" or "3D", '
+            f"got {dimensionality!r}"
+        )
+    return dependence, periodic, dimensionality
+
+
 def _check_inputs(fixture_dir: Path, benchmark_id: str, repo_root: Path):
     """Validate the arguments; return ``(benchmark, expected_bbox)``."""
     from cfdagent.bench.registry import RegistryError, load_registry
@@ -220,7 +264,13 @@ def _sample_times(case_dir: Path) -> dict[str, float]:
 
 
 def _run_steps(
-    fixture_dir: Path, benchmark, bbox, workdir: Path, n_procs: int, result: CalibrationResult
+    fixture_dir: Path,
+    benchmark,
+    bbox,
+    workdir: Path,
+    n_procs: int,
+    result: CalibrationResult,
+    gate_settings: tuple[str, bool, str] | None = None,
 ) -> None:
     """The pipeline steps; fills ``result`` as it goes, raises ``_StepFailed`` on a failure."""
     from cfdagent.bench.scoring import score
@@ -258,6 +308,14 @@ def _run_steps(
     result.final_residuals = dict(summary.final_residuals)
     result.last_initial_residuals = dict(summary.initial_residuals)
     _require(solved.ok, result.solver, solved.tool.tail)
+    if gate_settings is not None:
+        from cfdagent.tools.convergence import check_convergence
+
+        dependence, periodic, dimensionality = gate_settings
+        gated = check_convergence(
+            case_dir, result.solver, dependence, periodic, dimensionality=dimensionality
+        )
+        result.gate = {"ok": gated.ok, "errors": list(gated.errors), "report": gated.data}
 
     quantities_path = workdir / "quantities.json"
     post = run_tool(
@@ -281,8 +339,12 @@ def calibrate(
     keep_dir: Path | None = None,
     workdir: Path | None = None,
     repo_root: Path = REPO_ROOT,
+    gate: bool = False,
 ) -> CalibrationResult:
     """Run one hand-written solution and score it.
+
+    With ``gate`` the solved case is also judged by the convergence gate (``result.gate``); the
+    plan entries it needs come from ``fixture.json`` (``CalibrationUsageError`` if missing).
 
     The work happens in ``workdir`` if given (the caller owns it), else in ``keep_dir`` if given
     (kept), else in a temporary directory that is removed. A failing step does not raise: it gives
@@ -290,6 +352,7 @@ def calibrate(
     """
     fixture_dir = Path(fixture_dir).resolve()  # scripts run with another working directory
     benchmark, bbox = _check_inputs(fixture_dir, benchmark_id, Path(repo_root))
+    gate_settings = _gate_settings(fixture_dir) if gate else None
     temporary = None
     if workdir is None and keep_dir is None:
         temporary = tempfile.TemporaryDirectory(prefix="cfdagent-calibration-")
@@ -308,7 +371,7 @@ def calibrate(
     os.environ["PYTHONPATH"] = os.pathsep.join(filter(None, [src, saved_path]))
     started = time.monotonic()
     try:
-        _run_steps(fixture_dir, benchmark, bbox, chosen.resolve(), n_procs, result)
+        _run_steps(fixture_dir, benchmark, bbox, chosen.resolve(), n_procs, result, gate_settings)
     except _StepFailed as exc:
         result.failure, result.passed, result.criteria = str(exc), False, []
     finally:
@@ -338,6 +401,21 @@ def _fmt(value: Any, width: int = 0) -> str:
 
 def _residuals(residuals: dict[str, float]) -> str:
     return ", ".join(f"{name} {value:.2e}" for name, value in residuals.items()) or "-"
+
+
+def _gate_lines(gate: dict[str, Any]) -> list[str]:
+    """The convergence gate as report lines: the verdict, what each check found, the errors."""
+    lines = [f"convergence gate: {'PASS' if gate.get('ok') else 'FAIL'}"]
+    report = gate.get("report") or {}
+    for name in ("steadiness", "periodicity"):
+        part = report.get(name)
+        if not isinstance(part, dict):
+            continue
+        how = part.get("criterion") or part.get("column")
+        label = f"{name} ({how})" if how else name
+        lines.append(f"  {label}: {'ok' if part.get('ok') else 'not ok'}: {part.get('details')}")
+    lines += [f"  gate error: {error}" for error in gate.get("errors") or []]
+    return lines
 
 
 def format_report(result: CalibrationResult) -> str:
@@ -371,6 +449,7 @@ def format_report(result: CalibrationResult) -> str:
         f"last initial residuals: {_residuals(result.last_initial_residuals)}",
         f"last final residuals: {_residuals(result.final_residuals)}",
         f"post-processing sample times: {_fmt(result.sample_times)}",
+        *(_gate_lines(result.gate) if result.gate is not None else []),
         "wall time: "
         f"total {result.wall_seconds:.1f} s, solver {_fmt(result.solver_wall_seconds)} s",
         f"result: {'PASS' if result.passed else 'FAIL'}",
@@ -384,12 +463,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--benchmark", required=True, help="benchmark id, e.g. cavity-re1000")
     parser.add_argument("--n-procs", type=int, default=1, help="MPI ranks, 1 to 4 (default 1)")
     parser.add_argument("--keep", type=Path, metavar="DIR", help="work in DIR and keep it")
+    parser.add_argument(
+        "--gate",
+        action="store_true",
+        help="also run the Solver Runner convergence gate (needs time_dependence and "
+        "periodic_outputs in fixture.json)",
+    )
     args = parser.parse_args(argv)
     try:
         if not 1 <= args.n_procs <= 4:
             raise CalibrationUsageError("--n-procs must be from 1 to 4")
         result = calibrate(
-            args.fixture_dir, args.benchmark, n_procs=args.n_procs, keep_dir=args.keep
+            args.fixture_dir,
+            args.benchmark,
+            n_procs=args.n_procs,
+            keep_dir=args.keep,
+            gate=args.gate,
         )
     except CalibrationUsageError as exc:
         print(f"usage error: {exc}", file=sys.stderr)
@@ -397,7 +486,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(format_report(result))
     if result.workdir is not None:
         print(f"work directory kept: {result.workdir}")
-    return 0 if result.passed else 1
+    return 0 if result.passed and result.gate_ok else 1
 
 
 if __name__ == "__main__":

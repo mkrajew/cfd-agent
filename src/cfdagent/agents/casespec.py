@@ -109,6 +109,11 @@ class CaseSpec(_Closed):
     dimensionality: Literal["2D", "axisymmetric", "3D"]
     flow_regime: Literal["laminar", "turbulent"]
     time_dependence: Literal["steady", "transient"]
+    periodic_outputs: bool = Field(
+        description="True when the requested outputs are statistics of a periodic unsteady regime, "
+        "such as a shedding frequency or a force averaged over whole periods (the case must then "
+        "be transient); false for steady cases and for transient ones without such outputs"
+    )
     fluid: Fluid
     reference: Reference
     geometry: Geometry

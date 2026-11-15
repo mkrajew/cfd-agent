@@ -23,6 +23,11 @@ solvers are not demanded when ``momentumPredictor`` is off; the viscous stress t
 only for the laminar models that certainly have it. Anything it cannot read is left to
 ``check_dictionaries`` and the trial run.
 
+With the plan's ``time_dependence`` the check also demands, for a steady case, a stopping
+criterion (ADR-0006, decision 8): ``residualControl`` in the ``SIMPLE`` dictionary, or, when the
+case is solved with a transient solver, a function object that monitors a quantity. Without them
+the Solver Runner gate cannot show that the run has become steady.
+
 Every message starts with the file to create or edit and shows the minimal skeleton of the missing
 entry in double quotes, for example ``system/fvSchemes: missing laplacianSchemes; add
 "laplacianSchemes { default Gauss linear corrected; }"``. A skeleton holds what the solver requires
@@ -398,9 +403,113 @@ def _reference_problems(rel: str, solution: Dictionary, algorithm: str) -> list[
     ]
 
 
-def solver_problems(case_dir: Path, solver: str, skipped: list[str]) -> list[str]:
+# Function-object types whose output is a time history of a quantity of the flow. Residual and
+# sampling types (``solverInfo``, ``residuals``, ``sets``, ``surfaces``, ``fieldAverage``) are not.
+MONITOR_TYPES = frozenset(
+    {
+        "forces",
+        "forceCoeffs",
+        "probes",
+        "patchProbes",
+        "volFieldValue",
+        "surfaceFieldValue",
+    }
+)
+RESIDUAL_CONTROL = "residualControl"
+RESIDUAL_CONTROL_SKELETON = "{algorithm} {{ residualControl {{ p <tolerance>; U <tolerance>; }} }}"
+MONITOR_SKELETON = (
+    "functions { <name> { type forceCoeffs; libs (forces); patches (<patch>); "
+    "<the coefficient settings of the task>; writeControl timeStep; writeInterval 1; } }"
+)
+
+
+def _residual_control(solution: Dictionary, algorithm: str) -> bool | None:
+    """True when the algorithm dictionary sets ``residualControl`` with an entry, False when it
+    certainly does not, ``None`` when a directive or a macro could supply it."""
+    if cc.DIRECTIVES in solution:
+        return None
+    block = solution.get(algorithm)
+    if not isinstance(block, dict):
+        return False
+    if cc.DIRECTIVES in block:
+        return None
+    control = block.get(RESIDUAL_CONTROL)
+    if control is None:
+        return False
+    if isinstance(control, list):
+        return None if cc._macro(cc._word(control)) else False
+    if cc.DIRECTIVES in control:
+        return None
+    return bool(control)
+
+
+def _monitors_a_quantity(case_dir: Path, skipped: list[str]) -> bool | None:
+    """True when ``functions`` of the controlDict holds a function object of a monitoring type,
+    False when it certainly holds none, ``None`` when a directive, a macro or an unreadable or
+    missing file leaves it unsure."""
+    control, _exists = _load(case_dir, "system/controlDict", skipped)
+    if control is None or cc.DIRECTIVES in control:
+        return None
+    functions = control.get("functions")
+    if functions is None:
+        return False
+    if not isinstance(functions, dict) or cc.DIRECTIVES in functions:
+        return None
+    for entry in functions.values():
+        if not isinstance(entry, dict):
+            continue
+        if cc.DIRECTIVES in entry:
+            return None
+        kind = cc._word(entry.get("type"))
+        if cc._macro(kind):
+            return None
+        if kind in MONITOR_TYPES:
+            return True
+    return False
+
+
+def steady_criterion_problems(
+    case_dir: Path, solver: str, time_dependence: str | None, skipped: list[str]
+) -> list[str]:
+    """A steady case without a stopping criterion (ADR-0006, decision 8): ``residualControl`` in
+    the ``SIMPLE`` dictionary of ``fvSolution`` or, when the case is solved with a transient solver,
+    a function object that monitors a quantity. Silent for any other plan,
+    for a solver outside ``NEEDS`` and whenever a directive or a missing file leaves it unsure."""
+    needs = NEEDS.get(solver)
+    if time_dependence != "steady" or needs is None:
+        return []
+    solution, _exists = _load(case_dir, "system/fvSolution", skipped)
+    if solution is None:  # missing (reported by ``_solution_problems``) or unreadable
+        return []
+    # Only a SIMPLE run is ended by residualControl: the PIMPLE one only ends the outer loop of a
+    # time step, so a transient solver needs a monitored quantity (evidence of M1: the journal of
+    # 2026-11-06 and tests/unit/test_solver_log.py; the log parser knows only the SIMPLE line).
+    if needs.algorithm == "SIMPLE" and _residual_control(solution, "SIMPLE") is not False:
+        return []
+    if needs.steady:
+        skeleton = RESIDUAL_CONTROL_SKELETON.format(algorithm=needs.algorithm)
+        return [
+            "system/fvSolution: a steady case needs a stopping criterion and this case has none; "
+            f'add "{skeleton}" so that the run ends by itself when the initial residuals fall '
+            "below the tolerances (choose the tolerances for the case; in an axisymmetric wedge "
+            "case leave `U` out: its swirl component is never met)"
+        ]
+    if _monitors_a_quantity(case_dir, skipped) is not False:
+        return []
+    return [
+        "system/controlDict: a steady case needs a stopping criterion and this case has none; "
+        f"solved with the transient solver {solver} it needs a function object that monitors a "
+        "quantity the task asks for, so that the run can show it has become steady: add for "
+        f'example "{MONITOR_SKELETON}" (`forces` or `probes` monitor other quantities)'
+    ]
+
+
+def solver_problems(
+    case_dir: Path, solver: str, skipped: list[str], time_dependence: str | None = None
+) -> list[str]:
     """All missing files and entries for ``solver`` in ``case_dir`` (empty for a solver outside
-    ``NEEDS``). Notes about unreadable files are appended to ``skipped``."""
+    ``NEEDS``). Notes about unreadable files are appended to ``skipped``. ``time_dependence`` is
+    the plan's: for ``"steady"`` a stopping criterion is demanded too."""
     needs = NEEDS.get(solver)
     if needs is None:
         return []
@@ -420,4 +529,5 @@ def solver_problems(case_dir: Path, solver: str, skipped: list[str]) -> list[str
     note = TURBULENCE_NOTE if incomplete else ""
     problems += _schemes_problems(case_dir, needs, ddt, viscous, skipped, note)
     problems += _solution_problems(case_dir, needs, skipped, note)
+    problems += steady_criterion_problems(case_dir, solver, time_dependence, skipped)
     return problems

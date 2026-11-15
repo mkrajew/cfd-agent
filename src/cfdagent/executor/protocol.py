@@ -238,7 +238,22 @@ class ReadKnowledgeArgs(ArgsModel):
 
 @op_args("check_case_consistency")
 class CheckCaseConsistencyArgs(ArgsModel):
-    """Mesh patches against the field files of ``0/``, and ``controlDict`` against the solver."""
+    """Mesh patches against the field files of ``0/``, and ``controlDict`` against the solver.
+    With ``time_dependence`` the case is also checked against it: a steady case needs a stopping
+    criterion (``residualControl``, or a monitored quantity for a transient solver)."""
 
     case_dir: RelPath
     solver: str = Field(max_length=64)
+    time_dependence: Literal["steady", "transient"] | None = None
+
+
+@op_args("convergence_report")
+class ConvergenceReportArgs(ArgsModel):
+    """The convergence gate of a solved case (``tools.convergence``): steadiness for a steady
+    case, periodicity of the force coefficients for ``periodic_outputs``; reads files only."""
+
+    case_dir: RelPath
+    solver: str = Field(max_length=64)
+    time_dependence: Literal["steady", "transient"]
+    periodic_outputs: StrictBool
+    dimensionality: Literal["2D", "axisymmetric", "3D"]

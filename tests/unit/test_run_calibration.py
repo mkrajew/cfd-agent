@@ -250,3 +250,106 @@ def test_fixture_post_keeps_rows_with_equal_position_but_different_value(tmp_pat
     write_sample(tmp_path, [(0, 0), (0.5, 0.1), (0.5, 0.2)])
     profile = load_post().centreline_profile(tmp_path, "verticalCentreline", "y", "Ux")
     assert profile["x"] == [0.0, 0.5, 0.5]
+
+
+# ------------------------------------------------------------------ --gate (ADR-0006, Task 12)
+
+GATE_PASS = {
+    "ok": True,
+    "errors": [],
+    "report": {
+        "steadiness": {"ok": True, "criterion": "residual_control", "details": "stopped at 812"},
+        "periodicity": None,
+    },
+}
+GATE_FAIL = {
+    "ok": False,
+    "errors": ["steady state not reached: the drift of Cd is 4e-3"],
+    "report": {
+        "steadiness": {"ok": False, "criterion": "none", "details": "the drift of Cd is 4e-3"},
+        "periodicity": None,
+    },
+}
+
+
+def gated(outcome, gate):
+    outcome.gate = gate
+    return outcome
+
+
+def test_gate_option_is_passed_to_calibrate(fixture_dir, fake_calibrate):
+    calls = fake_calibrate(gated(result(PASSING), GATE_PASS))
+    assert rc.main([str(fixture_dir), "--benchmark", "cavity-re100", "--gate"]) == 0
+    assert calls[0][2]["gate"] is True
+    fake_calibrate(result(PASSING))
+    assert rc.main([str(fixture_dir), "--benchmark", "cavity-re100"]) == 0  # not asked: not run
+
+
+def test_the_gate_is_off_by_default(fixture_dir, fake_calibrate):
+    calls = fake_calibrate(result(PASSING))
+    rc.main([str(fixture_dir), "--benchmark", "cavity-re100"])
+    assert calls[0][2]["gate"] is False
+
+
+def test_exit_code_is_one_when_the_gate_fails_although_the_scorer_passes(
+    fixture_dir, fake_calibrate
+):
+    fake_calibrate(gated(result(PASSING), GATE_FAIL))
+    assert rc.main([str(fixture_dir), "--benchmark", "cavity-re100", "--gate"]) == 1
+
+
+def test_report_states_the_gate_verdict_and_what_it_found():
+    passed = rc.format_report(gated(result(PASSING), GATE_PASS))
+    assert "convergence gate: PASS" in passed and "residual_control" in passed
+    failed = rc.format_report(gated(result(PASSING), GATE_FAIL))
+    assert "convergence gate: FAIL" in failed and "drift of Cd" in failed
+    assert "convergence gate" not in rc.format_report(result(PASSING))  # not requested
+
+
+def test_gate_settings_are_read_from_fixture_json(tmp_path):
+    (tmp_path / "fixture.json").write_text(
+        json.dumps(
+            {"expected_bbox": [0] * 6, "time_dependence": "steady", "periodic_outputs": False}
+        )
+    )
+    assert rc._gate_settings(tmp_path) == ("steady", False, "2D")
+    (tmp_path / "fixture.json").write_text(
+        json.dumps(
+            {"expected_bbox": [0] * 6, "time_dependence": "transient", "periodic_outputs": True}
+        )
+    )
+    assert rc._gate_settings(tmp_path) == ("transient", True, "2D")
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {},
+        {"time_dependence": "steady"},
+        {"periodic_outputs": False},
+        {"time_dependence": "sometimes", "periodic_outputs": False},
+        {"time_dependence": "steady", "periodic_outputs": "no"},
+    ],
+)
+def test_gate_settings_are_required_and_checked(tmp_path, settings):
+    (tmp_path / "fixture.json").write_text(json.dumps({"expected_bbox": [0] * 6, **settings}))
+    with pytest.raises(rc.CalibrationUsageError, match="time_dependence|periodic_outputs"):
+        rc._gate_settings(tmp_path)
+
+
+def test_gate_without_plan_settings_is_a_usage_error(fixture_dir, capsys):
+    for name in ("geometry.py", "mesh.py", "post.py"):
+        (fixture_dir / name).write_text("")
+    (fixture_dir / "case").mkdir()
+    code = rc.main([str(fixture_dir), "--benchmark", "cavity-re100", "--gate"])
+    assert code == 2
+    assert "time_dependence" in capsys.readouterr().err
+
+
+def test_gate_dimensionality_is_optional_and_checked(tmp_path):
+    base = {"expected_bbox": [0] * 6, "time_dependence": "steady", "periodic_outputs": False}
+    (tmp_path / "fixture.json").write_text(json.dumps({**base, "dimensionality": "axisymmetric"}))
+    assert rc._gate_settings(tmp_path) == ("steady", False, "axisymmetric")
+    (tmp_path / "fixture.json").write_text(json.dumps({**base, "dimensionality": "flat"}))
+    with pytest.raises(rc.CalibrationUsageError, match="dimensionality"):
+        rc._gate_settings(tmp_path)
