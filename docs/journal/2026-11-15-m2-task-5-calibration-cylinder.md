@@ -47,3 +47,19 @@ Nothing was changed; the owner has to decide. `cfd-reviewer` notes that the Re 2
 ## 2026-11-15 decision: minor review findings deferred
 
 Not done: committing the fine Re 20 mesh, unit tests for the `post.py` guards, a longer Re 20 Cd convergence guard window (the test also asserts that `residualControl` ended the run), support for more than the 3-argument form of `post.py`, assertions on the scored quantity names, and the `controlDict` comment on the perturbation leaving the window.
+
+## 2026-11-15 decision: the committed Re 20 mesh is the fine one (fix round for PR 84)
+
+This follows up the entries on the Re 20 L/D scatter and on the deferred minors: the fine Re 20 mesh (25 530 cells) is now the committed one, to reduce the mesh scatter of L/D. Result: Cd 2.036 (reference 2.05, error 0.67 %, threshold 5 %), L/D 0.921 (reference 0.93, error 0.97 %, threshold 10 %); 692 SIMPLEC iterations ended by `residualControl`, 32 s total, 19 s in the solver. The earlier 14 057-cell numbers (Cd 2.0374, L/D 0.9268) are now the mesh-check row, not the committed case.
+
+## 2026-11-15 experiment: Re 100 re-run unchanged after the fix round
+
+The Re 100 case was run again without changes to the case: St 0.1637, `cd_mean` 1.334, 525 s (baseline entry: St 0.16367, `cd_mean` 1.33429, 471 s idle and 639 s busy). Both quantities are unchanged to the printed precision.
+
+## 2026-11-15 milestone: the deferred minor findings are done
+
+The items listed as deferred are closed. `tests/unit/test_cylinder_fixture_post.py` has 28 unit tests for the `post.py` guards, and the reviewer's mutation check caught 28 of 28 mutants. The Re 20 Cd convergence guard is now a relative spread of at most 2e-4 over the last 200 rows (the real run has 8.4e-5). `post.py` also runs in a zero-argument form, the test asserts the names of the scored quantities, and the `controlDict` carries a comment that `endTime` and the window must assume the start perturbation has left the window (about up/U seconds).
+
+## 2026-11-15 decision: D4, lower the Re 20 Cd reference to 2.025 with threshold 4 % (separate PR)
+
+This closes the open item D4: on 2026-11-15 the owner decided in chat to change the Re 20 Cd reference from 2.05 +-5 % to 2.025 +-4 % (band 1.944-2.106), and to fix the unverified comment on experimental Cd 1.39-1.40 at Re 100 and the citation text in `benchmark.toml`. The change goes into a separate PR (branch `docs/cylinder-reference-d4`), not into PR 84. Reasons: 2.05 sits at the top of the numerical range 1.998-2.053 in Table 6 of Fornberg (1980); the old band was lenient upward, so a 7 % overshoot passed; and a wall-bounded 40D x 20D domain (overshoot 5-9 %) could pass. All measured variants (Cd 2.013-2.037) stay inside the new band.

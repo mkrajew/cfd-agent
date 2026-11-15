@@ -1,10 +1,14 @@
-"""Hand-written post-processing for steady flow past a cylinder: ``post.py <case_dir> <out.json>``.
+"""Hand-written post-processing for steady flow past a cylinder.
+
+Usage: ``post.py [<case_dir> <out.json>]``; without arguments ``case`` and ``quantities.json`` in
+the working directory.
 
 Writes the two scalars the benchmark asks for:
 
 * ``cd``: the drag coefficient, the last row of the ``Cd`` column (total: pressure plus viscous)
   of the ``forceCoeffs`` function object. The script refuses to write it when the coefficient was
-  still changing at the end of the run.
+  still changing at the end of the run: over the last ``WINDOW_ROWS`` rows (all rows when the record
+  is shorter) the spread ``max - min`` must be at most ``TOLERANCE`` times the last value.
 * ``recirculation_length_over_d``: length of the closed recirculation region behind the cylinder
   over the diameter. The streamwise velocity is sampled along the wake centreline from the rear
   surface (x = D / 2) downstream. The velocity is zero on the wall and negative inside the bubble,
@@ -29,19 +33,30 @@ START = 0.5 * DIAMETER + 2e-4  # first sample point, just behind the (polygonal)
 END = 0.8  # last sample point, 8 D behind the cylinder centre: far beyond the bubble
 N_POINTS = 1601
 MIN_REVERSED = -0.01 * FREE_STREAM  # the bubble must reach at least this reversed speed
-LAST_ROWS = 20  # Cd must not change by more than TOLERANCE over this many last iterations
-TOLERANCE = 1e-4
+MIN_ROWS = 10  # fewest rows of force coefficients that can be judged at all
+WINDOW_ROWS = 200  # Cd is judged over this many last iterations (all of them when fewer)
+TOLERANCE = 2e-4  # largest spread of Cd in the window, relative to the last value
+DEFAULT_PATHS = (Path("case"), Path("quantities.json"))  # relative to the working directory
 
 
 def drag_coefficient(case_dir: Path) -> float:
-    """Last ``Cd`` of the force coefficients; raises if it was still moving."""
+    """Last ``Cd`` of the force coefficients; raises if it was still moving.
+
+    "Still moving": over the last ``WINDOW_ROWS`` rows (all rows if there are fewer) the largest
+    minus the smallest ``Cd``, divided by the last ``Cd``, exceeds ``TOLERANCE``. A window much
+    longer than a few iterations is needed to see a slow creep.
+    """
     table = read_function_object(case_dir, "forceCoeffs", file="coefficient")
     cd = table.column("Cd")
-    if len(cd) < LAST_ROWS:
-        raise RuntimeError(f"only {len(cd)} rows of force coefficients, need {LAST_ROWS}")
-    drift = abs(float(np.mean(cd[-LAST_ROWS:])) - float(cd[-1]))
-    if drift > TOLERANCE:
-        raise RuntimeError(f"Cd is not converged: it moved by {drift:.2e} in the last {LAST_ROWS}")
+    if len(cd) < MIN_ROWS:
+        raise RuntimeError(f"only {len(cd)} rows of force coefficients, need {MIN_ROWS}")
+    window = cd[-WINDOW_ROWS:]
+    spread = float(np.max(window) - np.min(window)) / abs(float(cd[-1]))
+    if spread > TOLERANCE:
+        raise RuntimeError(
+            f"Cd is not converged: it varied by {spread:.2e} (relative) in the last "
+            f"{len(window)} iterations, the limit is {TOLERANCE:.0e}"
+        )
     return float(cd[-1])
 
 
@@ -69,7 +84,14 @@ def recirculation_length_over_d(case_dir: Path) -> float:
     z_mid = 0.5 * (low[2] + high[2])
     line = case.sample_line("U", (START, 0.0, z_mid), (END, 0.0, z_mid), n_points=N_POINTS)
     line = line.drop_outside()
-    x, ux = line.points[:, 0], line.value[:, 0]
+    return bubble_length_over_d(line.points[:, 0], line.value[:, 0])
+
+
+def bubble_length_over_d(x: np.ndarray, ux: np.ndarray) -> float:
+    """Length of the reversed-flow region from the rear surface over D, from centreline samples.
+
+    ``x`` are the sample positions and ``ux`` the streamwise velocity there (any order).
+    """
     order = np.argsort(x, kind="stable")
     x, ux = x[order], ux[order]
     if ux.min() > MIN_REVERSED:
@@ -84,10 +106,10 @@ def recirculation_length_over_d(case_dir: Path) -> float:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
-        print("usage: post.py <case_dir> <quantities.json>", file=sys.stderr)
+    if len(argv) not in (1, 3):
+        print("usage: post.py [<case_dir> <quantities.json>]", file=sys.stderr)
         return 2
-    case_dir, out_path = Path(argv[1]), Path(argv[2])
+    case_dir, out_path = (Path(argv[1]), Path(argv[2])) if len(argv) == 3 else DEFAULT_PATHS
     low, high = load_case(case_dir).bounds
     check_reference_area(case_dir, float(high[2] - low[2]))
     quantities = {

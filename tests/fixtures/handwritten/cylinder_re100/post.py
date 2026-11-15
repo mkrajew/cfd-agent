@@ -1,4 +1,7 @@
-"""Hand-written post-processing for vortex shedding: ``post.py <case_dir> <out.json>``.
+"""Hand-written post-processing for vortex shedding.
+
+Usage: ``post.py [<case_dir> <out.json>]``; without arguments ``case`` and ``quantities.json`` in
+the working directory.
 
 Writes the two scalars the benchmark asks for, both from the ``forceCoeffs`` record that the
 solver wrote at every time step:
@@ -41,6 +44,7 @@ SKIP_FRACTION = 0.5  # the first half of the record is not analysed
 MIN_PERIODS = 10  # shedding periods required in the analysed window
 MIN_AMPLITUDE = 0.1  # lift amplitude below which the wake is not shedding
 MAX_AMPLITUDE_CHANGE = 0.02  # relative change of the lift amplitude between the window halves
+DEFAULT_PATHS = (Path("case"), Path("quantities.json"))  # relative to the working directory
 
 
 def amplitude(values: np.ndarray) -> float:
@@ -99,10 +103,10 @@ def shedding_quantities(case_dir: Path) -> dict[str, float]:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 3:
-        print("usage: post.py <case_dir> <quantities.json>", file=sys.stderr)
+    if len(argv) not in (1, 3):
+        print("usage: post.py [<case_dir> <quantities.json>]", file=sys.stderr)
         return 2
-    case_dir, out_path = Path(argv[1]), Path(argv[2])
+    case_dir, out_path = (Path(argv[1]), Path(argv[2])) if len(argv) == 3 else DEFAULT_PATHS
     low, high = load_case(case_dir).bounds
     check_reference_area(case_dir, float(high[2] - low[2]))
     write_quantities(out_path, shedding_quantities(case_dir))

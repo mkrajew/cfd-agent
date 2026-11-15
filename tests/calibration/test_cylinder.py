@@ -14,6 +14,7 @@ def test_cylinder_re20_handwritten_passes_scorer(calibrate):
     result = calibrate("cylinder_re20", "cylinder-re20")
     assert result.failure is None, result.failure
     assert result.passed, f"criteria failed: {result.criteria}"
+    assert {c["quantity"] for c in result.criteria} == {"cd", "recirculation_length_over_d"}
     # The run ended because residualControl was met, not because the iteration cap was reached.
     assert result.converged_at is not None, "the solver log has no 'solution converged' line"
     assert result.ended_by_residual_control, (
@@ -25,6 +26,7 @@ def test_cylinder_re100_handwritten_passes_scorer(calibrate):
     result = calibrate("cylinder_re100", "cylinder-re100", n_procs=4)
     assert result.failure is None, result.failure
     assert result.passed, f"criteria failed: {result.criteria}"
+    assert {c["quantity"] for c in result.criteria} == {"strouhal", "cd_mean"}
     # The run reached the intended end time (it was not cut short).
     assert result.end_time is not None and result.case_end_time is not None
     assert result.end_time >= result.case_end_time - 1e-6, (

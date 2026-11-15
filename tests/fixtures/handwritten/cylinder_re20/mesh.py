@@ -25,8 +25,8 @@ from cfdagent.manifest import MANIFEST_FILE_NAME, BoundaryManifest
 from cfdagent.tools.gmsh_helpers import assign_physical_groups
 
 RADIUS = 0.05  # cylinder radius; the cylinder centre is the origin
-SIZE_WALL = 0.002  # cells on the cylinder surface: D / 50, 157 on the circumference
-SIZE_WAKE = 0.01  # cells in the near wake box
+SIZE_WALL = 0.0014  # cells on the cylinder surface: D / 71, 224 on the circumference
+SIZE_WAKE = 0.007  # cells in the near wake box
 WAKE_END = 2.0  # downstream end of the wake box
 WAKE_HALF_WIDTH = 0.25
 SIZE_MAX = 0.5  # far field
