@@ -1,0 +1,14 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      turbulenceProperties;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+// The task states a laminar flow: no turbulence model. At Re = 1000 the cavity flow is steady and
+// laminar (it stays so up to a Reynolds number of several thousand).
+simulationType  laminar;
+
+// ************************************************************************* //
