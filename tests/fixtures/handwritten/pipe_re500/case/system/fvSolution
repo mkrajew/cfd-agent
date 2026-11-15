@@ -1,0 +1,65 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      fvSolution;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+solvers
+{
+    // Linear solves inside one SIMPLE iteration only need to reduce the error by a factor of 10.
+    p
+    {
+        solver          GAMG;
+        smoother        GaussSeidel;
+        tolerance       1e-10;
+        relTol          0.1;
+    }
+    U
+    {
+        solver          smoothSolver;
+        smoother        symGaussSeidel;
+        tolerance       1e-10;
+        relTol          0.1;
+    }
+}
+
+SIMPLE
+{
+    nNonOrthogonalCorrectors 0;
+    // SIMPLEC: consistent pressure equation, which allows the large relaxation factor below.
+    consistent      yes;
+    // Pressure is fixed by the outlet: no reference cell.
+    // The run stops when the INITIAL residual (the residual of the equation before it is solved in
+    // an iteration) of p falls below the value below. There is no entry for the velocity, on
+    // purpose: residualControl keys are field names, and an entry "U" covers all three components,
+    // including Uz (through the wedge planes). Uz is zero by symmetry (max |Uz| of the converged
+    // field is 1e-15 m/s) but its normalised residual is round-off noise that stays near 1e-2
+    // however long the run is, so a target on "U" can never be met and the run would end at the
+    // iteration cap (measured: 20000 iterations, Ux 3e-11, Uy 3e-9, p 9e-11, Uz 3e-2). Entries
+    // for single components such as "Ux" are not matched and are ignored.
+    // The velocity is converged when p is: Ux and Uy initial residuals are 4e-10 and 2e-7 when p
+    // crosses 1e-8, and the profile does not move when the target is tightened further.
+    // Why 1e-8: the target must hold on the finer meshes too. Measured with p as the only
+    // criterion, as the largest difference of the profile (sampled at 201 points) from the
+    // analytic one in units of the centreline velocity: on the mesh of mesh.py 1e-6 gives 3.7e-3
+    // (88 iterations), 1e-8 gives 3.6e-3 (135) and 1e-9 the same (158); on a mesh four times
+    // finer (500 x 40 cells) 1e-6 stops at 1.3e-2 (117 iterations) while the profile is still
+    // developing, against 1.8e-3 at 1e-8 (222) and at 1e-10 (274).
+    residualControl
+    {
+        p               1e-8;
+    }
+}
+
+relaxationFactors
+{
+    equations
+    {
+        U               0.9;
+    }
+}
+
+// ************************************************************************* //

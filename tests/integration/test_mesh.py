@@ -1,5 +1,6 @@
 """Mesh stage and mesh gate: Gmsh script -> MSH 2.2 -> OpenFOAM polyMesh -> checkMesh gate."""
 
+import json
 import math
 import re
 import shutil
@@ -636,3 +637,17 @@ def test_check_mesh_rejects_two_layer_wedge(tmp_path):
     assert report is not None
     assert any("one cell thick" in e and "wedge" in e for e in gate.errors)
     assert not any("solution directions" in e for e in gate.errors)
+
+
+def test_wedge_case_passes_geometry_and_mesh_gates(tmp_path):
+    """A solid wedge reaching the axis (prisms next to it), as in the pipe benchmark's solution."""
+    fixture = FIXTURES / "pipe_re500"
+    cad_bbox = json.loads((fixture / "fixture.json").read_text(encoding="utf-8"))["expected_bbox"]
+    manifest, case_dir = _make_case(fixture, tmp_path, tuple(cad_bbox))
+    mesh_bbox = list(cad_bbox)
+    mesh_bbox[4] *= math.cos(math.radians(5.0) / 2)  # flat faces: largest y is R cos(angle / 2)
+    gate = check_mesh(case_dir, manifest, tuple(mesh_bbox))
+    report = gate.data
+    assert gate.ok, gate.errors
+    assert report is not None and report.solution_directions == 3
+    assert report.patches["wedgeNegative"] + report.patches["wedgePositive"] == 2 * report.n_cells

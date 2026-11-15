@@ -1,0 +1,32 @@
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      controlDict;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+application     simpleFoam;
+startFrom       startTime;
+startTime       0;
+stopAt          endTime;
+// Steady solver: "time" is the iteration counter and deltaT = 1 is the iteration step.
+// endTime is only a safety cap on the number of SIMPLE iterations; the run is meant to end earlier,
+// by the residualControl of the SIMPLE dictionary in fvSolution ("SIMPLE solution converged").
+// Measured with that residualControl: 135 iterations on the mesh of mesh.py. The cap of 20000 is
+// far above that, so a run that reaches it did not converge.
+deltaT          1;
+endTime         20000;
+writeControl    timeStep;
+// The final write happens when residualControl stops the run, so the fields that post.py reads
+// are those of the last iteration.
+writeInterval   5000;
+purgeWrite      0;
+writeFormat     ascii;
+writePrecision  8;
+writeCompression off;
+timeFormat      general;
+timePrecision   6;
+runTimeModifiable false;
+
+// ************************************************************************* //
