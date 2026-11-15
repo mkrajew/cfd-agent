@@ -1,14 +1,20 @@
 """Unit tests for the tutorial search and reader (``knowledge.search``)."""
 
 import os
+from importlib import resources
 
 import pytest
 
 from cfdagent.errors import AgentInputError, ToolFailure
 from cfdagent.knowledge.search import (
     MAX_FILE_BYTES,
+    NOTES_DIR,
     Hit,
+    KnowledgeRoot,
+    SourcedHit,
+    read_knowledge,
     read_tutorial,
+    search_knowledge,
     search_tutorials,
 )
 
@@ -246,3 +252,173 @@ def test_a_real_path_on_another_drive_counts_as_outside_the_root(monkeypatch):
     monkeypatch.setattr(module, "os", fake_os)
     assert module._is_inside("/root", "/root") is True
     assert module._is_inside("/root", "elsewhere") is False
+
+
+# ------------------------------------------------------------------ curated notes and tutorials
+
+NOTE_NAMES = (
+    "README.md",
+    "gmsh-api.md",
+    "cadquery-api.md",
+    "openfoam-function-objects.md",
+    "steady-solver-setup.md",
+    "transient-time-step.md",
+    "forces-and-coefficients.md",
+    "axisymmetric-wedge.md",
+)
+
+
+@pytest.fixture
+def notes(tmp_path):
+    root = tmp_path / "notes"
+    root.mkdir()
+    return root
+
+
+@pytest.fixture
+def roots(notes, tutorials):
+    return [KnowledgeRoot("tutorial", tutorials), KnowledgeRoot("note", notes)]
+
+
+def test_note_hits_rank_before_tutorial_hits(notes, tutorials, roots):
+    # The tutorial files match better (the terms are in their path), the note only in its text.
+    write(tutorials, "flow/relaxation/system/fvSolution", "relaxationFactors\n")
+    write(tutorials, "flow/other/system/fvSolution", "relaxationFactors\n")
+    write(notes, "steady-solver-setup.md", "# Steady\nSet relaxationFactors in fvSolution.\n")
+    write(notes, "unrelated.md", "nothing here\n")
+
+    hits = search_knowledge("relaxation fvSolution", roots)
+
+    assert all(isinstance(h, SourcedHit) for h in hits)
+    assert [(h.source, h.path) for h in hits] == [
+        ("note", "note:steady-solver-setup.md"),
+        ("tutorial", "flow/relaxation/system/fvSolution"),
+        ("tutorial", "flow/other/system/fvSolution"),
+    ]
+    assert hits[0].line == 2 and "relaxationFactors" in hits[0].text
+    # The same result whichever order the roots are given in.
+    assert search_knowledge("relaxation fvSolution", list(reversed(roots))) == hits
+    two = search_knowledge("relaxation fvSolution", roots, max_hits=2)
+    assert [h.source for h in two] == ["note", "tutorial"]
+    assert len(search_knowledge("relaxation fvSolution", roots, max_hits=1)) == 1
+
+
+def test_search_knowledge_shows_only_plain_note_files(notes, roots):
+    write(notes, "a.md", "needle\n")
+    write(notes, "sub/b.md", "needle\n")  # not readable through note:<file>, so not offered
+    write(notes, "c.txt", "needle\n")
+    assert [h.path for h in search_knowledge("needle", roots)] == ["note:a.md"]
+
+
+def test_a_missing_notes_root_is_the_images_fault_not_a_silent_skip(tutorials, tmp_path):
+    write(tutorials, "a/dict", "needle\n")
+    missing = KnowledgeRoot("note", tmp_path / "no-notes")
+    with pytest.raises(ToolFailure):
+        search_knowledge("needle", [missing, KnowledgeRoot("tutorial", tutorials)])
+    with pytest.raises(ToolFailure):
+        search_knowledge("needle", [missing])
+    only = [KnowledgeRoot("tutorial", tutorials)]  # no notes root asked for: tutorials work
+    hits = search_knowledge("needle", only)
+    assert [(h.source, h.path) for h in hits] == [("tutorial", "a/dict")]
+
+
+def test_a_missing_tutorial_root_fails_only_when_it_is_requested(notes, tmp_path):
+    write(notes, "a.md", "needle\n")
+    missing = KnowledgeRoot("tutorial", tmp_path / "no-tutorials")
+    only_notes = [KnowledgeRoot("note", notes)]
+    assert [h.path for h in search_knowledge("needle", only_notes)] == ["note:a.md"]
+    with pytest.raises(ToolFailure):
+        search_knowledge("needle", [*only_notes, missing])
+
+
+def test_search_knowledge_rejects_bad_queries_and_limits(roots):
+    for query in ("", "   ", "x" * 300):
+        with pytest.raises(AgentInputError):
+            search_knowledge(query, roots)
+    with pytest.raises(ValueError):
+        search_knowledge("x", roots, max_hits=0)
+
+
+def test_knowledge_root_names_are_checked(tmp_path):
+    with pytest.raises(ValueError):
+        KnowledgeRoot("benchmark", tmp_path)  # type: ignore[arg-type]
+
+
+def test_read_knowledge_note_prefix_and_refusals(notes, tutorials, roots, tmp_path):
+    write(notes, "gmsh-api.md", "# Gmsh\nUse the OCC kernel.\n")
+    write(notes, "long.md", "x" * 100)
+    write(tutorials, "flow/alpha/system/fvSchemes", "ddtSchemes { default Euler; }")
+    write(tmp_path, "secret.md", "secret")
+
+    assert read_knowledge("note:gmsh-api.md", roots) == "# Gmsh\nUse the OCC kernel.\n"
+    assert "[file truncated" in read_knowledge("note:long.md", roots, max_bytes=10)
+    # Ordinary tutorial paths behave as read_tutorial does, directories included.
+    assert read_knowledge("flow/alpha/system/fvSchemes", roots) == "ddtSchemes { default Euler; }"
+    assert read_knowledge("flow/alpha", roots) == "system/"
+
+    for refused in (
+        "note:",
+        "note:../secret.md",
+        "note:..",
+        "note:sub/x.md",
+        "note:/gmsh-api.md",
+        "note:" + chr(92) + "gmsh-api.md",
+        "note:gmsh-api.txt",
+        "note:gmsh-api",
+        "note:missing.md",
+        "note:gmsh-api.md" + chr(0),
+        "note:" + "a" * 2000 + ".md",
+        "Note:gmsh-api.md",
+        "other:gmsh-api.md",
+        "http://example.org/x",
+        str(tmp_path / "secret.md"),
+        "../secret.md",
+    ):
+        with pytest.raises(AgentInputError):
+            read_knowledge(refused, roots)
+    for not_a_text in ("", "  ", None, 5):
+        with pytest.raises(AgentInputError):
+            read_knowledge(not_a_text, roots)  # type: ignore[arg-type]
+
+
+def test_read_knowledge_refuses_a_note_that_is_a_link(notes, roots, tmp_path):
+    write(tmp_path, "outside.md", "secret")
+    try:
+        os.symlink(tmp_path / "outside.md", notes / "linked.md")
+        os.symlink(tmp_path, notes / "dirlink", target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links are not available here")
+    with pytest.raises(AgentInputError):
+        read_knowledge("note:linked.md", roots)
+    with pytest.raises(AgentInputError):
+        read_knowledge("note:dirlink", roots)
+
+
+def test_read_knowledge_without_the_requested_root_is_refused(notes, tutorials):
+    write(notes, "a.md", "text")
+    write(tutorials, "a/dict", "text")
+    only_notes = [KnowledgeRoot("note", notes)]
+    only_tutorials = [KnowledgeRoot("tutorial", tutorials)]
+    assert read_knowledge("note:a.md", only_notes) == "text"
+    assert read_knowledge("a/dict", only_tutorials) == "text"
+    with pytest.raises(AgentInputError):
+        read_knowledge("a/dict", only_notes)
+    with pytest.raises(AgentInputError):
+        read_knowledge("note:a.md", only_tutorials)
+
+
+def test_read_knowledge_with_a_missing_notes_directory_is_the_images_fault(tmp_path):
+    with pytest.raises(ToolFailure):
+        read_knowledge("note:a.md", [KnowledgeRoot("note", tmp_path / "gone")])
+    with pytest.raises(AgentInputError):  # no notes root requested at all
+        read_knowledge("note:a.md", [])
+
+
+def test_notes_are_packaged():
+    package = resources.files("cfdagent.knowledge") / "notes"
+    for name in NOTE_NAMES:
+        entry = package / name
+        assert entry.is_file(), f"{name} is not shipped inside the package"
+        assert entry.read_text(encoding="utf-8").strip(), f"{name} is empty"
+    assert NOTES_DIR.is_absolute() and NOTES_DIR.is_dir()
+    assert {entry.name for entry in NOTES_DIR.iterdir()} >= set(NOTE_NAMES)

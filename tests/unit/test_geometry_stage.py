@@ -499,7 +499,8 @@ def test_stage_identity_and_extra_tools(tmp_path):
     stage = GeometryStage()
     ctx = make_ctx(tmp_path, FakeSandbox({}))
     assert (stage.name, stage.agent) == ("geometry", "geometry")
-    assert stage.extra_tools(ctx, ctx.run.attempt_dir("geometry", 1)) == []
+    tools = stage.extra_tools(ctx, ctx.run.attempt_dir("geometry", 1))
+    assert [tool.name for tool in tools] == ["search_knowledge", "read_knowledge"]
     assert stage.system_prompt() == load_prompt("geometry").text
 
 
@@ -580,6 +581,8 @@ def test_stage_loop_passes_promotes_and_records_one_attempt(tmp_path):
         "list_dir",
         "write_file",
         "check_stage",
+        "search_knowledge",
+        "read_knowledge",
     }
 
 

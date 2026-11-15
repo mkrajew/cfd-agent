@@ -520,10 +520,11 @@ def test_scope_gives_no_access_beyond_the_run_results(tmp_path):
         assert not scope.can_write(fixed), fixed
 
 
-def test_the_analyst_has_no_knowledge_tools(tmp_path):
+def test_the_analyst_has_the_knowledge_tools_and_nothing_that_reads_benchmarks(tmp_path):
     setup = prepared(tmp_path)
-    assert setup.registry.names() == ["run_utility"]
-    assert "knowledge" not in " ".join(setup.registry.names())
+    assert setup.registry.names() == ["run_utility", "search_knowledge", "read_knowledge"]
+    # The file scope still keeps benchmark data out; the knowledge ops reach notes and tutorials.
+    assert not setup.stage.scope.can_read("benchmarks/x/reference.json")
 
 
 def test_the_allowlist_is_a_subset_of_the_executors(tmp_path):
@@ -640,8 +641,9 @@ def test_the_prompt_states_the_rules_of_the_stage():
         "check_stage",
     ):
         assert needle in text, needle
-    # The blind-evaluation rule: no tutorial or knowledge tool, and no reference data.
-    assert "read_knowledge" not in text and "search_knowledge" not in text
+    # The blind-evaluation rule: the knowledge tools reach notes and tutorials, never reference
+    # data.
+    assert "read_knowledge" in text and "search_knowledge" in text
     assert "benchmarks/" not in text
 
 
@@ -721,6 +723,8 @@ def test_stage_loop_passes_scripted_fixture_and_promotes(tmp_path):
         "write_file",
         "run_utility",
         "check_stage",
+        "search_knowledge",
+        "read_knowledge",
     }
     assert [(a.n, a.ok) for a in setup.ctx.record.stages[0].attempts] == [(1, True)]
     assert setup.ctx.record.stages[0].name == "analyst"

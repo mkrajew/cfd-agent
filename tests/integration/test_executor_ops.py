@@ -205,8 +205,9 @@ def test_knowledge_ops_search_and_read_the_installed_tutorials(job):
     )
     assert found.ok, found.error
     hits = found.data["hits"]
-    assert 0 < len(hits) <= 5 and {"path", "line", "text"} <= set(hits[0])
-    text = client.call("read_knowledge", {"path": hits[0]["path"]}, timeout_s=120)
+    assert 0 < len(hits) <= 5 and {"source", "path", "line", "text"} <= set(hits[0])
+    first_tutorial = next(h for h in hits if h["source"] == "tutorial")
+    text = client.call("read_knowledge", {"path": first_tutorial["path"]}, timeout_s=120)
     assert text.ok and "FoamFile" in text.data["text"]
     outside = client.call("read_knowledge", {"path": "../../etc/passwd"}, timeout_s=120)
     assert outside.ok is False and outside.internal is False
@@ -214,3 +215,20 @@ def test_knowledge_ops_search_and_read_the_installed_tutorials(job):
     for path in (root + "/../../../../../etc/hostname", root + "/../.."):
         escaped = client.call("read_knowledge", {"path": path}, timeout_s=120)
         assert escaped.ok is False and escaped.internal is False, path
+
+
+def test_search_knowledge_op_finds_notes_in_image(job):
+    client, _ = job
+    # The notes ship inside the installed package; every note is found by its own name and
+    # comes before any tutorial hit.
+    found = client.call("search_knowledge", {"query": "gmsh api", "max_hits": 10}, timeout_s=120)
+    assert found.ok, found.error
+    hits = found.data["hits"]
+    notes = [h for h in hits if h["source"] == "note"]
+    assert "note:gmsh-api.md" in [h["path"] for h in notes]
+    assert hits[: len(notes)] == notes  # notes first
+    text = client.call("read_knowledge", {"path": "note:gmsh-api.md"}, timeout_s=120)
+    assert text.ok and text.data["text"].strip()
+    for path in ("note:../gmsh-api.md", "note:missing.md", "note:sub/gmsh-api.md"):
+        refused = client.call("read_knowledge", {"path": path}, timeout_s=120)
+        assert refused.ok is False and refused.internal is False, path

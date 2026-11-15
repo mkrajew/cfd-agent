@@ -3,9 +3,9 @@
 The Mesh stage has left the run directory a ``case/`` that holds ``constant/polyMesh`` only. Every
 attempt gets a fresh copy of it as ``attempts/case_setup-N/case/`` (``prepare_attempt``); the
 agent writes the dictionaries: the field files of ``0/``, the property files of ``constant/`` and
-the ``system/`` dictionaries. It may search and read the OpenFOAM tutorials of the image
-(``search_knowledge``, ``read_knowledge``) and check its dictionaries without spending an attempt
-(``validate_dictionaries``).
+the ``system/`` dictionaries. It may search and read the curated notes and the OpenFOAM tutorials
+of the image (``search_knowledge``, ``read_knowledge``) and check its dictionaries without
+spending an attempt (``validate_dictionaries``).
 
 The mesh is not the agent's to change. ``constant/polyMesh/**`` is excluded from the writable
 paths of the file scope, and, as a second line of defence, the files of the run directory's mesh
@@ -41,10 +41,9 @@ import re
 import shutil
 from pathlib import Path
 
-from pydantic import BaseModel, Field
-
 from cfdagent.agents.casespec import CaseSpec
 from cfdagent.agents.gatehelp import last_bytes
+from cfdagent.agents.knowledge_tools import KnowledgeTools
 from cfdagent.agents.stage import Stage, StageContext
 from cfdagent.agents.tools import FileScope, NoArgs, Tool
 from cfdagent.errors import AgentInputError, ToolFailure
@@ -52,8 +51,6 @@ from cfdagent.executor.protocol import (
     CheckCaseConsistencyArgs,
     CheckDictionariesArgs,
     OpResponse,
-    ReadKnowledgeArgs,
-    SearchKnowledgeArgs,
     TrialRunArgs,
 )
 from cfdagent.gates import GateResult
@@ -75,7 +72,6 @@ KNOWN_SOLVERS = ("icoFoam", "simpleFoam", "pimpleFoam")
 TRIAL_STEPS = 3
 GATE_TIMEOUT_S = 300.0  # the dictionary check has its own total limit of 300 s
 TRIAL_TIMEOUT_S = 600.0  # the op limits the solver to 300 s; the rest is set-up of the scratch copy
-KNOWLEDGE_TIMEOUT_S = 60.0
 TAIL_BYTES = 2500  # the loop shows the model at most 4096 bytes of all errors together
 HEADLINE_CHARS = 500  # headline and OpenFOAM's own message in a trial failure
 # A fixed time step whose trial run measured a Courant number above this fails the gate. The value
@@ -84,7 +80,6 @@ HEADLINE_CHARS = 500  # headline and OpenFOAM's own message in a trial failure
 TRIAL_MAX_COURANT = 10.0
 TRIAL_COURANT_TARGET = 0.5  # the Courant number the suggested deltaT aims at
 TRANSIENT_SOLVERS = ("icoFoam", "pimpleFoam")
-READ_BYTES = 7000  # a tool result is cut at 8000 bytes; this keeps the truncation marker visible
 POLYMESH_MAX_BYTES = 1 << 30  # an ascii mesh is ~170 bytes per cell; the run limit is 2e6 cells
 POLYMESH_MAX_FILES = 1000  # a polyMesh directory holds about ten files
 POLYMESH_MAX_DEPTH = 6
@@ -93,22 +88,6 @@ _MAX_CHANGES_SHOWN = 8
 
 _Snapshot = dict[str, tuple[int, str]]  # relative path -> (size, SHA-256); "" for a special entry
 _SPECIAL = (-1, "")
-
-
-class SearchKnowledgeToolArgs(BaseModel):
-    query: str = Field(
-        max_length=200,
-        description="Words to look for (all of them must occur, in the file's path or its text)",
-    )
-
-
-class ReadKnowledgeToolArgs(BaseModel):
-    path: str = Field(
-        min_length=1,
-        max_length=1024,
-        description="A path as search_knowledge shows it, relative to the tutorial directory; "
-        "a directory path lists its entries",
-    )
 
 
 # ------------------------------------------------------------------ the mesh that must not change
@@ -265,7 +244,7 @@ def _trial_failure(response: OpResponse, solver: str) -> str:
     return message
 
 
-class CaseSetupStage(Stage):
+class CaseSetupStage(KnowledgeTools, Stage):
     """Stage 4: OpenFOAM dictionaries on the Mesh stage's mesh, gated by a short trial run."""
 
     name = STAGE
@@ -286,12 +265,6 @@ class CaseSetupStage(Stage):
             "attempts/case_setup-*/case/0/polyMesh/*",
         ),
     )
-
-    def __init__(self) -> None:
-        # Every path the agent asked ``read_knowledge`` for, in order of first request, whether
-        # or not the read succeeded. The orchestrator stores it in the run record (a
-        # blind-evaluation audit: what did the agent look at?).
-        self.knowledge_reads: list[str] = []
 
     # ------------------------------------------------------------------ the agent's task
 
@@ -360,22 +333,7 @@ class CaseSetupStage(Stage):
         case_rel = f"{ctx.run.relative(attempt_dir)}/{CASE_NAME}"
         solver = self._solver(self._spec(ctx))
         return [
-            Tool(
-                "search_knowledge",
-                "Search the OpenFOAM tutorials of this installation. A file matches when all the "
-                "words occur in its path (case and file names) or its text, in any case. Returns "
-                "up to 10 lines `path:line: text`. Search for the closest case first, then read "
-                "its dictionaries.",
-                SearchKnowledgeToolArgs,
-                lambda args: self._search(ctx, args),
-            ),
-            Tool(
-                "read_knowledge",
-                "Read one file of the OpenFOAM tutorials (a path from search_knowledge), or list a "
-                f"directory. At most {READ_BYTES} bytes are shown.",
-                ReadKnowledgeToolArgs,
-                lambda args: self._read(ctx, args),
-            ),
+            *self.knowledge_tools(ctx),
             Tool(
                 "validate_dictionaries",
                 "Check the case in the attempt directory without using an attempt: every "
@@ -569,41 +527,6 @@ class CaseSetupStage(Stage):
         )
 
     # ------------------------------------------------------------------ the agent's tools
-
-    @staticmethod
-    def _knowledge(ctx: StageContext, op: str, args: BaseModel) -> dict:
-        response = ctx.sandbox.call(op, args, outer_timeout(ctx.inner_timeout(KNOWLEDGE_TIMEOUT_S)))
-        if response.internal:
-            raise _internal(response, f"{op}")
-        if not response.ok:
-            raise AgentInputError(response.error or f"{op} failed without a message")
-        return response.data or {}
-
-    def _search(self, ctx: StageContext, args: SearchKnowledgeToolArgs) -> str:
-        data = self._knowledge(ctx, "search_knowledge", SearchKnowledgeArgs(query=args.query))
-        hits = data.get("hits")
-        if not isinstance(hits, list):
-            raise ToolFailure("search_knowledge answered without a list of hits")
-        if not hits:
-            return (
-                "No tutorial file contains all of these words. Try fewer or different words, "
-                "for example a solver name, a dictionary name or a keyword."
-            )
-        lines = []
-        for hit in hits:
-            path, line, text = str(hit["path"]), int(hit["line"]), str(hit["text"])
-            lines.append(f"{path}:{line}: {text}" if line else f"{path} {text}")
-        return "\n".join(lines)
-
-    def _read(self, ctx: StageContext, args: ReadKnowledgeToolArgs) -> str:
-        if args.path not in self.knowledge_reads:
-            self.knowledge_reads.append(args.path)
-        request = ReadKnowledgeArgs(path=args.path, max_bytes=READ_BYTES)
-        data = self._knowledge(ctx, "read_knowledge", request)
-        text = data.get("text")
-        if not isinstance(text, str):
-            raise ToolFailure("read_knowledge answered without text")
-        return text
 
     def _validate(self, ctx: StageContext, case_rel: str, solver: str) -> str:
         problems, report = self._static_problems(ctx, case_rel, solver)

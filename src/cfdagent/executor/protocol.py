@@ -221,7 +221,7 @@ class RunUtilityArgs(ArgsModel):
 
 @op_args("search_knowledge")
 class SearchKnowledgeArgs(ArgsModel):
-    """Lexical search over the OpenFOAM tutorials of the image (``$FOAM_TUTORIALS``)."""
+    """Lexical search over the curated notes and the OpenFOAM tutorials (``$FOAM_TUTORIALS``)."""
 
     query: str = Field(max_length=1000)
     max_hits: Annotated[StrictInt, Field(ge=1, le=50)] = 10
@@ -229,7 +229,8 @@ class SearchKnowledgeArgs(ArgsModel):
 
 @op_args("read_knowledge")
 class ReadKnowledgeArgs(ArgsModel):
-    """One file (or directory listing) below ``$FOAM_TUTORIALS``; the path is relative to it."""
+    """One note (``note:<file>``), or one file or directory listing below ``$FOAM_TUTORIALS``
+    (the path is relative to it)."""
 
     path: str = Field(min_length=1, max_length=1024)
     max_bytes: Annotated[StrictInt, Field(ge=1, le=100_000)] = 20000

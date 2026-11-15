@@ -16,9 +16,11 @@ the convergence of the run: the Critic judges the first, the Scorer the second, 
 states the third. Under the decision that a non-converged steady run may reach this stage, the
 prompt requires an honest verdict instead.
 
-The Analyst has the file tools, the calculator and ``run_utility`` (a short allowlist of OpenFOAM
-post-processing utilities). It has no knowledge tools and cannot read ``benchmarks/``: its readable
-paths are the plan, the solved case, the logs and its own attempt directories.
+The Analyst has the file tools, the calculator, ``run_utility`` (a short allowlist of OpenFOAM
+post-processing utilities) and the knowledge tools (the curated notes and the tutorials of the
+image, nothing else). It cannot read ``benchmarks/``: its readable paths are the plan, the solved
+case, the logs and its own attempt directories, and the knowledge tools reach only the notes and
+the tutorials.
 
 ``promote``: ``results/`` (``quantities.json`` and ``plots/*.png``) and ``analysis.md`` in the run
 directory.
@@ -40,6 +42,7 @@ from pydantic import BaseModel, Field
 
 from cfdagent.agents.casespec import CaseSpec, OutputSpec
 from cfdagent.agents.gatehelp import last_bytes, names
+from cfdagent.agents.knowledge_tools import KnowledgeTools
 from cfdagent.agents.stage import (
     CASESPEC_FROM_ATTEMPT,
     Stage,
@@ -173,7 +176,7 @@ def _snapshot(root: Path) -> dict[str, str]:
     return found
 
 
-class AnalystStage(Stage):
+class AnalystStage(KnowledgeTools, Stage):
     """Stage 6: post-process the solved case with a script; gate the quantities and the analysis."""
 
     name = STAGE
@@ -290,7 +293,8 @@ class AnalystStage(Stage):
                 f"{SCRIPT_NAME}. Returns the end of its output.",
                 RunUtilityToolArgs,
                 lambda args: self._run_utility(ctx, case_rel, args),
-            )
+            ),
+            *self.knowledge_tools(ctx),
         ]
 
     def _run_utility(self, ctx: StageContext, case_rel: str, args: RunUtilityToolArgs) -> str:
