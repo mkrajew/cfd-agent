@@ -54,7 +54,8 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
-from cfdagent.agents.stage import Stage, StageContext
+from cfdagent.agents.routing import RouteRequest, fix_request_text
+from cfdagent.agents.stage import Stage, StageContext, seeded_files_text
 from cfdagent.agents.tools import (
     NoArgs,
     Tool,
@@ -113,12 +114,25 @@ DIAGNOSIS_RESUME = (
 @dataclass(frozen=True)
 class StageOutcome:
     """Result of ``run_stage``: ``attempts`` is the number of gate runs, ``errors`` the errors of
-    the last failed gate (empty on success) and ``reason`` why a failed stage ended."""
+    the last failed gate (empty on success) and ``reason`` why a failed stage ended. ``route`` is
+    the stage's request for a fix in an earlier stage (``Stage.route_after_failure``); only a stage
+    that failed its gate has one, never one that ran into a cost, time or turn limit."""
 
     ok: bool
     attempts: int
     errors: list[str] = field(default_factory=list)
     reason: str | None = None
+    route: RouteRequest | None = None
+
+
+@dataclass(frozen=True)
+class SeededAttempt:
+    """A first attempt directory that was seeded with the stage's earlier files before the loop
+    started (``Stage.seed_from_canonical``): ``path`` is the directory, ``carried`` the files in it
+    as run-relative paths. The loop uses the directory as it is and does not create it again."""
+
+    path: Path
+    carried: list[str]
 
 
 def message_chars(message: dict) -> int:
@@ -191,7 +205,7 @@ class ModelConversation:
         self.last_problem: str | None = None  # what the last unusable reply was reported as
         self.last_errors: list[str] = []  # the errors of the last failed attempt
         self.log_attempt: int | None = None  # transcript label override (the diagnosis turn)
-        self.record = StageRecord(name=stage_name, ok=False)
+        self.record = StageRecord(name=stage_name, ok=False, pass_no=ctx.pass_no)
         ctx.record.stages.append(self.record)
 
     def _time_left(self) -> float:
@@ -210,13 +224,14 @@ class ModelConversation:
 
     # ------------------------------------------------------------------ the model
 
-    def _fail(self, reason: str) -> StageOutcome:
+    def _fail(self, reason: str, route: RouteRequest | None = None) -> StageOutcome:
         self.record.ok = False
         return StageOutcome(
             ok=False,
             attempts=self.attempts,
             errors=list(self.last_errors),
             reason=redact(reason, MAX_REASON_CHARS),
+            route=route,
         )
 
     def _prompt_chars(
@@ -244,6 +259,7 @@ class ModelConversation:
             self.messages[self.logged : sent],
             result,
             error=error,
+            pass_no=self.ctx.pass_no,
         )
         self.logged = sent
 
@@ -358,14 +374,23 @@ class _StageRun(ModelConversation):
     def _relative(self, path: Path) -> str:
         return self.ctx.run.relative(path) + "/"
 
-    def _start_attempt(self, previous_dir: Path | None = None) -> list[str]:
+    def _start_attempt(
+        self, previous_dir: Path | None = None, seeded: SeededAttempt | None = None
+    ) -> list[str]:
         """Prepare the directory of the next attempt. With ``previous_dir`` (a retry) and repair
         mode ``in_place`` the agent's files of that attempt are carried over; the files carried
-        (run-relative) are returned."""
+        (run-relative) are returned. With ``seeded`` (the first attempt of a routed pass) the
+        directory exists already and holds the seed: it is kept, and the stage's inputs are added
+        around it."""
         number = self.attempts + 1
         carried: list[str] = []
         with internal("preparing the attempt directory"):
-            self.attempt_dir = self.ctx.run.attempt_dir(self.stage.name, number)
+            if seeded is None:
+                self.attempt_dir = self.ctx.run.attempt_dir(
+                    self.stage.name, number, self.ctx.pass_no
+                )
+            else:
+                self.attempt_dir = self._seeded_directory(seeded)
             self.stage.prepare_attempt(self.ctx, self.attempt_dir)
             if previous_dir is not None and self.ctx.config.repair_mode == "in_place":
                 carried = self.stage.carry_over(self.ctx, previous_dir, self.attempt_dir)
@@ -391,6 +416,17 @@ class _StageRun(ModelConversation):
             registry.add(tool)
         self.registry = registry
         return carried
+
+    def _seeded_directory(self, seeded: SeededAttempt) -> Path:
+        """The directory of a seeded first attempt, after checking that it is the one the loop would
+        have made itself (the stage, attempt 1, the pass of the context)."""
+        expected = self.ctx.run.path(f"attempts/{self.stage.name}-p{self.ctx.pass_no}-1")
+        if self.attempts != 0 or self.ctx.pass_no < 1 or Path(seeded.path) != expected:
+            raise ToolFailure(
+                f"the seeded attempt directory {seeded.path} is not the first attempt of pass "
+                f"{self.ctx.pass_no} of stage {self.stage.name!r}"
+            )
+        return expected
 
     def _turn_limit(self) -> int:
         """Model turns allowed per attempt: the stage's own limit if the configuration has one."""
@@ -457,9 +493,15 @@ class _StageRun(ModelConversation):
 
     # ------------------------------------------------------------------ the loop
 
-    def run(self) -> StageOutcome:
-        self._start_attempt()
-        opening = f"{self.stage.opening_message(self.ctx)}\n\n{self._attempt_note()}"
+    def run(self, seeded: SeededAttempt | None = None) -> StageOutcome:
+        self._start_attempt(seeded=seeded)
+        parts = [self.stage.opening_message(self.ctx)]
+        if self.ctx.fix_request is not None:
+            parts.append(fix_request_text(self.ctx.fix_request))
+        if seeded is not None and seeded.carried:
+            parts.append(seeded_files_text(seeded.carried))
+        parts.append(self._attempt_note())
+        opening = "\n\n".join(parts)
         self.messages = [
             {"role": "system", "content": self.stage.system_prompt()},
             {"role": "user", "content": opening},
@@ -522,13 +564,17 @@ class _StageRun(ModelConversation):
             self._progress()
             return StageOutcome(ok=True, attempts=self.attempts, errors=[], reason=None)
         shown = short("; ".join(self.last_errors), MAX_REASON_CHARS - 200)
+        route = self.stage.route_after_failure(self.ctx, list(self.last_errors))
         if self.no_retry:
             return self._fail(
                 f"stage {self.stage.name!r} failed after {self.attempts} attempt(s) and is not "
-                f"retried (another attempt cannot fix it); last errors: {shown}"
+                f"retried (another attempt cannot fix it); last errors: {shown}",
+                route,
             )
         return self._fail(
-            f"stage {self.stage.name!r} failed after {self.attempts} attempts; last errors: {shown}"
+            f"stage {self.stage.name!r} failed after {self.attempts} attempts; "
+            f"last errors: {shown}",
+            route,
         )
 
     def _restart_conversation(self) -> None:
@@ -631,6 +677,9 @@ class _StageRun(ModelConversation):
         return self.registry.dispatch(call)
 
 
-def run_stage(stage: Stage, ctx: StageContext) -> StageOutcome:
-    """Run ``stage`` to its end; see the module docstring."""
-    return _StageRun(stage, ctx).run()
+def run_stage(stage: Stage, ctx: StageContext, seeded: SeededAttempt | None = None) -> StageOutcome:
+    """Run ``stage`` to its end; see the module docstring.
+
+    ``seeded`` is the seeded first attempt of a routed pass (repair mode ``in_place``, see
+    ``Stage.seed_from_canonical``); without it the loop makes the first attempt directory itself."""
+    return _StageRun(stage, ctx).run(seeded)

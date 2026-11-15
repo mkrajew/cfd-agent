@@ -311,10 +311,15 @@ class CaseSetupStage(KnowledgeTools, Stage):
     # ------------------------------------------------------------------ attempts
 
     def prepare_attempt(self, ctx: StageContext, attempt_dir: Path) -> None:
-        """Copy the run's mesh-only ``case/`` into the attempt and check the copy."""
+        """Copy the mesh, and only the mesh, of the run's ``case/`` into the attempt and check the
+        copy. After a route back ``case/`` may hold more (the solved case of an earlier pass: time
+        directories, ``postProcessing/``, logs, the old dictionaries); none of that is copied. What
+        the attempt holds besides ``case/constant/polyMesh`` (a seed, ``seed_from_canonical``) is
+        left as it is."""
         self._solver(self._spec(ctx))
         rel = ctx.run.relative(attempt_dir)
         source_rel = f"{CASE_NAME}/{POLYMESH_REL}"
+        target_rel = f"{rel}/{CASE_NAME}/{POLYMESH_REL}"
         try:
             source = ctx.run.path(source_rel)
             if not source.is_dir():
@@ -323,11 +328,21 @@ class CaseSetupStage(KnowledgeTools, Stage):
                     "pipeline order is broken"
                 )
             snapshot = _snapshot(source)
-            ctx.run.promote(ctx.run.path(CASE_NAME), f"{rel}/{CASE_NAME}")
+            ctx.run.promote(source, target_rel)
         except (RunDirError, OSError) as exc:
             raise ToolFailure(f"could not copy the mesh into {rel}/: {exc}") from exc
-        if _changes(ctx.run.path(f"{rel}/{CASE_NAME}/{POLYMESH_REL}"), snapshot):
+        if _changes(ctx.run.path(target_rel), snapshot):
             raise ToolFailure(f"the copy of {source_rel} in {rel}/ differs from the original")
+
+    def seed_from_canonical(self, ctx: StageContext, attempt_dir: Path) -> list[str]:
+        """The dictionaries of the case the stage last accepted: ``0/``, ``constant/`` and
+        ``system/``. The mesh is not seeded (``prepare_attempt`` copies it from the run, and the
+        file scope excludes it), nor are time directories, ``postProcessing/`` or logs."""
+        return self._seed(
+            ctx,
+            attempt_dir,
+            {f"{CASE_NAME}/{name}": f"{CASE_NAME}/{name}" for name in ("0", "constant", "system")},
+        )
 
     def extra_tools(self, ctx: StageContext, attempt_dir: Path) -> list[Tool]:
         case_rel = f"{ctx.run.relative(attempt_dir)}/{CASE_NAME}"

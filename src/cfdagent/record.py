@@ -51,6 +51,9 @@ MAX_TEXT_CHARS = 4000  # failure reason
 MAX_ERROR_CHARS = 500  # one attempt error
 MAX_ERRORS_PER_ATTEMPT = 50
 MAX_DIAGNOSIS_CHARS = 1500  # the agent's own account of why an attempt failed
+MAX_FIX_REASON_CHARS = 1000  # why a fix loop was started (the same cap as a route request)
+MAX_FIX_MOVED = 200  # paths a fix loop moved aside that the record lists
+MAX_FIX_PATH_CHARS = 200
 MAX_KNOWLEDGE_READS = 200  # paths an agent asked to read from the knowledge base
 MAX_KNOWLEDGE_PATH_CHARS = 200
 SOFT_RECORD_BYTES = 1_500_000  # above this the attempt errors are cut down (limit is 2 MB)
@@ -152,6 +155,34 @@ class StageRecord(BaseModel):
     attempts: list[AttemptRecord] = Field(default_factory=list)
     ok: bool
     free_restarts: int = Field(default=0, ge=0)
+    pass_no: int = Field(default=0, ge=0)  # 0 for the first run of the stage, n after fix loop n
+
+
+class FixLoopRecord(BaseModel):
+    """One fix loop (ADR-0006): a failed gate or the Critic sent the run back to ``target``.
+
+    ``n`` is the number of the loop and of the pass it started; ``moved`` lists what was moved
+    aside, as run-relative paths of the places the files came from.
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    n: int = Field(ge=1)
+    source: str
+    target: str
+    origin: str
+    reason: str
+    moved: list[str] = Field(default_factory=list)
+
+    @field_validator("reason")
+    @classmethod
+    def _clean_reason(cls, value: str) -> str:
+        return redact(value, MAX_FIX_REASON_CHARS)
+
+    @field_validator("moved")
+    @classmethod
+    def _clean_moved(cls, value: list[str]) -> list[str]:
+        return [redact(item, MAX_FIX_PATH_CHARS) for item in value[:MAX_FIX_MOVED]]
 
 
 class RunRecord(BaseModel):
@@ -176,6 +207,7 @@ class RunRecord(BaseModel):
     image_id: str | None = None
     cfdagent_version: str
     stages: list[StageRecord] = Field(default_factory=list)
+    fix_loops: list[FixLoopRecord] = Field(default_factory=list)
     tokens_in: int = Field(default=0, ge=0)
     tokens_out: int = Field(default=0, ge=0)
     cost_usd: float = Field(default=0.0, ge=0)
@@ -300,6 +332,12 @@ def _comparison_lines(comparison: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _stage_label(stage: StageRecord) -> str:
+    """The stage's name, with its pass when it is not the first (a stage can run more than once)."""
+    name = _md(stage.name)
+    return name if stage.pass_no == 0 else f"{name} (pass {stage.pass_no})"
+
+
 def write_summary(
     run: RunDir,
     record: RunRecord,
@@ -339,12 +377,12 @@ def write_summary(
         lines += ["| Stage | Attempts | Result |", "|---|---|---|"]
         for stage in record.stages:
             result = "ok" if stage.ok else "failed"
-            lines.append(f"| {_md(stage.name)} | {len(stage.attempts)} | {result} |")
+            lines.append(f"| {_stage_label(stage)} | {len(stage.attempts)} | {result} |")
         for stage in record.stages:
             if stage.free_restarts:
                 lines += [
                     "",
-                    f"Stage {_md(stage.name)}: {stage.free_restarts} free restart(s) after "
+                    f"Stage {_stage_label(stage)}: {stage.free_restarts} free restart(s) after "
                     "attempts in which the model sent only blank replies (not counted as "
                     "attempts).",
                 ]

@@ -65,6 +65,7 @@ ANALYSIS_NAME = "analysis.md"
 QUANTITIES_NAME = "quantities.json"
 PLOTS_DIR = "plots"
 RESULTS_DIR = "results"  # in the run directory once promoted
+PROMOTED_DIR = "analyst"  # the accepted post-processing script, for the seed of a later pass
 SOLVER_SUMMARY = "logs/solver_run.json"
 CONTROL_DICT = f"{CASE_NAME}/system/controlDict"
 POLYMESH = f"{CASE_NAME}/constant/polyMesh"
@@ -487,19 +488,32 @@ class AnalystStage(KnowledgeTools, Stage):
 
     # ------------------------------------------------------------------ promotion
 
+    def seed_from_canonical(self, ctx: StageContext, attempt_dir: Path) -> list[str]:
+        """The accepted post-processing script of the earlier pass. ``analysis.md`` is not seeded:
+        its numbers belong to the solution of the earlier pass and are written again."""
+        return self._seed(ctx, attempt_dir, {f"{PROMOTED_DIR}/{SCRIPT_NAME}": SCRIPT_NAME})
+
     def promote(self, ctx: StageContext, attempt_dir: Path) -> None:
-        """``results/``: ``quantities.json`` and ``plots/*.png``; ``analysis.md``: the analysis."""
+        """``results/``: ``quantities.json`` and ``plots/*.png``; ``analysis.md``: the analysis;
+        ``analyst/``: the script (kept for the seed of a later pass, ``seed_from_canonical``)."""
         rel = ctx.run.relative(attempt_dir)
         try:
             quantities = ctx.run.path(f"{rel}/{QUANTITIES_NAME}")
             if not quantities.is_file() or quantities.is_symlink():
                 raise ToolFailure(f"cannot promote: {rel}/{QUANTITIES_NAME} does not exist")
             text = ctx.run.read_text(f"{rel}/{ANALYSIS_NAME}", ANALYSIS_MAX_BYTES)
+            script = ctx.run.path(f"{rel}/{SCRIPT_NAME}")
+            if not script.is_file() or script.is_symlink():
+                raise ToolFailure(f"cannot promote: {rel}/{SCRIPT_NAME} does not exist")
             results = ctx.run.path(RESULTS_DIR)
             _remove(results)
             results.mkdir(parents=True)
             shutil.copyfile(quantities, results / QUANTITIES_NAME)
             self._copy_plots(attempt_dir / PLOTS_DIR, results / PLOTS_DIR)
+            kept = ctx.run.path(PROMOTED_DIR)
+            _remove(kept)
+            kept.mkdir(parents=True)
+            shutil.copyfile(script, kept / SCRIPT_NAME)
             ctx.run.write_text(ANALYSIS_NAME, text)
         except (RunDirError, OSError) as exc:
             raise ToolFailure(f"promoting the results failed: {type(exc).__name__}: {exc}") from exc

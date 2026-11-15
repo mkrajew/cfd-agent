@@ -1,9 +1,9 @@
 """The LLM transcript: one JSON line per model call in ``llm_transcript.jsonl`` (design 6.4).
 
-Each line holds the stage, agent, attempt and model, the messages added since the previous call,
-the reply (content, tool calls, finish reason), the token usage (``null`` if the service gave
-none), the cost so far and whether that cost is partly estimated, and, for a call that failed,
-the error. The reply's ``raw`` wire data is never stored.
+Each line holds the stage, agent, pass (0 until a fix loop sends the run back), attempt and model,
+the messages added since the previous call, the reply (content, tool calls, finish reason), the
+token usage (``null`` if the service gave none), the cost so far and whether that cost is partly
+estimated, and, for a call that failed, the error. The reply's ``raw`` wire data is never stored.
 
 Free text is passed through the same redaction as the run record (URLs, host names, e-mail
 addresses, IP addresses, tokens), and every field and every line is bounded, so a model that
@@ -82,21 +82,29 @@ class TranscriptWriter:
         result: ChatResult | None,
         *,
         error: str | None = None,
+        pass_no: int = 0,
     ) -> None:
         """Write the line for one call. ``result`` is ``None`` and ``error`` set for a call that
-        failed before a usable reply."""
+        failed before a usable reply. ``pass_no`` is the pass of the run the call belongs to (0
+        until a fix loop sends the run back, ADR-0006)."""
         line = self._line(
-            stage, agent, attempt, model, new_messages, result, error, _TEXT_LIMITS[0]
+            stage, agent, attempt, model, new_messages, result, error, pass_no, _TEXT_LIMITS[0]
         )
         for limit in _TEXT_LIMITS[1:]:
             if len(line) <= MAX_LINE_BYTES:
                 break
-            line = self._line(stage, agent, attempt, model, new_messages, result, error, limit)
+            line = self._line(
+                stage, agent, attempt, model, new_messages, result, error, pass_no, limit
+            )
         if len(line) > MAX_LINE_BYTES:  # a very long conversation delta: keep the shape only
-            line = self._line(stage, agent, attempt, model, [], result, error, _TEXT_LIMITS[-1])
+            line = self._line(
+                stage, agent, attempt, model, [], result, error, pass_no, _TEXT_LIMITS[-1]
+            )
         self._append(line)
 
-    def _line(self, stage, agent, attempt, model, new_messages, result, error, limit) -> bytes:
+    def _line(
+        self, stage, agent, attempt, model, new_messages, result, error, pass_no, limit
+    ) -> bytes:
         usage = None
         reply = None
         if result is not None:
@@ -123,6 +131,7 @@ class TranscriptWriter:
         entry = {
             "stage": stage,
             "agent": agent,
+            "pass_no": pass_no,
             "attempt": attempt,
             "model": model,
             "new_messages": [_message(m, limit) for m in new_messages],

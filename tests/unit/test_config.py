@@ -37,6 +37,7 @@ def test_default_config_models_and_limits():
     limits = config.limits
     assert limits == RunLimits(max_turns_per_attempt_by_stage={"case_setup": 60})
     assert limits.max_attempts_per_stage == 3
+    assert limits.max_fix_loops == 10  # design 6.5
     assert limits.wall_clock_s == 7200
     assert limits.max_cost_usd == 1.0
     assert limits.max_ranks == 4
@@ -62,6 +63,8 @@ def test_limits_reject_nonsense():
         ("max_ranks", 5),
         ("max_ranks", 0),
         ("max_attempts_per_stage", 0),
+        ("max_fix_loops", -1),
+        ("max_fix_loops", 101),
         ("max_cost_usd", -1),
         ("max_cost_usd", float("nan")),
         ("wall_clock_s", 0),

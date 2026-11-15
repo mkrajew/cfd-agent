@@ -17,6 +17,7 @@ from cfdagent import orchestrator
 from cfdagent.agents.casespec import CaseSpec
 from cfdagent.agents.geometry import GeometryStage
 from cfdagent.agents.loop import StageOutcome
+from cfdagent.agents.routing import RouteRequest
 from cfdagent.config import RunConfig, RunLimits
 from cfdagent.errors import ToolFailure
 from cfdagent.llm.client import ChatResult, ToolCall, Usage
@@ -47,30 +48,55 @@ TICKER = Ticker()  # shared, so that two runs of one test never get the same run
 
 
 class FakeStep(Step):
-    """A pipeline step that records a stage and returns what it was told to."""
+    """A pipeline step that records a stage and returns what it was told to.
 
-    def __init__(self, name, *, ok=True, reason=None, action=None, reads=(), free_restarts=0):
+    ``script`` is a list with one entry per call: ``True`` (the step passes), ``False`` (it fails
+    without a route) or a ``RouteRequest`` (it fails and asks for a fix in an earlier stage); the
+    last entry is repeated once the list is used up. Without a script the step passes or fails as
+    ``ok`` says. ``seen`` has one ``(pass_no, fix_request)`` per call and ``seeded`` one entry per
+    ``seed_from_canonical`` call.
+    """
+
+    def __init__(
+        self, name, *, ok=True, reason=None, action=None, reads=(), free_restarts=0, script=None
+    ):
         self.name = name
         self.ok, self.reason, self.action, self.reads = ok, reason, action, list(reads)
         self.free_restarts = free_restarts
+        self.script = list(script) if script is not None else None
         self.calls = 0
         self.task_text = None
+        self.seen = []
+        self.seeded = []
+        self.on_seed = None
+
+    def seed_from_canonical(self, ctx):
+        self.seeded.append(ctx.pass_no)
+        if self.on_seed is not None:
+            self.on_seed(ctx)
 
     def run(self, ctx, task_text):
         self.calls += 1
         self.task_text = task_text
+        self.seen.append((ctx.pass_no, ctx.fix_request))
         if self.action is not None:
             self.action(ctx)
-        attempt = AttemptRecord(n=1, ok=self.ok, errors=[], seconds=0.0)
+        ok, route = self.ok, None
+        if self.script is not None:
+            item = self.script[min(self.calls, len(self.script)) - 1]
+            ok = item is True
+            route = item if isinstance(item, RouteRequest) else None
+        attempt = AttemptRecord(n=1, ok=ok, errors=[], seconds=0.0)
         ctx.record.stages.append(
             StageRecord(
                 name=self.name,
                 attempts=[attempt],
-                ok=self.ok,
+                ok=ok,
                 free_restarts=self.free_restarts,
+                pass_no=ctx.pass_no,
             )
         )
-        return StageOutcome(ok=self.ok, attempts=1, errors=[], reason=self.reason)
+        return StageOutcome(ok=ok, attempts=1, errors=[], reason=self.reason, route=route)
 
     def knowledge_reads(self):
         return list(self.reads)
@@ -538,6 +564,262 @@ def test_free_restarts_of_a_stage_reach_the_log_the_record_and_the_summary(tmp_p
     assert read_record(RunDir(result.run_dir)).stages[0].free_restarts == 2
     summary = (result.run_dir / "summary.md").read_text(encoding="utf-8")
     assert "2 free restart(s)" in summary
+
+
+# ---------------------------------------------------------------------- fix loops (ADR-0006)
+
+
+def route(source="solver_runner", target="mesh", **changes):
+    values = {
+        "origin": "gate",
+        "reason": "the run did not converge",
+        "instruction": "refine the mesh near the wall",
+    }
+    values.update(changes)
+    return RouteRequest(source=source, target=target, **values)
+
+
+def pipeline_of(calls, solver_script, **actions):
+    """The six stage names of ``STAGE_ORDER`` (up to the Analyst) as fake steps that log their
+    calls into ``calls``; the Solver Runner follows ``solver_script``."""
+    made = {}
+
+    def acting(name, extra):
+        def act(ctx):
+            calls.append((name, ctx.pass_no))
+            if extra is not None:
+                extra(ctx)
+
+        return act
+
+    for name in ("planner", "geometry", "mesh", "case_setup", "solver_runner", "analyst"):
+        made[name] = FakeStep(name, action=acting(name, actions.get(name)))
+    made["solver_runner"].script = list(solver_script)
+    return made
+
+
+def test_route_back_reruns_every_later_stage(tmp_path):
+    calls = []
+    made = pipeline_of(calls, [route(target="mesh"), True])
+    result = go(tmp_path, *made.values())
+    assert result.status == "completed", result.record.failure_reason
+    assert [name for name, _ in calls] == [
+        "planner",
+        "geometry",
+        "mesh",
+        "case_setup",
+        "solver_runner",
+        "mesh",  # the target runs again ...
+        "case_setup",  # ... and every stage after it, in order
+        "solver_runner",
+        "analyst",
+    ]
+    assert [(name, pass_no) for name, pass_no in calls if name == "mesh"] == [
+        ("mesh", 0),
+        ("mesh", 1),
+    ]
+    assert [pass_no for _, pass_no in calls] == [0, 0, 0, 0, 0, 1, 1, 1, 1]
+    assert made["planner"].calls == made["geometry"].calls == 1  # before the target: not run again
+    assert made["analyst"].calls == 1  # it never ran in pass 0: the Solver Runner failed first
+    stages = [(s.name, s.pass_no, s.ok) for s in result.record.stages]
+    assert stages == [
+        ("planner", 0, True),
+        ("geometry", 0, True),
+        ("mesh", 0, True),
+        ("case_setup", 0, True),
+        ("solver_runner", 0, False),
+        ("mesh", 1, True),
+        ("case_setup", 1, True),
+        ("solver_runner", 1, True),
+        ("analyst", 1, True),
+    ]
+    (loop,) = result.record.fix_loops
+    assert (loop.n, loop.source, loop.target, loop.origin) == (1, "solver_runner", "mesh", "gate")
+    assert loop.reason == "the run did not converge"
+    assert read_record(RunDir(result.run_dir)).fix_loops == [loop]
+
+
+def test_a_second_loop_starts_a_second_pass(tmp_path):
+    calls = []
+    made = pipeline_of(calls, [route(target="case_setup"), route(target="mesh"), True])
+    result = go(tmp_path, *made.values())
+    assert result.status == "completed"
+    assert [(loop.n, loop.target) for loop in result.record.fix_loops] == [
+        (1, "case_setup"),
+        (2, "mesh"),
+    ]
+    assert [pass_no for name, pass_no in calls if name == "solver_runner"] == [0, 1, 2]
+    assert [pass_no for name, pass_no in calls if name == "case_setup"] == [0, 1, 2]
+    assert [pass_no for name, pass_no in calls if name == "mesh"] == [0, 2]  # not run in pass 1
+
+
+def test_fix_request_in_opening_message_then_cleared(tmp_path):
+    calls = []
+    request = route(target="mesh")
+    made = pipeline_of(calls, [request, True])
+    result = go(tmp_path, *made.values())
+    assert result.status == "completed"
+    assert made["mesh"].seen == [(0, None), (1, request)]  # only the target gets the request
+    for name in ("case_setup", "solver_runner", "analyst"):
+        assert all(fix is None for _, fix in made[name].seen), name
+    assert made["case_setup"].seen == [(0, None), (1, None)]  # in pass 1, without the request
+
+
+def test_a_failed_target_ends_the_run_and_the_request_does_not_leak(tmp_path):
+    made = pipeline_of([], [route(target="mesh")])
+    made["mesh"].script = [True, False]
+    made["mesh"].reason = "stage 'mesh' failed after 3 attempts"
+    result = go(tmp_path, *made.values())
+    assert result.status == "failed" and result.record.failed_stage == "mesh"
+    assert "failed after 3 attempts" in result.record.failure_reason
+    assert len(result.record.fix_loops) == 1
+    assert made["analyst"].calls == 0
+
+
+def test_route_back_moves_downstream_outputs_aside(tmp_path):
+    held = []
+
+    def meshed(ctx):
+        ctx.run.write_text("case/constant/polyMesh/points", "the mesh")
+
+    def solved(ctx):
+        ctx.run.write_text("case/0/U", f"fields of pass {ctx.pass_no}")
+        ctx.run.write_text("logs/solver_run.json", "{}")
+        ctx.run.write_text("results/quantities.json", "{}")  # as if an Analyst had run
+
+    def look(ctx):  # what the stages after the mesh have left in the canonical places
+        found = (ctx.run.relative(p) for p in ctx.run.iter_files())
+        held.append(
+            (ctx.pass_no, sorted(n for n in found if n.startswith(("case/", "logs/", "results/"))))
+        )
+
+    made = pipeline_of(
+        [], [route(target="case_setup"), True], mesh=meshed, case_setup=look, solver_runner=solved
+    )
+    result = go(tmp_path, *made.values())
+    assert result.status == "completed", result.record.failure_reason
+    # when the Case Setup ran again, the solved case was gone and the mesh was still there
+    assert held == [
+        (0, ["case/constant/polyMesh/points"]),
+        (1, ["case/constant/polyMesh/points"]),
+    ]
+    superseded = result.run_dir / "superseded" / "pass-1"
+    assert (superseded / "case" / "0" / "U").read_text(encoding="utf-8") == "fields of pass 0"
+    assert (superseded / "logs" / "solver_run.json").is_file()
+    assert (superseded / "results" / "quantities.json").is_file()
+    assert (result.run_dir / "case" / "0" / "U").read_text(encoding="utf-8") == "fields of pass 1"
+    (loop,) = result.record.fix_loops
+    assert "case/0" in loop.moved and "logs" in loop.moved and "results" in loop.moved
+    assert not any(item.startswith("case/constant/polyMesh") for item in loop.moved)
+    assert "fix loop 1" in log_text(result) and "solver_runner -> case_setup" in log_text(result)
+
+
+def test_the_target_is_seeded_before_its_downstream_outputs_move_in_place_mode(tmp_path):
+    state = []
+
+    def solved(ctx):
+        ctx.run.write_text("case/0/U", "canonical")
+
+    made = pipeline_of([], [route(target="case_setup"), True], solver_runner=solved)
+    made["case_setup"].on_seed = lambda ctx: state.append(
+        ((ctx.run.root / "case" / "0" / "U").is_file(), ctx.fix_request is not None, ctx.pass_no)
+    )
+    config = RunConfig.default().model_copy(update={"repair_mode": "in_place"})
+    result = go(tmp_path, *made.values(), config=config)
+    assert result.status == "completed"
+    assert state == [(True, True, 1)]  # still in place, the request and the pass already set
+    assert made["case_setup"].seeded == [1]
+    assert made["mesh"].seeded == []  # only the target is seeded
+
+
+def test_fresh_mode_seeds_nothing(tmp_path):
+    made = pipeline_of([], [route(target="case_setup"), True])
+    result = go(tmp_path, *made.values())
+    assert result.status == "completed"
+    assert all(step.seeded == [] for step in made.values())
+
+
+def test_fix_loop_budget_ends_run_failed(tmp_path):
+    made = pipeline_of([], [route(target="case_setup")])  # asks again every time
+    made["solver_runner"].reason = "stage 'solver_runner' failed after 1 attempts"
+    result = go(tmp_path, *made.values())
+    assert result.status == "failed"
+    assert result.record.failed_stage == "solver_runner"
+    assert result.record.failure_reason.startswith("fix-loop limit of 10 reached")
+    assert len(result.record.fix_loops) == 10  # design 6.5
+    assert [loop.n for loop in result.record.fix_loops] == list(range(1, 11))
+    assert made["solver_runner"].calls == 11  # pass 0 and ten loops
+    assert made["analyst"].calls == 0
+    assert "fix-loop limit of 10 reached" in (result.run_dir / "summary.md").read_text(
+        encoding="utf-8"
+    )
+    assert "internal_error" not in result.record.failure_reason
+
+
+def test_the_budget_is_the_configured_limit(tmp_path):
+    made = pipeline_of([], [route(target="case_setup")])
+    config = RunConfig.default().model_copy(update={"limits": RunLimits(max_fix_loops=2)})
+    result = go(tmp_path, *made.values(), config=config)
+    assert result.status == "failed"
+    assert result.record.failure_reason.startswith("fix-loop limit of 2 reached")
+    assert len(result.record.fix_loops) == 2 and made["solver_runner"].calls == 3
+    zero = pipeline_of([], [route(target="case_setup")])
+    config = RunConfig.default().model_copy(update={"limits": RunLimits(max_fix_loops=0)})
+    result = go(tmp_path / "zero", *zero.values(), config=config)
+    assert result.record.failure_reason.startswith("fix-loop limit of 0 reached")
+    assert result.record.fix_loops == []
+
+
+def test_a_route_with_no_budget_left_moves_nothing_aside(tmp_path):
+    def solved(ctx):
+        ctx.run.write_text("results/quantities.json", "{}")
+
+    made = pipeline_of([], [route(target="case_setup")], solver_runner=solved)
+    config = RunConfig.default().model_copy(update={"limits": RunLimits(max_fix_loops=0)})
+    result = go(tmp_path, *made.values(), config=config)
+    assert (result.run_dir / "results" / "quantities.json").is_file()  # what exists, stays
+    assert not (result.run_dir / "superseded").exists()
+
+
+def test_a_route_to_a_stage_the_pipeline_does_not_have_is_an_internal_error(tmp_path):
+    first = FakeStep("mesh")
+    second = FakeStep("solver_runner", script=[route(target="geometry")])
+    result = go(tmp_path, first, second)
+    assert result.status == "failed"
+    assert result.record.failure_reason.startswith("internal_error")
+    assert "geometry" in result.record.failure_reason
+    assert result.record.fix_loops == []
+    assert not (result.run_dir / "superseded").exists()
+
+
+def test_a_failed_outcome_without_a_route_still_ends_the_run(tmp_path):
+    made = pipeline_of([], [False])
+    result = go(tmp_path, *made.values())
+    assert result.status == "failed" and result.record.failed_stage == "solver_runner"
+    assert result.record.fix_loops == []
+    assert made["analyst"].calls == 0
+
+
+def test_the_scorer_runs_once_after_the_last_pass_only(tmp_path, monkeypatch):
+    scored = []
+    monkeypatch.setattr(
+        orchestrator._Session, "run_scorer", lambda self: scored.append(self.ctx.pass_no)
+    )
+    made = pipeline_of([], [route(target="mesh"), True])
+    result = go(tmp_path, *made.values())
+    assert result.status == "completed" and scored == [1]
+
+
+def test_the_free_restart_log_line_names_the_pass(tmp_path):
+    made = pipeline_of([], [route(target="case_setup"), True])
+    made["case_setup"].free_restarts = 1
+    result = go(tmp_path, *made.values())
+    text = log_text(result)
+    assert "stage case_setup: 1 free restart(s)" in text  # pass 0
+    assert "stage case_setup (pass 1): 1 free restart(s)" in text
+    assert text.count("free restart") == 2  # each pass once, not the old record again
+    assert "stage mesh (pass 0)" not in text and "stage mesh: start" in text
+    assert "stage case_setup (pass 1): start" in text
 
 
 def test_the_record_is_saved_after_every_step_even_without_progress_callbacks(tmp_path):

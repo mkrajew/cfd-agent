@@ -11,7 +11,8 @@ from types import SimpleNamespace
 import pytest
 
 from cfdagent.agents import loop
-from cfdagent.agents.loop import StageOutcome, run_stage
+from cfdagent.agents.loop import SeededAttempt, StageOutcome, run_stage
+from cfdagent.agents.routing import RouteRequest
 from cfdagent.agents.stage import Stage, StageContext
 from cfdagent.agents.tools import FileScope, NoArgs, Tool
 from cfdagent.agents.transcript import TRANSCRIPT_FILE, TranscriptWriter
@@ -919,7 +920,7 @@ def test_promote_errors_propagate_as_tool_failure(tmp_path):
 def test_attempt_directory_errors_propagate_as_tool_failure(tmp_path, monkeypatch):
     ctx, _ = make_ctx(tmp_path, [reply(None, check())])
 
-    def refuse(stage, attempt):
+    def refuse(stage, attempt, pass_no=0):
         raise RunDirError("cannot prepare the directory")
 
     monkeypatch.setattr(ctx.run, "attempt_dir", refuse)
@@ -1557,3 +1558,171 @@ def test_turn_limit_override_per_stage(tmp_path):
     other = RunLimits(max_turns_per_attempt=3, max_turns_per_attempt_by_stage={"mesh": 9})
     ctx, backend = make_ctx(tmp_path / "other", steps, limits=other)
     assert not run_stage(ToyStage([]), ctx).ok and len(backend.calls) == 3  # another stage's key
+
+
+# ------------------------------------------------------------------ routing and passes (ADR-0006)
+
+FIX = RouteRequest(
+    source="solver_runner",
+    target="case_setup",
+    origin="gate",
+    reason="the residuals did not fall",
+    instruction="set a residualControl block",
+)
+
+
+class RoutingToy(ToyStage):
+    """A stage whose failed outcome asks for a fix in an earlier stage."""
+
+    def __init__(self, gates, route=FIX, **kwargs):
+        super().__init__(gates, **kwargs)
+        self.route = route
+        self.asked: list[list[str]] = []
+
+    def route_after_failure(self, ctx, errors):
+        self.asked.append(list(errors))
+        return self.route
+
+
+def test_transcript_lines_carry_pass_no(tmp_path):
+    ctx, _ = make_ctx(tmp_path, [reply(None, check())])
+    assert run_stage(ToyStage([GateResult(True, [])]), ctx).ok
+    ctx.pass_no = 2
+    ctx.backend = ScriptedBackend([reply(None, check())])
+    assert run_stage(ToyStage([GateResult(True, [])]), ctx).ok
+    assert [line["pass_no"] for line in read_transcript(ctx)] == [0, 2]
+
+
+def test_a_later_pass_has_its_own_attempt_directories_and_stage_record(tmp_path):
+    ctx, backend = make_ctx(tmp_path, [reply(None, check("k1")), reply(None, check("k2"))])
+    earlier = ctx.run.attempt_dir("toy", 1)
+    (earlier / "old.py").write_text("pass 0\n", encoding="utf-8")
+    ctx.pass_no = 1
+    stage = ToyStage([GateResult(False, ["bad"]), GateResult(True, [])])
+    assert run_stage(stage, ctx).ok
+    assert [d.name for d in stage.gate_dirs] == ["toy-p1-1", "toy-p1-2"]
+    assert "attempts/toy-p1-1" in backend.calls[0].messages[1]["content"]
+    assert (earlier / "old.py").read_text(encoding="utf-8") == "pass 0\n"  # never touched
+    (stage_record,) = ctx.record.stages
+    assert stage_record.pass_no == 1
+    assert "attempts/toy-p1-2/" in tool_messages(1, backend)[-1]["content"]
+
+
+def test_the_stage_record_of_pass_zero_is_unchanged(tmp_path):
+    ctx, _ = make_ctx(tmp_path, [reply(None, check())])
+    assert run_stage(ToyStage([GateResult(True, [])]), ctx).ok
+    assert ctx.record.stages[0].pass_no == 0
+
+
+def test_fix_request_in_opening_message(tmp_path):
+    ctx, backend = make_ctx(tmp_path, [reply(None, check())])
+    ctx.fix_request, ctx.pass_no = FIX, 1
+    assert run_stage(ToyStage([GateResult(True, [])]), ctx).ok
+    opening = backend.calls[0].messages[1]["content"]
+    text = "Fix requested by solver_runner: the residuals did not fall. set a residualControl block"
+    assert text in opening
+    assert (
+        opening.index("Do the toy task.") < opening.index(text) < opening.index("This is attempt")
+    )
+
+
+def test_no_fix_request_means_the_opening_message_is_unchanged(tmp_path):
+    ctx, backend = make_ctx(tmp_path, [reply(None, check())])
+    assert ctx.fix_request is None and ctx.pass_no == 0
+    assert run_stage(ToyStage([GateResult(True, [])]), ctx).ok
+    assert "Fix requested" not in backend.calls[0].messages[1]["content"]
+
+
+def test_a_failed_outcome_carries_the_route_of_the_stage(tmp_path):
+    steps = [reply(None, check(f"k{i}")) for i in range(1, 4)]
+    ctx, _ = make_ctx(tmp_path, steps)
+    stage = RoutingToy([GateResult(False, [f"bad {i}"]) for i in range(3)])
+    outcome = run_stage(stage, ctx)
+    assert not outcome.ok and outcome.route == FIX
+    assert stage.asked == [["bad 2"]]  # asked once, with the errors of the last attempt
+
+
+def test_a_stage_that_is_not_retried_carries_its_route_too(tmp_path):
+    class NoRetry(RoutingToy):
+        def retry_after_failure(self, errors):
+            return False
+
+    ctx, _ = make_ctx(tmp_path, [reply(None, check())])
+    outcome = run_stage(NoRetry([GateResult(False, ["diverged"])]), ctx)
+    assert not outcome.ok and outcome.attempts == 1 and outcome.route == FIX
+
+
+def test_a_stage_without_a_route_gives_none(tmp_path):
+    steps = [reply(None, check(f"k{i}")) for i in range(1, 4)]
+    ctx, _ = make_ctx(tmp_path, steps)
+    outcome = run_stage(ToyStage([GateResult(False, ["bad"])] * 3), ctx)
+    assert not outcome.ok and outcome.route is None
+    assert StageOutcome(ok=True, attempts=1).route is None
+
+
+def test_a_stage_that_declines_to_route_gives_none(tmp_path):
+    steps = [reply(None, check(f"k{i}")) for i in range(1, 4)]
+    ctx, _ = make_ctx(tmp_path, steps)
+    stage = RoutingToy([GateResult(False, ["bad"])] * 3, route=None)
+    assert run_stage(stage, ctx).route is None
+
+
+def test_a_stage_stopped_by_a_limit_is_never_routed(tmp_path):
+    steps = [reply(None, tc("calculator", f"c{i}", expression="1+1")) for i in range(5)]
+    ctx, _ = make_ctx(tmp_path, steps, limits=RunLimits(max_turns_per_attempt=2))
+    stage = RoutingToy([])
+    outcome = run_stage(stage, ctx)
+    assert not outcome.ok and outcome.route is None and stage.asked == []
+    big = Usage(1_000_000, 100_000, None)
+    ctx, _ = make_ctx(tmp_path / "cost", [reply(None, check(), usage=big)], cost_limit=0.1)
+    stage = RoutingToy([GateResult(False, ["bad"])])
+    outcome = run_stage(stage, ctx)
+    assert "cost limit" in outcome.reason and outcome.route is None and stage.asked == []
+
+
+def seeded_attempt(ctx, files, pass_no=1, name="toy"):
+    attempt = ctx.run.attempt_dir(name, 1, pass_no)
+    carried = []
+    for rel, text in files.items():
+        (attempt / rel).write_text(text, encoding="utf-8")
+        carried.append(f"{ctx.run.relative(attempt)}/{rel}")
+    return SeededAttempt(attempt, carried)
+
+
+def test_a_pre_seeded_first_attempt_is_kept_and_announced(tmp_path):
+    ctx, backend = make_ctx(tmp_path, [reply(None, check())])
+    ctx.pass_no, ctx.fix_request = 1, FIX
+    seeded = seeded_attempt(ctx, {"a.py": "x = 1\n"})
+    stage = ToyStage([GateResult(True, [])])
+    assert run_stage(stage, ctx, seeded=seeded).ok
+    assert stage.gate_dirs == [seeded.path]
+    assert (seeded.path / "a.py").read_text(encoding="utf-8") == "x = 1\n"  # not wiped
+    opening = backend.calls[0].messages[1]["content"]
+    assert "attempts/toy-p1-1/a.py" in opening
+    assert "already in the attempt directory" in opening
+    assert opening.index("Fix requested by") < opening.index("attempts/toy-p1-1/a.py")
+
+
+def test_the_attempt_after_a_seeded_one_is_prepared_in_the_usual_way(tmp_path):
+    ctx, _ = make_ctx(tmp_path, [reply(None, check("k1")), reply(None, check("k2"))])
+    in_place(ctx)
+    ctx.pass_no = 1
+    seeded = seeded_attempt(ctx, {"a.py": "x = 1\n"})
+    stage = RepairStage([GateResult(False, ["bad"]), GateResult(True, [])])
+    assert run_stage(stage, ctx, seeded=seeded).ok
+    assert stage.carry_calls == [("toy-p1-1", "toy-p1-2")]  # the seed itself is not a carry
+    assert stage.listings == [["a.py"], ["a.py"]]
+
+
+def test_a_seed_for_another_directory_than_the_loop_would_use_is_a_tool_failure(tmp_path):
+    ctx, _ = make_ctx(tmp_path, [])
+    ctx.pass_no = 2
+    seeded = seeded_attempt(ctx, {"a.py": "x\n"}, pass_no=1)  # the wrong pass
+    with pytest.raises(ToolFailure, match="seeded"):
+        run_stage(ToyStage([]), ctx, seeded=seeded)
+
+
+def test_an_unseeded_run_stage_call_is_unchanged(tmp_path):
+    ctx, backend = make_ctx(tmp_path, [reply(None, check())])
+    assert run_stage(ToyStage([GateResult(True, [])]), ctx, seeded=None).ok
+    assert "already in the attempt directory" not in backend.calls[0].messages[1]["content"]

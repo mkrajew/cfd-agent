@@ -34,6 +34,7 @@ from cfdagent.agents.loop import (
     internal,
     short,
 )
+from cfdagent.agents.routing import RouteRequest, fix_request_text
 from cfdagent.agents.stage import StageContext
 from cfdagent.agents.tools import ToolRegistry, calculator_tool
 from cfdagent.config import RunLimits
@@ -332,14 +333,17 @@ def _only_resource_errors(errors: list[str]) -> bool:
     return bool(errors) and all(e.startswith(RESOURCE_PREFIX) for e in errors)
 
 
-def _opening_message(task_text: str) -> str:
-    return (
+def _opening_message(task_text: str, fix_request: RouteRequest | None = None) -> str:
+    text = (
         f"Task from the user:\n\n{task_text}\n\n"
         "Plan the simulation. Restate the task, decide every parameter the task leaves open "
         "(record each as an assumption) and compute every derived number with the calculator "
         "tool. When you have all the numbers you need, reply in plain text with a short summary "
         "of the plan and of every assumption. Do not write the final CaseSpec yet."
     )
+    if fix_request is not None:  # a later stage sent the run back here (ADR-0006)
+        text += f"\n\n{fix_request_text(fix_request)}"
+    return text
 
 
 def _structured_request(task_text: str) -> str:
@@ -511,7 +515,7 @@ class _PlannerRun(ModelConversation):
     def run(self) -> StageOutcome:
         self.messages = [
             {"role": "system", "content": load_prompt(AGENT).text},
-            {"role": "user", "content": _opening_message(self.task_text)},
+            {"role": "user", "content": _opening_message(self.task_text, self.ctx.fix_request)},
         ]
         self._phase_one()
         if self.abort is not None:

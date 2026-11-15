@@ -40,6 +40,9 @@ class RunLimits(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     max_attempts_per_stage: int = Field(default=3, ge=1, le=100)
+    # Fix loops of the whole run (ADR-0006): a failed gate or the Critic sending the run back to an
+    # earlier stage. Zero turns the mechanism off: the first request then ends the run.
+    max_fix_loops: int = Field(default=10, ge=0, le=100)
     wall_clock_s: float = 7200
     max_cost_usd: float = 1.0
     max_ranks: int = Field(default=MAX_RANKS_LIMIT, ge=1, le=MAX_RANKS_LIMIT)
