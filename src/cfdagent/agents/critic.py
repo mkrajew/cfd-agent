@@ -68,6 +68,9 @@ from cfdagent.rundir import RunDir, RunDirError
 STAGE = "critic"
 AGENT = "critic"
 CRITIC_MAX_TURNS = 12  # read-only model turns, then the verdict (ADR-0007)
+# The checks every review makes (ADR-0007, decision 3), by the names the prompt gives them. A
+# success must list all of them: a success that shows no evidence is not a judgement.
+REQUIRED_CHECKS = ("requested_outputs", "task_parameters", "convergence", "plausibility")
 SOLVER_SUMMARY = "logs/solver_run.json"
 LOG_TAIL_BYTES = 3000  # the end of the solver log that the opening message carries
 MAX_SCHEMA_PROBLEMS = 8
@@ -108,8 +111,25 @@ def verdict_problems(verdict: CriticVerdict) -> list[str]:
     if verdict.verdict == "success" and failed:
         problems.append(
             f"the verdict is success but these checks did not pass: {', '.join(failed)}. A "
-            "success needs every check to pass: give the verdict partial or failed, or correct "
-            "the checks if the evidence shows they passed"
+            "success needs every check to pass: give the verdict partial or failed, or, if "
+            "something in the files you read shows that a check did pass, say what it is in "
+            "that check's evidence and set passed to true"
+        )
+    if verdict.verdict == "success":
+        listed = {check.name for check in verdict.checks}
+        missing = [name for name in REQUIRED_CHECKS if name not in listed]
+        if missing:
+            problems.append(
+                f"the verdict is success but it does not list these required checks: "
+                f"{', '.join(missing)}. List all of {', '.join(REQUIRED_CHECKS)}, each with its "
+                "evidence (a check that does not apply to this case passes with the evidence "
+                "'not applicable: <why>')"
+            )
+    elif not failed and not verdict.reasons:
+        problems.append(
+            f"the verdict is {verdict.verdict} but no check failed and no reason is given; "
+            "name what is wrong in `reasons` or in a failed check, or give the verdict success "
+            "if nothing is"
         )
     if verdict.send_back_to is not None:
         if verdict.verdict == "success":
@@ -160,8 +180,8 @@ def _opening_message(task_text: str, tail: tuple[str, str] | None) -> str:
     text = (
         f"Task from the user:\n\n{task_text}\n\n"
         "The run has finished and every stage has passed its automatic checks. Review it as your "
-        "instructions describe: make the four required checks (requested_outputs, "
-        "task_parameters, convergence, plausibility) against the task text above, using the "
+        "instructions describe: make the four required checks "
+        f"({', '.join(REQUIRED_CHECKS)}) against the task text above, using the "
         "files you may read (start with list_dir on '.'). When you have what you need, reply in "
         "plain text with a short summary of your findings; do not write the verdict yet."
     )

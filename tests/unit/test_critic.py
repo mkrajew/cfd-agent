@@ -8,7 +8,7 @@ import pytest
 from test_casespec import _violations
 from test_planner import FakeClock, calc, make_ctx, reply
 
-from cfdagent.agents.critic import CRITIC_MAX_TURNS, run_critic
+from cfdagent.agents.critic import CRITIC_MAX_TURNS, REQUIRED_CHECKS, run_critic, verdict_problems
 from cfdagent.agents.routing import RouteRequest
 from cfdagent.agents.transcript import TRANSCRIPT_FILE
 from cfdagent.config import RunLimits
@@ -146,6 +146,7 @@ def test_a_verdict_with_too_many_checks_or_reasons_is_refused():
 
 def test_the_prompt_names_the_required_checks_and_the_targets():
     text = load_prompt("critic").text
+    assert REQUIRED_CHECKS == CHECK_NAMES  # the guard demands what the prompt asks for
     for name in CHECK_NAMES:
         assert name in text, name
     for target in ("planner", "geometry", "mesh", "case_setup", "analyst"):
@@ -315,6 +316,66 @@ def test_success_with_failed_check_is_rejected(tmp_path):
     told = backend.calls[2].messages[-1]
     assert told["role"] == "user" and "convergence" in told["content"]
     assert "success" in told["content"]
+    # phase 2 has no tools, so the model cannot collect new evidence: it must not be invited to
+    # "correct" the checks, only to change the verdict or to say what in its files shows a pass
+    assert "correct the checks" not in told["content"]
+    assert "partial or failed" in told["content"]
+
+
+def make_verdict(**changes) -> CriticVerdict:
+    return CriticVerdict.model_validate_json(verdict_json(**changes))
+
+
+def test_success_without_the_required_checks_is_rejected(tmp_path):
+    empty = json.loads(verdict_json())
+    empty["checks"] = []
+    partial_list = json.loads(verdict_json())
+    partial_list["checks"] = checks()[:3]  # `plausibility` is missing
+    renamed = json.loads(verdict_json())
+    renamed["checks"][0]["name"] = "outputs"  # a name the prompt does not ask for
+    steps = [
+        reply("Read."),
+        reply(json.dumps(empty)),
+        reply(json.dumps(partial_list)),
+        reply(json.dumps(renamed)),
+    ]
+    ctx, backend = make_ctx(tmp_path, steps)
+    populate(ctx.run)
+    outcome = run_critic(ctx, TASK)
+    assert outcome.ok and ctx.record.critic_verdict is None  # three invalid replies: no verdict
+    errors = [a.errors[0] for a in ctx.record.stages[-1].attempts]
+    listing = "does not list these required checks: "
+    assert listing + "requested_outputs, task_parameters, convergence, plausibility." in errors[0]
+    assert listing + "plausibility." in errors[1]  # only the check that is missing
+    assert listing + "requested_outputs." in errors[2]  # a name the prompt does not give
+    told = backend.calls[2].messages[-1]["content"]
+    assert "requested_outputs, task_parameters, convergence, plausibility" in told
+
+
+def test_a_success_with_all_required_checks_and_extra_ones_is_accepted(tmp_path):
+    data = json.loads(verdict_json())
+    data["checks"].append({"name": "mesh_quality", "passed": True, "evidence": "checkMesh is ok"})
+    ctx, _ = make_ctx(tmp_path, [reply("Read."), reply(json.dumps(data))])
+    populate(ctx.run)
+    assert run_critic(ctx, TASK).ok
+    assert len(ctx.record.critic_verdict.checks) == 5
+
+
+def test_a_verdict_that_is_not_a_success_needs_a_failed_check_or_a_reason():
+    reasonless = make_verdict(verdict="failed", reasons=[])
+    assert verdict_problems(reasonless) and "reason" in verdict_problems(reasonless)[0]
+    assert (
+        verdict_problems(make_verdict(verdict="failed", failed=("convergence",), reasons=[])) == []
+    )
+    assert (
+        verdict_problems(make_verdict(verdict="partial", reasons=["One output is missing."])) == []
+    )
+    assert verdict_problems(make_verdict()) == []  # a complete success is fine
+    # only a success must show all the required checks; a verdict that finds a fault may name just
+    # the checks that found it (rejecting it would cost attempts and could end in no verdict)
+    short_list = json.loads(verdict_json("partial", failed=("convergence",)))
+    short_list["checks"] = [c for c in short_list["checks"] if c["name"] == "convergence"]
+    assert verdict_problems(CriticVerdict.model_validate(short_list)) == []
 
 
 @pytest.mark.parametrize("instruction", [None, "", "   "])
