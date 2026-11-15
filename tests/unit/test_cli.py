@@ -1306,3 +1306,82 @@ def test_the_real_registry_wiring_keeps_a_broken_generality_set_out_of_developme
     unknown = invoke(runner, "run", "--benchmark", "nope")
     assert unknown.exit_code == 2 and "secret-marker" not in unknown.output
     assert "gen-bad" not in unknown.output
+
+
+def test_a_task_file_under_the_generality_directory_is_refused_too(
+    runner, root, fake_run_task, popen, generality_benchmarks
+):
+    # The same text given by path must not start a run either (design 9.1).
+    path = generality_benchmarks / "generality" / "gen-one" / "task.md"
+    refused = invoke(runner, "run", str(path))
+    assert refused.exit_code == 2
+    assert "--allow-generality" in refused.output and "generality" in refused.output
+    assert fake_run_task.calls == []
+    # --detach: refused in the parent, nothing is spawned (the endpoint is set by `popen`, so the
+    # refusal cannot come from a missing environment variable).
+    detached = invoke(runner, "run", str(path), "--detach")
+    assert detached.exit_code == 2
+    assert "--allow-generality" in detached.output
+    assert popen.instances == []
+    allowed_detached = invoke(runner, "run", str(path), "--detach", "--allow-generality")
+    assert allowed_detached.exit_code == 0, allowed_detached.output
+    argv = popen.instances[0].args
+    assert "--allow-generality" in argv
+    assert str(path.resolve()) in argv
+    allowed = invoke(runner, "run", str(path), "--allow-generality")
+    assert allowed.exit_code == 0, allowed.output
+    # A task file anywhere else is unaffected.
+    other = generality_benchmarks / "bench-one" / "task.md"
+    assert invoke(runner, "run", str(other)).exit_code == 0
+
+
+def test_a_link_into_the_generality_directory_is_followed(
+    runner, root, fake_run_task, generality_benchmarks, tmp_path
+):
+    target = generality_benchmarks / "generality" / "gen-one"
+    link = tmp_path / "innocent"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        if sys.platform != "win32":
+            raise
+        # Windows without the symlink privilege: a directory junction does the same.
+        made = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True
+        )
+        if made.returncode != 0:
+            pytest.skip("neither symbolic links nor junctions are available")
+    result = invoke(runner, "run", str(link / "task.md"))
+    assert result.exit_code == 2, result.output
+    assert "--allow-generality" in result.output
+    assert fake_run_task.calls == []
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("/x/Benchmarks/GENERALITY/y/task.md", True),
+        ("/x/benchmarks/./generality/y/task.md", True),
+        ("/x/benchmarks/generality-x/task.md", False),
+        ("/x/generality/benchmarks/task.md", False),
+        ("/x/generality/task.md", False),
+        ("/x/benchmarks/task.md", False),
+        ("/x/benchmarks/bench-one/task.md", False),
+    ],
+)
+def test_the_generality_directory_test_is_exact(text, expected):
+    assert cli._in_generality_directory(Path(text)) is expected
+
+
+def test_a_relative_and_a_dotdot_path_into_the_generality_directory_are_refused(
+    runner, root, fake_run_task, generality_benchmarks, monkeypatch
+):
+    monkeypatch.chdir(generality_benchmarks.parent)
+    for text in (
+        "benchmarks/generality/gen-one/task.md",
+        "benchmarks/bench-one/../generality/gen-one/task.md",
+        "./benchmarks/GENERALITY/gen-one/task.md",
+    ):
+        result = invoke(runner, "run", text)
+        assert result.exit_code == 2, (text, result.output)
+    assert fake_run_task.calls == []

@@ -27,6 +27,13 @@ system works in general and not only on the development benchmarks in `benchmark
 - `cfdagent run --benchmark <generality id>` exits with code 2 unless `--allow-generality` is given
   (also for `--detach`, which passes the flag on to the background process). The orchestrator opens
   the generality set only for a run configured as `generality`.
+- `cfdagent run <path to a task file under benchmarks/generality>` is refused unless
+  `--allow-generality` is given (links and `..` are resolved; a copy of the file elsewhere is not
+  detected).
+- `.claude/settings.json` denies the Read tool on `benchmarks/generality/**` for development
+  sessions. This is a guard against accidents, not a barrier (a shell command can still read the
+  files). Only the owner changes it: it has to be lifted for the session that prepares the set
+  (plan Task 7) and put back afterwards, and the frozen M3 campaign needs it lifted as well.
 - The knowledge tools reach only the curated notes and the OpenFOAM tutorials of the image.
 - The generality lint (`tests/unit/test_generality_lint.py`) fails when a word that names a family
   of this set appears under `src/cfdagent`.

@@ -45,6 +45,7 @@ client and the storage layer) is imported inside ``run`` only.
 from __future__ import annotations
 
 import codecs
+import itertools
 import math
 import os
 import re
@@ -414,6 +415,18 @@ def _registry(include_generality: bool = False) -> dict:
     return load_registry(include_generality=include_generality)
 
 
+def _in_generality_directory(path: Path) -> bool:
+    """True if ``path`` (links and ``..`` resolved) lies under a ``benchmarks/generality``
+    directory: the text of a generality task must not start a run by path either (design 9.1).
+    Compared without regard to case, because the file systems of the laptops are insensitive."""
+    try:
+        resolved = path.resolve()
+    except (OSError, RuntimeError):
+        resolved = Path(os.path.abspath(path))  # not resolvable: the guard still looks at the text
+    parts = [part.casefold() for part in resolved.parts]
+    return any(pair == ("benchmarks", "generality") for pair in itertools.pairwise(parts))
+
+
 def _read_task_file(path: Path) -> str:
     try:
         with open(path, "rb") as handle:
@@ -611,6 +624,11 @@ def run(
 
     task_set: Literal["development", "generality"] = "development"
     if task_file is not None:
+        if _in_generality_directory(task_file) and not allow_generality:
+            _usage_error(
+                "a task file under benchmarks/generality runs only in the frozen M3 campaign "
+                "(--allow-generality)"
+            )
         task = _read_task_file(task_file)
     else:
         task, task_set = _benchmark_task(str(benchmark), allow_generality)
