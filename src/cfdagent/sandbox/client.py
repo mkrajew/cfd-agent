@@ -10,7 +10,10 @@ it becomes a failed ``OpResponse`` that carries the tail of what the container p
 A timeout (or ``KeyboardInterrupt``, or any other exception while waiting) runs ``docker kill
 <name>``: killing only the ``docker run`` client would leave the container running. The client
 process is then waited for, killed if it does not exit, and ``docker rm -f <name>`` removes a
-container that was created but never started.
+container that was created but never started. Containers are not started with ``--rm``: after a
+normal exit the client removes the container itself, and after exit code 137 it first asks
+``docker inspect`` whether the memory limit killed it. That is the agent's failed call (``ok``
+false, not ``internal``: the case was too big), not an internal error that would end the run.
 
 ``mode="local"`` runs ``python -m cfdagent.executor`` as a subprocess of the caller. It is NOT
 confined (no container, no network cut); it exists for the tests that already run inside the
@@ -221,6 +224,28 @@ class SandboxClient:
         except (OSError, subprocess.SubprocessError):
             pass
 
+    def _oom_killed(self, name: str) -> bool:
+        """True if Docker says the container was killed by the out-of-memory killer.
+
+        Any trouble asking (Docker gone, no answer in time, an unexpected answer) is "no": the
+        caller then reports the exit as the internal failure it was before.
+        """
+        try:
+            done = self._run(
+                ["docker", "inspect", "--format", "{{.State.OOMKilled}}", name],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=_COMMAND_TIMEOUT_S,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        output = done.stdout
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        return isinstance(output, str) and output.strip() == "true"
+
     def _stop(self, proc: Any, name: str) -> None:
         """Stop the executor: kill the named container first, then make sure the client is gone."""
         docker = self.config.mode == "docker"
@@ -332,6 +357,15 @@ class SandboxClient:
                     self._active.pop(name, None)
             tail = self._scrub(_tail(output))
 
+        oom = False
+        if self.config.mode == "docker" and not timed_out:
+            # The container is not run with --rm: it is asked why it exited (137 is SIGKILL, which
+            # the memory limit sends), then removed.
+            try:
+                oom = code == 137 and self._oom_killed(name)
+            finally:
+                self._command_quietly(["docker", "rm", "-f", name])
+
         if timed_out:
             where = (
                 f"the container {name} was killed"
@@ -341,6 +375,14 @@ class SandboxClient:
             return protocol.failure(
                 f"{op} timed out after {timeout_s:g} s; {where}\n{tail}".rstrip(),
                 data={"timed_out": True},
+            )
+        if oom:
+            # The agent's case was too big for the limit: its failed attempt, not an internal
+            # error (the tools raise ``AgentInputError`` for a failed response that is not).
+            return protocol.failure(
+                f"the executor ran out of memory (limit {self.config.memory}); "
+                "reduce the problem size",
+                data={"oom_killed": True},
             )
         if code != 0:  # the executor exits 0 whenever it wrote a response: ignore any file
             return protocol.failure(

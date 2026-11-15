@@ -1,6 +1,8 @@
 """The ``docker run`` command line of one executor container.
 
-One container per call: ``docker run --rm``, no network, no capabilities, no privilege gain, a
+One container per call: ``docker run`` (without ``--rm``: the client removes the container itself,
+after asking Docker whether the kernel killed it for lack of memory, which a removed container
+cannot answer), no network, no capabilities, no privilege gain, a
 read-only root file system with a small non-executable ``/tmp``, bounded memory, CPUs and
 processes, the host user's uid, no swap, no core dumps, an init process, no image pull, and
 exactly one bind mount: the run directory at ``/job``. No environment variable is passed
@@ -55,7 +57,6 @@ def build_argv(
     return [
         "docker",
         "run",
-        "--rm",
         "--name",
         name,
         "--network",

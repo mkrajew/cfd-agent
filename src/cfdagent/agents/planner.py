@@ -86,6 +86,61 @@ def task_identifiers(task_text: str) -> list[str]:
     return found
 
 
+# A number as a task writes it: 100, 2.5, 1e5, 2.5e4 or with thousands separators (1,000).
+_NUMBER = r"(?:\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+# What may not follow the number: more of a number, a group of thousands set off by a space
+# ("10 000"), a unit or a percent sign ("300 K", "5 %"), a unit-like word or a power of ten ("1
+# million", "1 x 10^5"). Such a number is not the plain value it looks like, so it is not taken.
+_NOT_FOLLOWED_BY = (
+    r"(?![\d.]*\d)(?![ \u00a0\u202f]\d{3}(?!\d))"
+    r"(?!\s*(?:million|billion|thousand|k\b|[x×*]\s*10|\^|°|%|times\b"
+    r"|[KCF]\b|c?m\b|mm\b|km\b|m/s\b|s\b|inch(?:es)?\b|ft\b|feet\b|meters?\b))"
+    r"(?![A-Za-z])"
+)
+_SEPARATOR = r"\s*(?:,|;|-|–|—|\bto\b|\band\b|\bor\b)\s*"
+# The label of the value: "Reynolds number" or "Re" and the few words that may stand before the
+# value, or "Reynolds number based on <words without numbers> is". An approximate statement
+# ("about", "≈") is deliberately not a label: a rounded value cannot be held to 0.1 %.
+_REYNOLDS_LABEL = (
+    r"(?:\b[Rr]eynolds[ \t]+numbers?[ \t]+based[ \t]+on"
+    r"(?:(?!\bis\b|\bequals?\b)[^\d.,;:()=\n]){1,120}?"
+    r"(?:\bis\b|\bequals?\b)[ \t]*"
+    r"|(?:\b[Rr]eynolds[ \t]+numbers?(?:[ \t]*\(Re\))?|\bRe\b)"
+    r"(?:[ \t]*(?:=|:)|[ \t]+(?:(?:of|is|are|equals?|from|between|set[ \t]+to)\b[ \t]*)*)"
+    r"[ \t]*)"
+)
+# What follows a list that ended early: a separator and one more number (which a guard refused).
+_CUT_OFF = re.compile(rf"{_SEPARATOR}{_NUMBER}")
+_STATED_REYNOLDS = re.compile(
+    rf"{_REYNOLDS_LABEL}(?P<list>{_NUMBER}{_NOT_FOLLOWED_BY}"
+    rf"(?:{_SEPARATOR}{_NUMBER}{_NOT_FOLLOWED_BY})*)"
+)
+
+
+def stated_reynolds(task_text: str) -> list[float]:
+    """The distinct values the task states as its Reynolds number, in order of appearance.
+
+    Recognised: "Re = 100", "Re 100", "Re: 100", "Reynolds number of 100", "Reynolds number is
+    1,000", "Reynolds number (Re) of 40", "Reynolds number based on the <length> and the
+    <speed> is 500". A list or range right after the label ("Re = 100, 400 and 1000", "from 100
+    to 400") gives every value in it. Not taken: an approximate value ("about", "≈"), a number
+    that is not a plain value ("1 million", "1 x 10^5", "10 000") and a number farther from the
+    label than the words above. Such a miss means the check is skipped; but a value that a
+    sentence gives after the first one in another form ("Re = 100 for the first case and 400 for
+    the second") is not seen, so the check treats the task as stating one value.
+    A list cut off by a number that is not taken ("from 1000 to 10 000") gives no values at all.
+    """
+    found: list[float] = []
+    for match in _STATED_REYNOLDS.finditer(task_text):
+        if _CUT_OFF.match(task_text, match.end()):
+            return []  # the list goes on with a number not taken: its values are unknown
+        for text in re.findall(_NUMBER, match.group("list")):
+            value = float(text.replace(",", ""))
+            if math.isfinite(value) and value not in found:
+                found.append(value)
+    return found
+
+
 def _num(value: float) -> str:
     return f"{value:.6g}"
 
@@ -142,6 +197,33 @@ def _reynolds_errors(spec: CaseSpec) -> list[str]:
             f"fluid.kinematic_viscosity_m2_s = {_num(expected)}; they must agree within "
             "0.1 %. Recompute the value the task does not fix with the calculator, keep "
             "every value the task states, and record the choice in assumptions"
+        ]
+    return []
+
+
+def _stated_reynolds_errors(spec: CaseSpec, task_text: str) -> list[str]:
+    """The CaseSpec must carry the Reynolds number the task states.
+
+    Checked only when the task states exactly one value (more than one: the task compares or
+    sweeps, and which one the spec holds is the Critic's question; none: nothing to compare).
+    """
+    stated = stated_reynolds(task_text)
+    if len(stated) != 1:
+        return []
+    (value,) = stated
+    given = spec.reference.reynolds_number
+    if given is None:
+        return [
+            f"the task states a Reynolds number of {_num(value)}, but reference.reynolds_number "
+            f"is null; set it to {_num(value)} and choose the reference velocity, length and "
+            "fluid viscosity so that velocity * length / viscosity gives that value"
+        ]
+    if not (math.isfinite(given) and abs(given - value) <= REYNOLDS_TOLERANCE * value):
+        return [
+            f"the task states a Reynolds number of {_num(value)}, but reference.reynolds_number "
+            f"is {_num(given)}; use the value of the task (within 0.1 %) and choose the "
+            "reference velocity, length and fluid viscosity so that velocity * length / "
+            "viscosity gives it, recording any choice in assumptions"
         ]
     return []
 
@@ -328,6 +410,7 @@ def plan_gate(spec: CaseSpec, task_text: str, limits: RunLimits) -> GateResult:
             )
     errors += _property_errors(spec)
     errors += _reynolds_errors(spec)
+    errors += _stated_reynolds_errors(spec, task_text)
     errors += _geometry_errors(spec)
     errors += _boundary_errors(spec)
     errors += _solver_errors(spec)

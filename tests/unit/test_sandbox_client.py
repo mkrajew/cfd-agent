@@ -70,9 +70,10 @@ class FakeProcess:
 class FakeRunner:
     """Records every process the client starts; plays the executor when the run is normal."""
 
-    def __init__(self, behaviour="normal", exit_code=0, response=None, stderr=b""):
+    def __init__(self, behaviour="normal", exit_code=0, response=None, stderr=b"", oom=False):
         self.behaviour, self.exit_code = behaviour, exit_code
         self.response, self.stderr = response, stderr
+        self.oom = oom  # what ``docker inspect`` says about State.OOMKilled
         self.popen_calls: list[list[str]] = []
         self.run_calls: list[list[str]] = []
         self.container_killed = False
@@ -92,6 +93,8 @@ class FakeRunner:
         self.run_calls.append(list(argv))
         if argv[:2] == ["docker", "kill"]:
             self.container_killed = True
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, b"true\n" if self.oom else b"false\n", b"")
         return subprocess.CompletedProcess(argv, 0, b"", b"")
 
     def on_exit(self, proc):
@@ -124,7 +127,8 @@ def test_client_runs_docker_with_a_unique_named_container_per_call(tmp_path):
     names = [_value_after(argv, "--name") for argv in runner.popen_calls]
     assert names == [f"cfd-{RUN_ID}-1", f"cfd-{RUN_ID}-2"]
     argv = runner.popen_calls[0]
-    assert argv[:3] == ["docker", "run", "--rm"]
+    # No --rm: the container must still exist when the client asks Docker why it exited (OOM).
+    assert argv[:2] == ["docker", "run"] and "--rm" not in argv
     command = argv[argv.index("cfdagent:test") + 1 :]
     assert command[:5] == ["python", "-P", "-m", "cfdagent.executor", "run_solver"]
     request_rel = argv[-1]
@@ -186,6 +190,52 @@ def test_missing_response_is_a_failed_response_with_the_stderr_tail(tmp_path):
     response = client.call("run_solver", SOLVE_ARGS, timeout_s=30)
     assert response.ok is False and response.internal is True
     assert "137" in response.error and "OOM killed marker" in response.error
+
+
+def test_oom_kill_is_an_agent_input_error(tmp_path):
+    """Exit 137 with OOMKilled is the agent's problem (the case was too big), not an internal one:
+    the tools turn a failed, non-internal response into an ``AgentInputError``."""
+    runner = FakeRunner(exit_code=137, oom=True, stderr=b"some solver output\n")
+    client, _ = _client(tmp_path, runner, memory="3g")
+    response = client.call("run_solver", SOLVE_ARGS, timeout_s=30)
+    assert response.ok is False and response.internal is False
+    assert response.error == ("the executor ran out of memory (limit 3g); reduce the problem size")
+    name = f"cfd-{RUN_ID}-1"
+    inspect = [c for c in runner.run_calls if c[:2] == ["docker", "inspect"]]
+    assert len(inspect) == 1 and name in inspect[0] and "{{.State.OOMKilled}}" in inspect[0]
+    # The inspect comes before the removal of the container.
+    assert runner.run_calls.index(inspect[0]) < runner.run_calls.index(["docker", "rm", "-f", name])
+
+
+def test_exit_137_without_oom_is_still_an_internal_failure(tmp_path):
+    runner = FakeRunner(exit_code=137, oom=False, stderr=b"killed from outside\n")
+    client, _ = _client(tmp_path, runner)
+    response = client.call("run_solver", SOLVE_ARGS, timeout_s=30)
+    assert response.ok is False and response.internal is True
+    assert "137" in response.error and "killed from outside" in response.error
+
+
+def test_other_exit_codes_do_not_ask_docker_about_oom(tmp_path):
+    runner = FakeRunner(exit_code=1, oom=True)
+    client, _ = _client(tmp_path, runner)
+    response = client.call("run_solver", SOLVE_ARGS, timeout_s=30)
+    assert response.internal is True
+    assert not [c for c in runner.run_calls if c[:2] == ["docker", "inspect"]]
+
+
+def test_an_unreadable_inspect_answer_means_not_oom(tmp_path):
+    runner = FakeRunner(exit_code=137, oom=False)
+    runner.run = lambda argv, **kwargs: (_ for _ in ()).throw(OSError("docker is gone"))
+    client, _ = _client(tmp_path, runner)
+    response = client.call("run_solver", SOLVE_ARGS, timeout_s=30)
+    assert response.internal is True
+
+
+def test_the_container_is_removed_after_every_docker_call(tmp_path):
+    runner = FakeRunner(response=OpResponse(ok=True))
+    client, _ = _client(tmp_path, runner)
+    client.call("run_solver", SOLVE_ARGS, timeout_s=30)
+    assert runner.run_calls == [["docker", "rm", "-f", f"cfd-{RUN_ID}-1"]]
 
 
 def test_stderr_tail_is_capped_by_bytes(tmp_path):
