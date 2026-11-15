@@ -10,7 +10,7 @@ import pytest
 from test_casespec import SPEC, make_spec
 
 from cfdagent.agents.casespec import CaseSpec
-from cfdagent.agents.planner import plan_gate, run_planner
+from cfdagent.agents.planner import plan_gate, run_planner, stated_reynolds
 from cfdagent.agents.routing import RouteRequest
 from cfdagent.agents.stage import StageContext
 from cfdagent.agents.transcript import TRANSCRIPT_FILE, TranscriptWriter
@@ -138,6 +138,122 @@ def test_planner_gate_checks_reynolds_consistency():
     assert "100" in result.errors[0]
     close = make_spec(reference={"length_m": 1.0, "velocity_m_s": 1.0, "reynolds_number": 100.05})
     assert plan_gate(close, TASK, LIMITS).ok  # 0.05 % is inside the 0.1 % tolerance
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Run at Re = 100.", [100.0]),
+        ("Run at Re=100 and report the profile.", [100.0]),
+        ("Run at Re 100.", [100.0]),
+        ("Use Re: 250 for this case.", [250.0]),
+        ("Run at a Reynolds number of 100.", [100.0]),
+        ("The Reynolds number is 1,000.", [1000.0]),
+        ("The Reynolds number is 1000.", [1000.0]),
+        ("The Reynolds number equals 2.5e4 here.", [25000.0]),
+        ("reynolds number (Re) of 40", [40.0]),
+        ("The Reynolds number is 100; that is, Re = 100.", [100.0]),  # the same value twice
+        ("Compare Re = 100 and Re = 1000.", [100.0, 1000.0]),
+        ("Run Re = 100, 400 and 1000.", [100.0, 400.0, 1000.0]),  # a list of values
+        ("Sweep the Reynolds number from 100 to 400.", [100.0, 400.0]),
+        ("Run Re = 100-400.", [100.0, 400.0]),
+        ("The Reynolds number is based on the lid speed of 1 m/s.", []),
+        ("The Reynolds number is large, about 1 million.", []),
+        ("The Reynolds number is 1 x 10^5.", []),  # not a plain number: no value, no check
+        ("Resolve the boundary layer. Number of cells: 100.", []),
+        ("There is no flow parameter here.", []),
+        # Space-separated thousands are not a plain number: no value, no check.
+        ("Re = 10 000.", []),
+        ("Re = 10\u202f000.", []),
+        ("Re = 10\u00a0000.", []),
+        # An approximate statement is not an exact value: no check.
+        ("Re ≈ 3300.", []),
+        ("Re ~ 3300.", []),
+        ("The Reynolds number is about 3000.", []),
+        # A condition that follows the words "Reynolds number at" is not the value.
+        ("The Reynolds number at 300 K is 5000.", []),
+        ("The Reynolds number at 20 C is 1e5.", []),
+        ("Run at Re = 100 %.", []),
+        # The usual wording with the convention of the Reynolds number in between.
+        ("The Reynolds number based on the diameter and the mean speed is 500.", [500.0]),
+        ("The Reynolds number based on the body length equals 2,000.", [2000.0]),
+        ("The Reynolds number based on the diameter of 0.1 m is large.", []),
+        ("The Reynolds number based on the diameter, which is 0.1 m, is 40.", []),
+        # A definition of the scales (U = 1, L = 1) is not the value.
+        ("The Reynolds number based on U = 1 and L = 1 is 100.", []),
+        ("The Reynolds number based on the side length L = 1 is 100.", []),
+        ("Reynolds number based on D = 1 equals 20", []),
+        ("Re = 1e999.", []),
+        # The label ends at the first "is": a later "is <number>" is another statement.
+        ("The Reynolds number based on the width is low and the cell count is 2000.", []),
+        ("The Reynolds number based on the width is low and the mesh is 200 cells wide.", []),
+        ("The Reynolds number based on the width is 100 and the grid is 50 by 50.", [100.0]),
+        # A list cut off by a number that is not taken: which values it holds is unknown.
+        ("Sweep the Reynolds number from 1000 to 10 000.", []),
+        ("Re = 100, 10 000.", []),
+        ("Re = 100 to 2 million.", []),
+        ("Re = 100 to 1 x 10^6.", []),
+        ("Re = 1000 and 5 %.", []),
+        ("The Reynolds number based on the diameter is 100 times the critical value.", []),
+    ],
+)
+def test_stated_reynolds_patterns(text, expected):
+    assert sorted(stated_reynolds(text)) == expected
+
+
+def test_stated_reynolds_has_no_false_positive_on_words_that_start_with_re():
+    assert stated_reynolds("Rerun 100 times. Report 5 results. Read 200 lines.") == []
+
+
+def test_plan_gate_ignores_scales_that_define_the_reynolds_number():
+    task = f"{TASK} The Reynolds number based on U = 1 and L = 1 is 100."
+    assert plan_gate(make_spec(), task, LIMITS).ok
+
+
+def test_plan_gate_rejects_spec_reynolds_different_from_task():
+    task = f"{TASK} The Reynolds number is 1000."
+    result = plan_gate(make_spec(), task, LIMITS)  # the spec says 100
+    assert not result.ok
+    assert len(result.errors) == 1
+    assert "reynolds" in result.errors[0].lower()
+    assert "1000" in result.errors[0] and "100" in result.errors[0]
+    # Within 0.1 % of the stated value the spec is accepted.
+    close = make_spec(
+        fluid={"density_kg_m3": 1.0, "kinematic_viscosity_m2_s": 0.001},
+        reference={"length_m": 1.0, "velocity_m_s": 1.0, "reynolds_number": 1000.5},
+    )
+    assert plan_gate(close, task, LIMITS).ok
+    off = make_spec(
+        fluid={"density_kg_m3": 1.0, "kinematic_viscosity_m2_s": 0.001},
+        reference={"length_m": 1.0, "velocity_m_s": 1.0, "reynolds_number": 1002.0},
+    )
+    assert not plan_gate(off, task, LIMITS).ok
+
+
+def test_plan_gate_accepts_spec_reynolds_equal_to_the_task():
+    assert plan_gate(make_spec(), f"{TASK} Use Re = 100.", LIMITS).ok
+    assert plan_gate(make_spec(), f"{TASK} The Reynolds number is 1e2.", LIMITS).ok
+
+
+def test_plan_gate_rejects_a_spec_without_the_reynolds_number_the_task_states():
+    spec = make_spec(reference={"length_m": 1.0, "velocity_m_s": 1.0, "reynolds_number": None})
+    result = plan_gate(spec, f"{TASK} Use Re = 100.", LIMITS)
+    assert not result.ok
+    assert "reynolds" in result.errors[0].lower() and "null" in result.errors[0]
+
+
+def test_plan_gate_skips_when_task_states_several_values():
+    task = f"{TASK} Compare Re = 100 and Re = 1000."
+    spec = make_spec(
+        fluid={"density_kg_m3": 1.0, "kinematic_viscosity_m2_s": 0.002},
+        reference={"length_m": 1.0, "velocity_m_s": 1.0, "reynolds_number": 500.0},
+    )
+    assert plan_gate(spec, task, LIMITS).ok
+
+
+def test_plan_gate_skips_when_task_states_no_value():
+    spec = make_spec(reference={"length_m": 1.0, "velocity_m_s": 5.0, "reynolds_number": 500.0})
+    assert plan_gate(spec, TASK, LIMITS).ok  # 5 * 1 / 0.01 = 500, and the task states nothing
 
 
 def test_planner_gate_skips_reynolds_check_when_not_given():

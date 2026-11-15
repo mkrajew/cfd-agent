@@ -98,7 +98,9 @@ def test_config_forbids_unknown_fields():
 
 def test_build_argv_has_every_hardening_flag():
     argv = _argv()
-    assert argv[:3] == ["docker", "run", "--rm"]
+    # No --rm: the client removes the container itself, after asking Docker whether the kernel
+    # killed it for lack of memory (a removed container cannot be inspected).
+    assert argv[:2] == ["docker", "run"] and "--rm" not in argv
     assert _value_after(argv, "--name") == "cfd-demo-1"
     assert _value_after(argv, "--network") == "none"
     assert _value_after(argv, "--cap-drop") == "ALL"

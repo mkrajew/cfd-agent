@@ -873,6 +873,45 @@ def test_gate_raising_agent_input_error_is_a_failed_attempt(tmp_path):
     assert attempts[0].errors == ["the script is broken"]
 
 
+class SandboxStage(ToyStage):
+    """A stage whose gate calls the sandbox the way the real stages do: an internal failure is a
+    ``ToolFailure``, any other failed response is the agent's ``AgentInputError``."""
+
+    def __init__(self, sandbox, results):
+        super().__init__([])
+        self.sandbox, self.results = sandbox, list(results)
+
+    def execute_and_gate(self, ctx, attempt_dir) -> GateResult:
+        if self.results.pop(0) == "oom":
+            args = {"case_dir": "case", "solver": "icoFoam"}
+            response = self.sandbox.call("run_solver", args, 30)
+            if response.internal:
+                raise ToolFailure(response.error)
+            if not response.ok:
+                raise AgentInputError(response.error)
+        return GateResult(True, [])
+
+
+def test_oom_costs_one_attempt_not_the_run(tmp_path):
+    from test_sandbox_client import FakeRunner, _client
+
+    runner = FakeRunner(exit_code=137, oom=True)
+    (tmp_path / "sandbox").mkdir()
+    sandbox, _ = _client(tmp_path / "sandbox", runner, memory="2g")
+    steps = [reply(None, check("k1")), reply(None, check("k2"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    outcome = run_stage(SandboxStage(sandbox, ["oom", "fine"]), ctx)  # no ToolFailure escapes
+    assert outcome.ok and outcome.attempts == 2
+    attempts = ctx.record.stages[0].attempts
+    assert [(a.n, a.ok) for a in attempts] == [(1, False), (2, True)]
+    assert attempts[0].errors == [
+        "the executor ran out of memory (limit 2g); reduce the problem size"
+    ]
+    (result,) = tool_messages(1, backend)
+    assert "ran out of memory" in result["content"]
+    assert "reduce the problem size" in result["content"]
+
+
 def test_gate_raising_agent_input_error_on_the_orchestrator_path(tmp_path):
     steps = [reply("done"), reply(None, check())]
     ctx, backend = make_ctx(tmp_path, steps)
