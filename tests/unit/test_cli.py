@@ -1306,3 +1306,35 @@ def test_the_real_registry_wiring_keeps_a_broken_generality_set_out_of_developme
     unknown = invoke(runner, "run", "--benchmark", "nope")
     assert unknown.exit_code == 2 and "secret-marker" not in unknown.output
     assert "gen-bad" not in unknown.output
+
+
+def test_a_task_file_under_the_generality_directory_is_refused_too(
+    runner, root, fake_run_task, generality_benchmarks
+):
+    # The same text given by path must not start a run either (design 9.1).
+    path = generality_benchmarks / "generality" / "gen-one" / "task.md"
+    refused = invoke(runner, "run", str(path))
+    assert refused.exit_code == 2
+    assert "--allow-generality" in refused.output and "generality" in refused.output
+    assert fake_run_task.calls == []
+    detached = invoke(runner, "run", str(path), "--detach")
+    assert detached.exit_code == 2
+    allowed = invoke(runner, "run", str(path), "--allow-generality")
+    assert allowed.exit_code == 0, allowed.output
+    # A task file anywhere else is unaffected.
+    other = generality_benchmarks / "bench-one" / "task.md"
+    assert invoke(runner, "run", str(other)).exit_code == 0
+
+
+def test_a_relative_and_a_dotdot_path_into_the_generality_directory_are_refused(
+    runner, root, fake_run_task, generality_benchmarks, monkeypatch
+):
+    monkeypatch.chdir(generality_benchmarks.parent)
+    for text in (
+        "benchmarks/generality/gen-one/task.md",
+        "benchmarks/bench-one/../generality/gen-one/task.md",
+        "./benchmarks/GENERALITY/gen-one/task.md",
+    ):
+        result = invoke(runner, "run", text)
+        assert result.exit_code == 2, (text, result.output)
+    assert fake_run_task.calls == []

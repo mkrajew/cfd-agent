@@ -414,6 +414,19 @@ def _registry(include_generality: bool = False) -> dict:
     return load_registry(include_generality=include_generality)
 
 
+def _in_generality_directory(path: Path) -> bool:
+    """True if ``path`` (links and ``..`` resolved) lies under a ``benchmarks/generality``
+    directory: the text of a generality task must not start a run by path either (design 9.1).
+    Compared without regard to case, because the file systems of the laptops are insensitive."""
+    try:
+        parts = [part.casefold() for part in path.resolve().parts]
+    except (OSError, RuntimeError):
+        return False  # unreadable anyway; _read_task_file reports it
+    return any(
+        a == "benchmarks" and b == "generality" for a, b in zip(parts, parts[1:], strict=False)
+    )
+
+
 def _read_task_file(path: Path) -> str:
     try:
         with open(path, "rb") as handle:
@@ -611,6 +624,11 @@ def run(
 
     task_set: Literal["development", "generality"] = "development"
     if task_file is not None:
+        if _in_generality_directory(task_file) and not allow_generality:
+            _usage_error(
+                "a task file under benchmarks/generality runs only in the frozen M3 campaign "
+                "(--allow-generality)"
+            )
         task = _read_task_file(task_file)
     else:
         task, task_set = _benchmark_task(str(benchmark), allow_generality)
