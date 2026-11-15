@@ -302,13 +302,21 @@ class RunDir:
 
     # ------------------------------------------------------------------ attempts
 
-    def attempt_dir(self, stage: str, attempt: int) -> Path:
-        """A fresh, empty ``attempts/<stage>-<attempt>/``; an older one of that name is deleted."""
+    def attempt_dir(self, stage: str, attempt: int, pass_no: int = 0) -> Path:
+        """A fresh, empty attempt directory; an older one of that name is deleted.
+
+        ``attempts/<stage>-<attempt>/`` in pass 0 (the layout of M1) and
+        ``attempts/<stage>-p<pass_no>-<attempt>/`` in a later pass (a route back, ADR-0006). The
+        names differ, so preparing a directory never deletes one of another pass.
+        """
         if not isinstance(stage, str) or not _STAGE.fullmatch(stage):
             raise UnsafePath(f"stage name {stage!r} must be 1-40 letters, digits or underscores")
         if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
             raise UnsafePath(f"attempt must be an integer of at least 1, got {attempt!r}")
-        rel = f"attempts/{stage}-{attempt}"
+        if isinstance(pass_no, bool) or not isinstance(pass_no, int) or pass_no < 0:
+            raise UnsafePath(f"pass_no must be an integer of at least 0, got {pass_no!r}")
+        label = f"{stage}-{attempt}" if pass_no == 0 else f"{stage}-p{pass_no}-{attempt}"
+        rel = f"attempts/{label}"
         path = self.path(rel)  # refuses a link, also as the last component: nothing is deleted
         try:
             if path.is_dir():

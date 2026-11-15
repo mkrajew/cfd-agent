@@ -10,10 +10,17 @@
    only at the file's modification time, which the heartbeat refreshes; the content is the process
    id). A state directory that cannot be written is a warning in ``run.log``, not an error.
 3. Run the pipeline steps in order: Planner, Geometry, Mesh, Case Setup, Solver Runner, Analyst.
-   A pipeline is a list of step factories, so a later milestone can insert the Critic and the fix
-   loops. The first step that fails ends the run ``failed`` with ``failed_stage`` and
-   ``failure_reason``; a Planner reason that starts with ``exceeds resources:`` is such a normal
-   result. Limits end the run ``failed`` and name the limit (cost, wall clock, disk).
+   A pipeline is a list of step factories, so a later milestone can insert the Critic. A failed
+   step ends the run ``failed`` with ``failed_stage`` and ``failure_reason``, unless its outcome
+   carries a route (ADR-0006): a request to run an earlier stage again. Then, while the run-wide
+   budget of fix loops (``limits.max_fix_loops``) lasts, the outputs of the stages after the target
+   move to ``superseded/pass-<n>/``, the target gets the request in its opening message (and, in
+   repair mode ``in_place``, starts from its own accepted files) and every later stage runs again,
+   in a numbered pass (``ctx.pass_no``, recorded in each ``StageRecord`` and in every transcript
+   line, and part of the attempt directory names). A route with no budget left ends the run
+   ``failed`` ("fix-loop limit of <n> reached"). A Planner reason that starts with
+   ``exceeds resources:`` is a normal failure result. Limits end the run ``failed`` and name the
+   limit (cost, wall clock, disk).
    ``KeyboardInterrupt`` and SIGTERM end it ``interrupted``; ToolFailure and every other
    uncaught exception end it ``failed`` with ``internal_error`` (the executor dying is the
    platform's problem and never a retryable gate failure).
@@ -71,9 +78,10 @@ from cfdagent.agents.analyst import (
 from cfdagent.agents.case_setup import CaseSetupStage
 from cfdagent.agents.casespec import CaseSpec
 from cfdagent.agents.geometry import GeometryStage
-from cfdagent.agents.loop import StageOutcome, internal, run_stage
+from cfdagent.agents.loop import SeededAttempt, StageOutcome, internal, run_stage
 from cfdagent.agents.mesh import MeshStage
 from cfdagent.agents.planner import CASESPEC_FILE, run_planner
+from cfdagent.agents.routing import RouteRequest, move_downstream_aside
 from cfdagent.agents.solver_runner import SolverRunnerStage
 from cfdagent.agents.stage import Stage, StageContext
 from cfdagent.agents.transcript import TranscriptWriter
@@ -84,7 +92,7 @@ from cfdagent.llm.client import ChatBackend, LLMClient
 from cfdagent.llm.cost import PRICING, CostLimitExceeded, CostTracker, Pricing
 from cfdagent.prompts import load_prompt
 from cfdagent.quantities import validate_quantities
-from cfdagent.record import RunRecord, redact, write_record, write_summary
+from cfdagent.record import FixLoopRecord, RunRecord, redact, write_record, write_summary
 from cfdagent.rundir import RunDir, RunDirError
 from cfdagent.sandbox.client import SandboxClient
 from cfdagent.storage.blob import UploadReport, upload_run
@@ -129,6 +137,13 @@ class Step(ABC):
         """Knowledge-base paths the step's agent asked to read (for the run record)."""
         return []
 
+    def seed_from_canonical(self, ctx: StageContext) -> None:
+        """Called by the orchestrator, in repair mode ``in_place`` only, on the step that a route
+        back is aimed at: after ``ctx.pass_no`` and ``ctx.fix_request`` are set and before the
+        later stages' outputs move aside, so the step can read its own canonical files. The
+        default does nothing."""
+        return None
+
 
 class PlannerStep(Step):
     """The Planner is a function, not a ``Stage``; this wraps it so the list is uniform."""
@@ -150,9 +165,19 @@ class GatedStep(Step):
     def __init__(self, stage: Stage) -> None:
         self.stage = stage
         self.name = stage.name
+        self._seeded: SeededAttempt | None = None
+
+    def seed_from_canonical(self, ctx: StageContext) -> None:
+        """Make attempt 1 of the pass and put the stage's earlier files into it; ``run`` hands the
+        directory to the loop."""
+        with internal("seeding the attempt directory"):
+            attempt_dir = ctx.run.attempt_dir(self.stage.name, 1, ctx.pass_no)
+            carried = self.stage.seed_from_canonical(ctx, attempt_dir)
+        self._seeded = SeededAttempt(attempt_dir, carried)
 
     def run(self, ctx: StageContext, task_text: str) -> StageOutcome:
-        return run_stage(self.stage, ctx)
+        seeded, self._seeded = self._seeded, None
+        return run_stage(self.stage, ctx, seeded=seeded)
 
     def knowledge_reads(self) -> list[str]:
         return list(getattr(self.stage, "knowledge_reads", []))
@@ -420,7 +445,8 @@ class _Session:
             clock=clock,
             on_progress=self._on_progress,
         )
-        self.steps: list[Step] = []
+        self.steps: list[Step] = []  # every step made, in the order it ran (a stage can run twice)
+        self.latest: list[Step | None] = [None] * len(pipeline)  # the newest step of each entry
         self.current: str | None = None
         # Pessimistic until the pipeline and the Scorer have returned normally: an exit that is
         # neither an interrupt nor an Exception (SystemExit and the like) never reads "completed".
@@ -556,11 +582,85 @@ class _Session:
         self.status, self.failed_stage, self.reason = status, stage, reason
         self._failure_set = True
 
+    def _make_step(self, index: int) -> Step:
+        step = self.pipeline[index]()
+        self.steps.append(step)
+        self.latest[index] = step
+        return step
+
+    def _label(self, name: str) -> str:
+        """``name`` for the first pass, ``name (pass n)`` in a later one, for ``run.log``."""
+        return name if self.ctx.pass_no == 0 else f"{name} (pass {self.ctx.pass_no})"
+
+    def _route_target(self, index: int, route: RouteRequest) -> int | None:
+        """The pipeline entry before ``index`` whose step is the route's target, if there is one."""
+        for earlier in range(index):
+            step = self.latest[earlier]
+            if step is not None and step.name == route.target:
+                return earlier
+        return None
+
+    def _follow_route(
+        self, index: int, name: str, outcome: StageOutcome
+    ) -> tuple[int, Step] | None:
+        """Start the pass a failed step asked for (ADR-0006) and return the pipeline entry and the
+        new step to run, or ``None`` when the run ends here (``self.fail`` has said why).
+
+        In repair mode ``in_place`` the target is seeded first, while its own canonical files are
+        still in place; then the outputs of every stage after it move aside, so that nothing of the
+        pass that is being replaced can be read, and the pass is recorded.
+        """
+        route = outcome.route
+        assert route is not None
+        limit = self.config.limits.max_fix_loops
+        reason = outcome.reason or f"stage {name!r} failed without giving a reason"
+        if len(self.record.fix_loops) >= limit:
+            self.log(f"stage {self._label(name)}: failed, fix-loop budget used up")
+            self.fail(name, f"fix-loop limit of {limit} reached: {reason}")
+            return None
+        target_index = self._route_target(index, route)
+        if target_index is None:
+            self.fail(
+                name,
+                f"internal_error: stage {name!r} asked for a fix in {route.target!r}, which is "
+                "not an earlier step of this pipeline",
+            )
+            return None
+        number = len(self.record.fix_loops) + 1
+        self.ctx.pass_no, self.ctx.fix_request = number, route
+        step = self._make_step(target_index)
+        if self.config.repair_mode == "in_place":
+            step.seed_from_canonical(self.ctx)
+        moved = move_downstream_aside(self.run, route.target, number)
+        self.record.fix_loops.append(
+            FixLoopRecord(
+                n=number,
+                source=route.source,
+                target=route.target,
+                origin=route.origin,
+                reason=route.reason,
+                moved=moved,
+            )
+        )
+        self.log(
+            f"fix loop {number}: {route.source} -> {route.target} ({route.origin}); "
+            f"{len(moved)} item(s) moved to superseded/pass-{number}/; "
+            f"reason: {redact(route.reason, MAX_LOG_REASON_CHARS)}"
+        )
+        self.save_record()
+        return target_index, step
+
     def run_pipeline(self) -> None:
-        for make in self.pipeline:
-            step = make()
-            self.steps.append(step)
+        """Run the pipeline as an index over its steps. A failed step that carries a route sends
+        the index back to the target and every later step runs again, in a new pass, within the
+        run-wide budget of fix loops (ADR-0006); any other failure ends the run."""
+        index = 0
+        made: Step | None = None  # the target of a route back, already made (and seeded)
+        while index < len(self.pipeline):
+            step = made if made is not None else self._make_step(index)
+            made = None
             name = self.current = step.name
+            label = self._label(name)
             if self.monitor is not None and self.monitor.exceeded:
                 return self.fail(name, f"run directory exceeded {_format_bytes(self.cap)}")
             if self.ctx.remaining_s() <= 0:
@@ -568,25 +668,37 @@ class _Session:
                 return self.fail(
                     name, f"wall-clock limit of {limit:.0f} s reached before stage {name!r}"
                 )
-            self.log(f"stage {name}: start")
+            self.log(f"stage {label}: start")
             self.write_status("running", name)
             outcome = step.run(self.ctx, self.task_text)
+            self.ctx.fix_request = None  # only the target of a route back is told what was asked
             self.save_record()
             for stage_record in self.ctx.record.stages:
-                if stage_record.name == name and stage_record.free_restarts:
+                if (
+                    stage_record.name == name
+                    and stage_record.pass_no == self.ctx.pass_no
+                    and stage_record.free_restarts
+                ):
                     self.log(
-                        f"stage {name}: {stage_record.free_restarts} free restart(s) after "
+                        f"stage {label}: {stage_record.free_restarts} free restart(s) after "
                         "attempts of blank model replies (not counted as attempts)"
                     )
             if self.monitor is not None and self.monitor.exceeded:
-                self.log(f"stage {name}: stopped, the run directory grew beyond its cap")
+                self.log(f"stage {label}: stopped, the run directory grew beyond its cap")
                 return self.fail(name, f"run directory exceeded {_format_bytes(self.cap)}")
             if not outcome.ok:
                 reason = outcome.reason or f"stage {name!r} failed without giving a reason"
-                self.log(f"stage {name}: failed ({redact(reason, MAX_LOG_REASON_CHARS)})")
-                return self.fail(name, reason)
-            self.log(f"stage {name}: ok after {outcome.attempts} attempt(s)")
+                self.log(f"stage {label}: failed ({redact(reason, MAX_LOG_REASON_CHARS)})")
+                if outcome.route is None:
+                    return self.fail(name, reason)
+                routed = self._follow_route(index, name, outcome)
+                if routed is None:
+                    return None
+                index, made = routed
+                continue
+            self.log(f"stage {label}: ok after {outcome.attempts} attempt(s)")
             self.write_status("running", name)
+            index += 1
         self.current = None
 
     # ------------------------------------------------------------------ the Scorer

@@ -235,6 +235,11 @@ class GeometryStage(KnowledgeTools, Stage):
             errors += _gate_errors(check)
         return GateResult(not errors, errors)
 
+    def seed_from_canonical(self, ctx: StageContext, attempt_dir: Path) -> list[str]:
+        """The accepted script of the earlier pass (the step file and the manifest are results of
+        running it and are made again)."""
+        return self._seed(ctx, attempt_dir, {f"{PROMOTED_DIR}/{SCRIPT_NAME}": SCRIPT_NAME})
+
     def promote(self, ctx: StageContext, attempt_dir: Path) -> None:
         ctx.run.promote(attempt_dir, PROMOTED_DIR)
 

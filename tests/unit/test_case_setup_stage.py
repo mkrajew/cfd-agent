@@ -371,6 +371,98 @@ def test_case_setup_in_place_keeps_dictionaries_and_fresh_mesh(tmp_path):
     assert result.ok, result.errors
 
 
+def test_routed_case_setup_gets_mesh_only(tmp_path):
+    """After a route back the run directory's ``case/`` may still hold what a solver run left
+    there (a time directory, logs, post-processing, the old dictionaries): none of it is copied."""
+    setup = Setup(tmp_path)
+    run = setup.ctx.run
+    run.write_text("case/0/U", "an old field file")
+    run.write_text("case/system/controlDict", "an old controlDict")
+    run.write_text("case/constant/transportProperties", "an old property file")
+    run.write_text("case/10/U", "a time directory")
+    run.write_text("case/10/phi", "a time directory")
+    run.write_text("case/log.icoFoam", "solver log")
+    run.write_text("case/postProcessing/forces/0/force.dat", "forces")
+    run.write_text("case/processor0/0/U", "decomposed data")
+    setup.ctx.pass_no = 1
+    attempt = run.attempt_dir("case_setup", 1, 1)
+    setup.stage.prepare_attempt(setup.ctx, attempt)
+    found = sorted(p.relative_to(attempt).as_posix() for p in attempt.rglob("*") if p.is_file())
+    assert found == sorted(f"case/constant/polyMesh/{name}" for name in POLYMESH_FILES)
+    assert (
+        attempt / "case" / "constant" / "polyMesh" / "points"
+    ).read_bytes() == b"points of the mesh\n"
+    assert sorted(p.name for p in (attempt / "case").iterdir()) == ["constant"]
+    assert sorted(p.name for p in (attempt / "case" / "constant").iterdir()) == ["polyMesh"]
+
+
+def test_prepare_attempt_keeps_a_seed_that_is_already_in_the_attempt(tmp_path):
+    """A seeded attempt gets its mesh from ``prepare_attempt`` without losing the dictionaries."""
+    setup = Setup(tmp_path)
+    run = setup.ctx.run
+    for name in ("0/U", "system/controlDict", "constant/transportProperties"):
+        run.write_text(f"case/{name}", f"canonical {name}")
+    setup.ctx.pass_no = 1
+    attempt = run.attempt_dir("case_setup", 1, 1)
+    carried = setup.stage.seed_from_canonical(setup.ctx, attempt)
+    prefix = "attempts/case_setup-p1-1/case"
+    assert carried == [
+        f"{prefix}/0/U",
+        f"{prefix}/constant/transportProperties",
+        f"{prefix}/system/controlDict",
+    ]
+    setup.stage.prepare_attempt(setup.ctx, attempt)
+    assert (attempt / "case" / "0" / "U").read_text(encoding="utf-8") == "canonical 0/U"
+    assert (attempt / "case" / "system" / "controlDict").is_file()
+    polymesh = attempt / "case" / "constant" / "polyMesh"
+    assert sorted(p.name for p in polymesh.iterdir()) == sorted(POLYMESH_FILES)
+
+
+def checked_by_the_real_consistency_check(ctx):
+    """A sandbox whose consistency check is the real one (the other ops are the canned ones)."""
+
+    def consistency(args):
+        result = check_case_consistency(ctx.run.path(args.case_dir), args.solver)
+        data = {"ok": result.ok, "errors": result.errors, "report": result.data}
+        return OpResponse(ok=result.ok, data=data, error="\n".join(result.errors) or None)
+
+    ctx.sandbox.responses["check_case_consistency"] = consistency
+
+
+def test_case_setup_seed_after_mesh_change_is_rechecked(tmp_path):
+    """Dictionaries carried over from the earlier pass are judged against the mesh that is there
+    now: a patch the new mesh has and the seeded field files do not know fails the gate."""
+    setup = Setup(tmp_path)
+    run = setup.ctx.run
+    checked_by_the_real_consistency_check(setup.ctx)
+    for path in sorted(CASE_FIXTURE.rglob("*")):  # the accepted case of the earlier pass
+        if path.is_file():
+            rel = path.relative_to(CASE_FIXTURE).as_posix()
+            run.write_text(f"case/{rel}", path.read_bytes().decode("utf-8"))
+    # the mesh has been built again, with other patch names
+    new_patches = {
+        "lid": ("wall", 64),
+        "fixedWalls": ("wall", 192),
+        "frontAndBack": ("empty", 8192),
+    }
+    run.write_text("case/constant/polyMesh/boundary", boundary_text(new_patches))
+    setup.ctx.pass_no = 1
+    attempt = run.attempt_dir("case_setup", 1, 1)
+    setup.stage.seed_from_canonical(setup.ctx, attempt)
+    setup.stage.prepare_attempt(setup.ctx, attempt)
+    result = setup.stage.execute_and_gate(setup.ctx, attempt)
+    assert not result.ok
+    assert any("lid" in e and "0/U" in e for e in result.errors)
+    assert any("lid" in e and "0/p" in e for e in result.errors)
+    assert "trial_run" not in setup.calls()  # it stopped at the static checks
+    # the same seed on the unchanged mesh passes
+    run.write_text("case/constant/polyMesh/boundary", boundary_text(CAVITY_PATCHES))
+    again = run.attempt_dir("case_setup", 2, 1)
+    setup.stage.seed_from_canonical(setup.ctx, again)
+    setup.stage.prepare_attempt(setup.ctx, again)
+    assert setup.stage.execute_and_gate(setup.ctx, again).ok
+
+
 def test_prepare_attempt_needs_the_mesh_and_a_known_solver(tmp_path):
     setup = Setup(tmp_path, with_mesh=False)
     with pytest.raises(ToolFailure, match="case/constant/polyMesh"):

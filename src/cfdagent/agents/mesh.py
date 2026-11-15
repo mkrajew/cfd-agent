@@ -418,6 +418,11 @@ class MeshStage(KnowledgeTools, Stage):
             errors += self._cell_limit(ctx, spec, check)
         return GateResult(not errors, errors)
 
+    def seed_from_canonical(self, ctx: StageContext, attempt_dir: Path) -> list[str]:
+        """The accepted script of the earlier pass (the mesh and the reports are results of running
+        it and are made again; the geometry comes from ``prepare_attempt``)."""
+        return self._seed(ctx, attempt_dir, {f"{PROMOTED_DIR}/{SCRIPT_NAME}": SCRIPT_NAME})
+
     def promote(self, ctx: StageContext, attempt_dir: Path) -> None:
         """``mesh/``: the attempt (script, mesh, logs); ``case/``: ``constant/polyMesh`` only.
 

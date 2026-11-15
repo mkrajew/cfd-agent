@@ -11,6 +11,7 @@ from test_casespec import SPEC, make_spec
 
 from cfdagent.agents.casespec import CaseSpec
 from cfdagent.agents.planner import plan_gate, run_planner
+from cfdagent.agents.routing import RouteRequest
 from cfdagent.agents.stage import StageContext
 from cfdagent.agents.transcript import TRANSCRIPT_FILE, TranscriptWriter
 from cfdagent.config import RunConfig, RunLimits
@@ -466,6 +467,38 @@ def test_planner_phase_one_uses_calculator_only_and_phase_two_uses_the_schema(tm
     # the identifiers the task names are spelled out for the model
     assert "centreline_u" in third.messages[-1]["content"]
     assert "drag" in third.messages[-1]["content"]
+
+
+def test_planner_receives_fix_request(tmp_path):
+    steps = [reply("A plan."), reply(spec_json())]
+    ctx, backend = make_ctx(tmp_path, steps)
+    ctx.fix_request = RouteRequest(
+        source="critic",
+        target="planner",
+        origin="critic",
+        reason="the Reynolds number of the task was not used",
+        instruction="use the stated value",
+    )
+    ctx.pass_no = 2
+    outcome = run_planner(ctx, TASK)
+    assert outcome.ok
+    opening = backend.calls[0].messages[1]["content"]
+    text = (
+        "Fix requested by critic: the Reynolds number of the task was not used. "
+        "use the stated value"
+    )
+    assert TASK in opening and text in opening
+    assert opening.index(TASK) < opening.index(text)
+    assert ctx.record.stages[-1].pass_no == 2
+    lines = (tmp_path / "run" / TRANSCRIPT_FILE).read_text("utf-8").splitlines()
+    assert {json.loads(line)["pass_no"] for line in lines} == {2}
+
+
+def test_planner_without_a_fix_request_has_the_usual_opening(tmp_path):
+    ctx, backend = make_ctx(tmp_path, [reply("A plan."), reply(spec_json())])
+    assert run_planner(ctx, TASK).ok
+    assert "Fix requested" not in backend.calls[0].messages[1]["content"]
+    assert ctx.record.stages[-1].pass_no == 0
 
 
 def test_planner_records_attempts_cost_and_transcript(tmp_path):

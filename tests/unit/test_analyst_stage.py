@@ -423,6 +423,19 @@ def test_promote_copies_results_and_analysis_and_replaces_older_ones(tmp_path):
     assert not (root / "results" / "case").exists()  # the working copy of the case is not a result
 
 
+def test_promote_keeps_the_post_script_for_a_later_pass(tmp_path):
+    setup = prepared(tmp_path)
+    root = setup.ctx.run.root
+    assert setup.gate().ok
+    setup.stage.promote(setup.ctx, setup.attempt)
+    assert (root / "analyst" / "post.py").read_text(encoding="utf-8") == "print('post')\n"
+    assert sorted(p.name for p in (root / "analyst").iterdir()) == ["post.py"]
+    # a later promotion replaces it
+    (setup.attempt / SCRIPT_NAME).write_text("print('second')\n", encoding="utf-8")
+    setup.stage.promote(setup.ctx, setup.attempt)
+    assert (root / "analyst" / "post.py").read_text(encoding="utf-8") == "print('second')\n"
+
+
 def test_promote_without_a_gated_attempt_is_a_tool_failure(tmp_path):
     setup = prepared(tmp_path, analysis=None)
     with pytest.raises(ToolFailure):

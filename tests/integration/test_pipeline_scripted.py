@@ -14,9 +14,12 @@ from pathlib import Path
 
 import pytest
 
+from cfdagent.agents.loop import StageOutcome
+from cfdagent.agents.routing import RouteRequest
+from cfdagent.agents.solver_runner import SolverRunnerStage
 from cfdagent.config import RunConfig
 from cfdagent.llm.scripted import ScriptedBackend
-from cfdagent.orchestrator import run_task
+from cfdagent.orchestrator import GatedStep, default_pipeline, run_task
 from cfdagent.record import read_record
 from cfdagent.rundir import RunDir
 from cfdagent.sandbox.config import SandboxConfig
@@ -29,6 +32,7 @@ FIXTURE = ROOT / "tests" / "fixtures" / "scripted" / "cavity_pipeline.json"
 BENCHMARK = "cavity-re100"
 PLANNER_STEPS = 3
 GEOMETRY_STEPS = 2
+STAGE_STEPS = 2  # every stage after the Planner is two scripted replies
 STAGES = ["planner", "geometry", "mesh", "case_setup", "solver_runner", "analyst"]
 
 
@@ -51,25 +55,25 @@ def backend_from(steps: list[dict], tmp_path: Path) -> ScriptedBackend:
     return ScriptedBackend.from_json(path)
 
 
-def benchmark_config() -> RunConfig:
+def benchmark_config(**changes) -> RunConfig:
     sandbox = SandboxConfig(mode="local", allow_local=True, image="local-unused")
-    return RunConfig.default().model_copy(
-        update={"sandbox": sandbox, "benchmark_id": BENCHMARK, "task_set": "development"}
-    )
+    update = {"sandbox": sandbox, "benchmark_id": BENCHMARK, "task_set": "development", **changes}
+    return RunConfig.default().model_copy(update=update)
 
 
-def run_scripted(tmp_path: Path, steps: list[dict]):
+def run_scripted(tmp_path: Path, steps: list[dict], *, pipeline=None, **config_changes):
     uploader = FakeUploader()
     backend = backend_from(steps, tmp_path)
     result = run_task(
         "ignored: a benchmark run uses the task file of the benchmark",
-        benchmark_config(),
+        benchmark_config(**config_changes),
         backend=backend,
         run_root=tmp_path / "runs",
         upload=True,
         uploader=uploader,
         state_dir=tmp_path / "state",
         benchmarks_root=ROOT / "benchmarks",
+        pipeline=pipeline,
     )
     return result, backend, uploader
 
@@ -182,3 +186,123 @@ def test_scripted_pipeline_survives_one_bad_geometry_attempt(tmp_path):
     assert [s.name for s in result.record.stages] == STAGES
     assert result.comparison["passed"] is True
     assert len(backend.calls) == len(steps)
+
+
+# ---------------------------------------------------------------------- a fix loop (ADR-0006)
+
+
+class RoutingOnceStep(GatedStep):
+    """A fake gate in the place of the Solver Runner: the first time it asks for a fix in the Case
+    Setup without running anything (no model call); from then on it is the real stage."""
+
+    def __init__(self, stage, state):
+        super().__init__(stage)
+        self.state = state
+
+    def run(self, ctx, task_text):
+        if self.state["routed"]:
+            return super().run(ctx, task_text)
+        self.state["routed"] = True
+        request = RouteRequest(
+            source="solver_runner",
+            target="case_setup",
+            origin="gate",
+            reason="the run did not reach a steady state",
+            instruction="use a smaller time step",
+        )
+        return StageOutcome(
+            ok=False, attempts=0, reason="the fake gate asked for a fix", route=request
+        )
+
+
+def routing_once_pipeline():
+    state = {"routed": False}
+    pipeline = default_pipeline()
+    pipeline[4] = lambda: RoutingOnceStep(SolverRunnerStage(), state)
+    return pipeline
+
+
+def in_pass_one(steps: list[dict], stage: str) -> list[dict]:
+    """The recorded conversation of a stage, writing into the attempt directories of pass 1."""
+    text = json.dumps(steps).replace(f"attempts/{stage}-1", f"attempts/{stage}-p1-1")
+    return json.loads(text)
+
+
+def steps_with_one_fix_loop(steps: list[dict]) -> list[dict]:
+    """Planner, Geometry, Mesh and Case Setup, then (after the fake gate's route back) the Case
+    Setup again, the Solver Runner and the Analyst, all in pass 1."""
+    stages = [
+        steps[PLANNER_STEPS + i * STAGE_STEPS : PLANNER_STEPS + (i + 1) * STAGE_STEPS]
+        for i in range(5)
+    ]
+    geometry, mesh, case_setup, solver, analyst = stages
+    return (
+        steps[:PLANNER_STEPS]
+        + geometry
+        + mesh
+        + case_setup
+        + in_pass_one(case_setup, "case_setup")
+        + solver
+        + in_pass_one(analyst, "analyst")
+    )
+
+
+@pytest.mark.parametrize("repair_mode", ["fresh", "in_place"])
+def test_scripted_pipeline_recovers_through_route_to_case_setup(tmp_path, repair_mode):
+    steps = steps_with_one_fix_loop(fixture_steps())
+    result, backend, _ = run_scripted(
+        tmp_path, steps, pipeline=routing_once_pipeline(), repair_mode=repair_mode
+    )
+    assert result.status == "completed", result.record.failure_reason
+    assert len(backend.calls) == len(steps)  # every scripted reply was used
+    assert [(s.name, s.pass_no, s.ok) for s in result.record.stages] == [
+        ("planner", 0, True),
+        ("geometry", 0, True),
+        ("mesh", 0, True),
+        ("case_setup", 0, True),
+        ("case_setup", 1, True),  # the fix
+        ("solver_runner", 1, True),  # every later stage runs again
+        ("analyst", 1, True),
+    ]
+    (loop,) = result.record.fix_loops
+    assert (loop.n, loop.source, loop.target, loop.origin) == (
+        1,
+        "solver_runner",
+        "case_setup",
+        "gate",
+    )
+    assert "case/0" in loop.moved and not any("polyMesh" in item for item in loop.moved)
+
+    run = result.run_dir
+    assert (run / "attempts" / "case_setup-1").is_dir()  # pass 0 stays
+    assert (run / "attempts" / "case_setup-p1-1").is_dir()
+    assert (run / "attempts" / "solver_runner-p1-1").is_dir()
+    assert (run / "superseded" / "pass-1" / "case" / "0").is_dir()  # the case of pass 0
+    assert (run / "case" / "0" / "U").is_file()  # and the one of pass 1, in the canonical place
+    assert (run / "case" / "constant" / "polyMesh" / "boundary").is_file()
+
+    opening = backend.calls[PLANNER_STEPS + 3 * STAGE_STEPS].messages[1]["content"]
+    assert "Fix requested by solver_runner: the run did not reach a steady state." in opening
+    assert "use a smaller time step" in opening
+    seeded_text = "already in the attempt directory"
+    assert (seeded_text in opening) == (repair_mode == "in_place")
+    if repair_mode == "in_place":
+        assert "attempts/case_setup-p1-1/case/0/U" in opening
+        assert "polyMesh" not in opening.split(seeded_text)[1].split("This is attempt")[0]
+    later = backend.calls[PLANNER_STEPS + 4 * STAGE_STEPS].messages[1]["content"]
+    assert "Fix requested" not in later  # the request goes to the target only
+
+    lines = (run / "llm_transcript.jsonl").read_text(encoding="utf-8").splitlines()
+    entries = [json.loads(line) for line in lines]
+    passes = {(entry["stage"], entry["pass_no"]) for entry in entries}
+    assert passes == {
+        ("planner", 0),
+        ("geometry", 0),
+        ("mesh", 0),
+        ("case_setup", 0),
+        ("case_setup", 1),
+        ("solver_runner", 1),
+        ("analyst", 1),
+    }
+    assert result.comparison["passed"] is True, result.comparison
+    assert "fix loop 1" in (run / "run.log").read_text(encoding="utf-8")

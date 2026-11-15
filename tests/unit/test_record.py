@@ -11,6 +11,7 @@ from cfdagent.llm.config import ModelConfig
 from cfdagent.record import (
     NO_REFERENCE_SENTENCE,
     AttemptRecord,
+    FixLoopRecord,
     RunRecord,
     StageRecord,
     _shrunk,
@@ -122,6 +123,73 @@ def test_old_run_record_without_repair_mode_loads(run):
     del document["repair_mode"]
     (run.root / "run_record.json").write_text(json.dumps(document), encoding="utf-8")
     assert read_record(run).repair_mode == "fresh"
+
+
+def test_old_run_record_without_fix_loops_loads(run):
+    stage = StageRecord(name="mesh", attempts=[AttemptRecord(n=1, ok=True, seconds=1)], ok=True)
+    write_record(run, make_record(status="completed", finished_at=NOW, stages=[stage]))
+    document = json.loads((run.root / "run_record.json").read_text())
+    del document["fix_loops"]
+    del document["stages"][0]["pass_no"]
+    (run.root / "run_record.json").write_text(json.dumps(document), encoding="utf-8")
+    loaded = read_record(run)
+    assert loaded.fix_loops == []
+    assert loaded.stages[0].pass_no == 0
+    assert make_record().fix_loops == []
+
+
+def test_a_fix_loop_is_recorded_and_survives_the_round_trip(run):
+    loop = FixLoopRecord(
+        n=1,
+        source="solver_runner",
+        target="case_setup",
+        origin="gate",
+        reason="the residuals did not fall",
+        moved=["case/0", "logs", "results"],
+    )
+    stage = StageRecord(name="case_setup", ok=True, pass_no=1)
+    write_record(run, make_record(status="failed", fix_loops=[loop], stages=[stage]))
+    loaded = read_record(run)
+    assert loaded.fix_loops == [loop]
+    assert loaded.stages[0].pass_no == 1
+    assert read_record(run).fix_loops[0].moved == ["case/0", "logs", "results"]
+
+
+def test_a_fix_loop_is_bounded_and_cleaned_like_the_other_free_text():
+    loop = FixLoopRecord(
+        n=2,
+        source="critic",
+        target="mesh",
+        origin="critic",
+        reason="see https://example.test/x " + "r" * 5000,
+        moved=[f"case/{i}" + "m" * 500 for i in range(500)],
+    )
+    assert len(loop.reason) <= 1000 and "example.test" not in loop.reason
+    assert len(loop.moved) <= 200 and all(len(item) <= 200 for item in loop.moved)
+    with pytest.raises(ValidationError):
+        FixLoopRecord(n=0, source="a", target="b", origin="gate", reason="x", moved=[])
+    with pytest.raises(ValidationError):
+        FixLoopRecord(n=1, source="a", target="b", origin="gate", reason="x", moved=[], extra=1)
+    with pytest.raises(ValidationError):
+        StageRecord(name="x", ok=True, pass_no=-1)
+
+
+def test_the_summary_names_the_pass_of_a_stage_that_ran_again(run):
+    attempt = AttemptRecord(n=1, ok=True, seconds=1)
+    record = make_record(
+        status="completed",
+        finished_at=NOW,
+        stages=[
+            StageRecord(name="case_setup", attempts=[attempt], ok=True),
+            StageRecord(name="case_setup", attempts=[attempt], ok=True, pass_no=1),
+            StageRecord(name="analyst", attempts=[attempt], ok=True, pass_no=1, free_restarts=1),
+        ],
+    )
+    write_summary(run, record, None)
+    text = run.read_text("summary.md")
+    assert r"| case\_setup | 1 | ok |" in text  # pass 0 reads as in M1 (names are escaped)
+    assert r"| case\_setup (pass 1) | 1 | ok |" in text
+    assert "Stage analyst (pass 1): 1 free restart(s)" in text
 
 
 def test_record_redacts_urls_addresses_and_ips_in_free_text():

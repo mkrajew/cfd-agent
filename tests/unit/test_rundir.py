@@ -244,6 +244,46 @@ def test_attempt_dir_rejects_bad_arguments(run, stage, attempt):
         run.attempt_dir(stage, attempt)
 
 
+def test_attempt_dirs_of_two_passes_coexist(run):
+    first = run.attempt_dir("mesh", 1)
+    (first / "mesh.py").write_text("pass 0", encoding="utf-8")
+    second = run.attempt_dir("mesh", 1, 1)
+    (second / "mesh.py").write_text("pass 1", encoding="utf-8")
+    third = run.attempt_dir("mesh", 2, 1)
+    assert first == run.root / "attempts" / "mesh-1"  # the layout of pass 0 is the M1 one
+    assert second == run.root / "attempts" / "mesh-p1-1"
+    assert third == run.root / "attempts" / "mesh-p1-2"
+    # preparing a directory of one pass never touches another pass's directory
+    assert (first / "mesh.py").read_text(encoding="utf-8") == "pass 0"
+    assert (second / "mesh.py").read_text(encoding="utf-8") == "pass 1"
+    assert sorted(p.name for p in (run.root / "attempts").iterdir()) == [
+        "mesh-1",
+        "mesh-p1-1",
+        "mesh-p1-2",
+    ]
+    assert run.attempt_dir("mesh", 1, 0) == first  # an explicit pass 0 is the default
+
+
+def test_a_later_pass_never_deletes_the_directory_of_an_earlier_one(run):
+    earlier = run.attempt_dir("case_setup", 1)
+    (earlier / "keep.txt").write_text("pass 0", encoding="utf-8")
+    run.attempt_dir("case_setup", 1, 1)
+    run.attempt_dir("case_setup", 1, 2)
+    assert (earlier / "keep.txt").read_text(encoding="utf-8") == "pass 0"
+
+
+def test_attempt_dir_of_a_pass_is_fresh_each_time(run):
+    first = run.attempt_dir("geometry", 1, 2)
+    (first / "stale.txt").write_text("old", encoding="utf-8")
+    assert list(run.attempt_dir("geometry", 1, 2).iterdir()) == []
+
+
+@pytest.mark.parametrize("pass_no", [-1, True, 1.5, "1", None])
+def test_attempt_dir_rejects_a_bad_pass_number(run, pass_no):
+    with pytest.raises(UnsafePath):
+        run.attempt_dir("geometry", 1, pass_no)
+
+
 def test_attempt_dir_refuses_a_symlinked_attempts_folder(run, tmp_path):
     (tmp_path / "elsewhere").mkdir()
     _symlink(run.root / "attempts", tmp_path / "elsewhere", directory=True)
