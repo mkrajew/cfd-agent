@@ -45,6 +45,7 @@ client and the storage layer) is imported inside ``run`` only.
 from __future__ import annotations
 
 import codecs
+import itertools
 import math
 import os
 import re
@@ -419,12 +420,11 @@ def _in_generality_directory(path: Path) -> bool:
     directory: the text of a generality task must not start a run by path either (design 9.1).
     Compared without regard to case, because the file systems of the laptops are insensitive."""
     try:
-        parts = [part.casefold() for part in path.resolve().parts]
+        resolved = path.resolve()
     except (OSError, RuntimeError):
-        return False  # unreadable anyway; _read_task_file reports it
-    return any(
-        a == "benchmarks" and b == "generality" for a, b in zip(parts, parts[1:], strict=False)
-    )
+        resolved = Path(os.path.abspath(path))  # not resolvable: the guard still looks at the text
+    parts = [part.casefold() for part in resolved.parts]
+    return any(pair == ("benchmarks", "generality") for pair in itertools.pairwise(parts))
 
 
 def _read_task_file(path: Path) -> str:
