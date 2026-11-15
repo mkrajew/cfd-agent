@@ -17,6 +17,7 @@ from cfdagent.record import (
     RunRecord,
     StageRecord,
     _shrunk,
+    critic_agreement,
     read_record,
     write_record,
     write_summary,
@@ -290,6 +291,138 @@ def test_summary_contains_no_reference_sentence_for_ad_hoc_run(run):
     assert "No Critic reviewed this run" in text
     assert "20261112-143005-demo" in text
     assert "completed" in text
+
+
+COMPARISON_PASSED = {
+    "passed": True,
+    "criteria": [
+        {"quantity": "q", "passed": True, "error": 0.01, "threshold": 0.05, "reason": "ok"}
+    ],
+}
+COMPARISON_MISSED = {**COMPARISON_PASSED, "passed": False}
+
+
+def make_loop(n=1, source="critic", target="mesh", origin="critic", reason="Refine the mesh."):
+    return FixLoopRecord(
+        n=n, source=source, target=target, origin=origin, reason=reason, moved=["case/0"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("verdict", "comparison", "expected"),
+    [
+        ("success", COMPARISON_PASSED, True),
+        ("success", COMPARISON_MISSED, False),
+        ("partial", COMPARISON_PASSED, False),
+        ("partial", COMPARISON_MISSED, True),
+        ("failed", COMPARISON_PASSED, False),
+        ("failed", COMPARISON_MISSED, True),
+        (None, COMPARISON_PASSED, None),  # no verdict: nothing to agree with
+        ("success", None, None),  # no comparison (an ad hoc run, or a run that ended early)
+        (None, None, None),
+        # a comparison that could not be made states passed=False: it counts as a Scorer that did
+        # not pass (a Critic that accepted a run with unusable results was wrong)
+        ("success", {"passed": False, "problem": "quantities.json cannot be read"}, False),
+        ("failed", {"passed": False, "problem": "quantities.json cannot be read"}, True),
+        ("success", {"criteria": []}, None),  # a comparison without an overall result
+        ("success", {"passed": "yes"}, None),
+    ],
+)
+def test_critic_agreement_values(verdict, comparison, expected):
+    final = None if verdict is None else make_verdict(verdict=verdict)
+    assert critic_agreement(final, comparison) is expected
+
+
+def test_critic_agreement_is_recorded_and_old_records_still_load(run):
+    assert make_record().critic_agreement is None
+    write_record(run, make_record(status="completed", finished_at=NOW, critic_agreement=False))
+    assert read_record(run).critic_agreement is False
+    document = run.read_json("run_record.json")
+    assert document["critic_agreement"] is False
+    del document["critic_agreement"]  # a record written before Task 15
+    (run.root / "run_record.json").write_text(json.dumps(document), encoding="utf-8")
+    assert read_record(run).critic_agreement is None
+    with pytest.raises(ValidationError):
+        make_record(critic_agreement="maybe")
+
+
+def test_summary_lists_critic_verdict_and_fix_loops(run):
+    verdict = make_verdict(
+        reasons=["The run did not converge.", "The lift is implausible."],
+        checks=[
+            CriticCheck(name="convergence", passed=False, evidence="the residuals did not fall"),
+            CriticCheck(name="plausibility", passed=True, evidence="values are in range"),
+        ],
+    )
+    record = make_record(
+        task_set="development",
+        benchmark_id="synthetic",
+        status="completed",
+        finished_at=NOW,
+        critic_verdict=verdict,
+        critic_rounds=1,
+        critic_agreement=True,
+        fix_loops=[
+            make_loop(
+                1, source="solver_runner", target="case_setup", origin="gate", reason="Gate."
+            ),
+            make_loop(2, reason="Refine the mesh near the wall."),
+        ],
+    )
+    write_summary(run, record, COMPARISON_MISSED)
+    text = run.read_text("summary.md")
+    assert "No Critic reviewed this run" not in text
+    assert "- Status: **completed**" in text  # the status stays the pipeline status
+    assert "## Critic" in text and "Verdict: **partial**" in text
+    assert "The run did not converge." in text and "The lift is implausible." in text
+    assert "convergence" in text and "the residuals did not fall" in text  # the failed check
+    assert "values are in range" not in text  # a passed check is only counted
+    assert "1 of 2 checks failed" in text
+    assert "Send-back not followed: case\\_setup" in text  # the final verdict still asks for one
+    assert "Run longer and set a residual criterion." in text
+    assert "## Fix loops" in text and "2 fix loop(s)" in text
+    assert "| 1 | solver_runner | case_setup | gate | Gate. |" in text
+    assert "| 2 | critic | mesh | critic | Refine the mesh near the wall. |" in text
+    assert "Critic send-backs followed: 1" in text
+    assert "Critic agreed with the Scorer: **yes**" in text
+    assert "Compared with the reference data" in text
+
+
+def test_summary_states_the_disagreement_and_missing_agreement(run):
+    record = make_record(
+        task_set="development",
+        benchmark_id="synthetic",
+        status="completed",
+        finished_at=NOW,
+        critic_verdict=make_verdict(verdict="success", checks=[], reasons=[], send_back_to=None),
+        critic_agreement=False,
+    )
+    write_summary(run, record, COMPARISON_MISSED)
+    assert "Critic agreed with the Scorer: **no**" in run.read_text("summary.md")
+    record.critic_agreement = None
+    write_summary(run, record, COMPARISON_MISSED)
+    text = run.read_text("summary.md")
+    assert "Critic agreed with the Scorer: not available" in text
+    ad_hoc = make_record(
+        status="completed", finished_at=NOW, critic_verdict=make_verdict(verdict="success")
+    )
+    write_summary(run, ad_hoc, None)
+    assert "agreed with the Scorer" not in run.read_text("summary.md")  # no Scorer, no line
+
+
+def test_summary_no_reference_sentence_unchanged(run):
+    ad_hoc = make_record(
+        status="completed", finished_at=NOW, critic_verdict=make_verdict(verdict="failed")
+    )
+    write_summary(run, ad_hoc, None)
+    text = run.read_text("summary.md")
+    assert NO_REFERENCE_SENTENCE in text  # design 6.8, word for word
+    assert "Verdict: **failed**" in text and "No Critic reviewed this run" not in text
+    without_critic = make_record(status="completed", finished_at=NOW)
+    write_summary(run, without_critic, None)
+    text = run.read_text("summary.md")
+    assert NO_REFERENCE_SENTENCE in text
+    assert "No Critic reviewed this run" in text and "## Critic" not in text
 
 
 def test_free_restarts_are_in_the_summary_and_old_records_still_load(run):

@@ -80,6 +80,7 @@ class Fake:
             stages=[stage("planner", 12.0), stage("geometry", 3.5, 4.5), stage("mesh", 2.0)],
             critic_verdict=None if self.critic is None else verdict(self.critic),
             critic_rounds=1,
+            critic_agreement=None if self.critic is None else self.critic == "success",
             wall_seconds=125.5,
             cost_usd=0.0,
             failure_reason="bad thing" if self.status != "completed" else None,
@@ -146,6 +147,7 @@ def test_summary_has_everything_the_runbook_needs(tmp_path, capsys):
     assert "u_profile" in out and "0.012" in out and "v_profile" in out
     assert "passed: True" in out or "comparison: passed" in out
     assert "Critic: success (2 of 2 checks passed; send-backs followed: 1)" in out
+    assert "Critic agreed with the Scorer: yes" in out
     assert "upload: done, 42 file(s)" in out
     assert "2.0 KiB" in out  # run directory size
     assert (
@@ -177,6 +179,7 @@ def test_exit_status_is_one_unless_completed_passed_and_uploaded(tmp_path, capsy
 def test_a_missing_critic_verdict_is_said_in_the_summary(tmp_path, capsys):
     code, _, captured = replay(tmp_path, capsys, critic=None)
     assert code == 1 and "Critic: no verdict" in captured.out
+    assert "Critic agreed with the Scorer: not available" in captured.out
     (tmp_path / "again").mkdir()  # the fake run writes its run directory into the one it is given
     code, _, captured = replay(tmp_path / "again", capsys, critic="partial")
     assert code == 1 and "Critic: partial (1 of 2 checks passed" in captured.out

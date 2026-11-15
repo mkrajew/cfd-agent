@@ -165,6 +165,9 @@ def test_scripted_cavity_pipeline_with_critic_success(clean):
     assert [s.name for s in result.record.stages][-2:] == ["analyst", "critic"]
     assert read_record(RunDir(result.run_dir)).critic_verdict == verdict
     assert result.comparison["passed"] is True  # the Scorer ran after the Critic
+    assert result.record.critic_agreement is True  # success and a passed Scorer agree
+    summary = (result.run_dir / "summary.md").read_text(encoding="utf-8")
+    assert "Verdict: **success**" in summary and "Critic agreed with the Scorer: **yes**" in summary
 
     # the Critic read the real files of this run through its read-only tools
     critic_calls = backend.calls[-CRITIC_STEPS:]
