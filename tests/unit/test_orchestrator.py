@@ -1438,6 +1438,162 @@ def test_transcript_has_no_reference_values_with_critic(tmp_path):
         )
 
 
+# ---------------------------------------------------------------------- the Scorer after the Critic
+
+
+def critic_bench_run(tmp_path, *verdicts, quantities=GOOD_QUANTITIES, config=None, **actions):
+    """The six fake stages (the Analyst writes ``quantities``), the real Critic, a benchmark."""
+    root = make_benchmarks(tmp_path)
+    actions.setdefault("analyst", write_quantities(quantities))
+    made, backend = with_critic([], *verdicts, **actions)
+    result = go(
+        tmp_path,
+        *made.values(),
+        CriticStep(),
+        backend=backend,
+        config=config or bench_config(),
+        benchmarks_root=root,
+    )
+    return result, made
+
+
+def test_scorer_runs_after_critic_failed_verdict_when_final_analyst_passed(tmp_path):
+    verdict = verdict_json("failed", failed=CHECK_NAMES, reasons=("Nothing was computed.",))
+    result, made = critic_bench_run(tmp_path, verdict)
+    assert result.status == "completed" and result.record.failed_stage is None
+    assert result.record.critic_verdict.verdict == "failed"
+    assert result.comparison["passed"] is True  # the Scorer ran although the Critic said failed
+    assert result.record.comparison == result.comparison
+    assert result.record.critic_agreement is False  # the Critic said failed, the Scorer passed
+    assert read_record(RunDir(result.run_dir)).critic_agreement is False
+    assert (result.run_dir / "results" / "comparison.json").is_file()
+    text = log_text(result)
+    assert text.count("scorer: start") == 1
+    assert text.index("stage critic: ok") < text.index("scorer: start")  # after the Critic
+    summary = (result.run_dir / "summary.md").read_text(encoding="utf-8")
+    assert "Verdict: **failed**" in summary and "Critic agreed with the Scorer: **no**" in summary
+
+
+@pytest.mark.parametrize(
+    ("replies", "quantities", "passed", "agreement"),
+    [
+        ([verdict_json()], GOOD_QUANTITIES, True, True),
+        ([verdict_json()], BAD_QUANTITIES, False, False),  # success, but the Scorer did not pass
+        ([sent_back()] * 3, GOOD_QUANTITIES, True, False),  # partial, rounds used up: final
+        ([sent_back()] * 3, BAD_QUANTITIES, False, True),
+        ([], GOOD_QUANTITIES, True, None),  # the Critic gave no verdict
+    ],
+)
+def test_the_scorer_runs_for_every_critic_outcome(tmp_path, replies, quantities, passed, agreement):
+    root = make_benchmarks(tmp_path)
+    made = pipeline_of([], [True], analyst=write_quantities(quantities))
+    if replies:
+        backend = critic_backend(*replies)
+    else:  # three invalid replies in a row: the Critic fails and leaves no verdict
+        invalid = verdict_json("success", failed=("convergence",))
+        backend = ScriptedBackend([critic_reply("Read.")] + [critic_reply(invalid)] * 3)
+    result = go(
+        tmp_path,
+        *made.values(),
+        CriticStep(),
+        backend=backend,
+        config=bench_config(),
+        benchmarks_root=root,
+    )
+    assert result.status == "completed", result.record.failure_reason
+    assert result.comparison["passed"] is passed
+    assert result.record.critic_agreement is agreement
+    assert (result.record.critic_verdict is None) == (not replies)
+
+
+def test_an_ad_hoc_run_has_no_agreement_and_no_comparison(tmp_path):
+    made, backend = with_critic([], verdict_json())
+    result = go(tmp_path, *made.values(), CriticStep(), backend=backend)
+    assert result.record.critic_verdict.verdict == "success"
+    assert result.comparison is None and result.record.critic_agreement is None
+    assert "scorer: start" not in log_text(result)
+    summary = (result.run_dir / "summary.md").read_text(encoding="utf-8")
+    assert "No reference data for this task" in summary and "agreed with the Scorer" not in summary
+
+
+def test_scorer_ignores_quantities_of_an_earlier_pass(tmp_path, monkeypatch):
+    scored = []
+    real_score = orchestrator.score
+
+    def spy(bench, quantities):
+        scored.append(quantities)
+        return real_score(bench, quantities)
+
+    monkeypatch.setattr(orchestrator, "score", spy)
+
+    def per_pass(first, later):
+        write_first, write_later = write_quantities(first), write_quantities(later)
+
+        def analyst(ctx):
+            (write_first if ctx.pass_no == 0 else write_later)(ctx)
+
+        return analyst
+
+    # the first pass is good, the Critic sends the run back to the mesh, the final pass is bad:
+    # only the final pass counts (the good numbers were moved aside and are never scored)
+    result, _ = critic_bench_run(
+        tmp_path,
+        sent_back("mesh"),
+        verdict_json("failed", failed=CHECK_NAMES, reasons=("Wrong.",)),
+        analyst=per_pass(GOOD_QUANTITIES, BAD_QUANTITIES),
+    )
+    assert result.status == "completed" and result.record.critic_rounds == 1
+    moved = result.run_dir / "superseded" / "pass-1" / "results" / "quantities.json"
+    assert json.loads(moved.read_text(encoding="utf-8")) == GOOD_QUANTITIES
+    assert len(scored) == 1  # once, not once per pass
+    assert scored[0]["profile_q"]["value"] == BAD_QUANTITIES["profile_q"]["value"]
+    assert result.comparison["passed"] is False and result.record.critic_agreement is True
+    assert log_text(result).count("scorer: start") == 1
+
+    # the other way round: a bad first pass does not count against a good final pass
+    scored.clear()
+    result, _ = critic_bench_run(
+        tmp_path / "second",
+        sent_back("mesh"),
+        verdict_json(),
+        analyst=per_pass(BAD_QUANTITIES, GOOD_QUANTITIES),
+    )
+    assert result.comparison["passed"] is True and len(scored) == 1
+    assert result.record.critic_agreement is True
+
+    # a final pass that left no quantities is not scored from superseded/ either
+    result, _ = critic_bench_run(
+        tmp_path / "third",
+        sent_back("mesh"),
+        verdict_json(),
+        analyst=lambda ctx: write_quantities(GOOD_QUANTITIES)(ctx) if ctx.pass_no == 0 else None,
+    )
+    assert (result.run_dir / "superseded" / "pass-1" / "results" / "quantities.json").is_file()
+    assert result.comparison["passed"] is False and "cannot be read" in result.comparison["problem"]
+
+
+def test_scorer_never_starts_a_fix_loop(tmp_path):
+    # a Scorer that does not pass, after a Critic that accepted the run: nothing runs again
+    result, made = critic_bench_run(tmp_path, verdict_json(), quantities=BAD_QUANTITIES)
+    assert result.comparison["passed"] is False and result.status == "completed"
+    assert result.record.fix_loops == [] and result.record.critic_rounds == 0
+    assert all(step.calls == 1 for step in made.values())
+    assert [(s.name, s.pass_no) for s in result.record.stages].count(("analyst", 0)) == 1
+    assert not (result.run_dir / "superseded").exists()
+    # a send-back the Critic may no longer follow is recorded; the Scorer still starts no loop
+    result, made = critic_bench_run(
+        tmp_path / "second",
+        sent_back("mesh"),
+        quantities=BAD_QUANTITIES,
+        config=bench_config().model_copy(update={"limits": RunLimits(max_critic_rounds=0)}),
+    )
+    assert result.comparison["passed"] is False and result.status == "completed"
+    assert result.record.fix_loops == [] and result.record.critic_rounds == 0
+    assert result.record.critic_verdict.send_back_to == "mesh"
+    assert all(step.calls == 1 for step in made.values())
+    assert result.record.critic_agreement is True  # partial and not passed agree
+
+
 def test_the_run_id_does_not_name_the_benchmark(tmp_path):
     root = make_benchmarks(tmp_path)
     result = go(tmp_path, FakeStep("one"), config=bench_config(), benchmarks_root=root)

@@ -27,10 +27,14 @@
    ``KeyboardInterrupt`` and SIGTERM end it ``interrupted``; ToolFailure and every other
    uncaught exception end it ``failed`` with ``internal_error`` (the executor dying is the
    platform's problem and never a retryable gate failure).
-4. Only when every step passed and the configuration names a benchmark: the Scorer. It validates
-   ``results/quantities.json``, scores it against the benchmark's reference data and writes
-   ``results/comparison.json`` and ``record.comparison``. A scoring problem is stated in the
-   comparison; it never causes a retry and never changes the run status.
+4. Only when every step of the final pass passed (the Critic's step last) and the configuration
+   names a benchmark: the Scorer, once. The Critic's verdict (``success``, ``partial``, ``failed``
+   or none) does not matter, so that the Critic's accuracy can be measured (design 9.2, ADR-0007).
+   It validates ``results/quantities.json`` (outputs of an earlier pass were moved to
+   ``superseded/`` and are never scored), scores it against the benchmark's reference data and
+   writes ``results/comparison.json``, ``record.comparison`` and ``record.critic_agreement``. A
+   scoring problem is stated in the comparison; it never causes a retry or a fix loop and never
+   changes the run status.
 5. Always, in a ``finally``: stop the watchdog, write the final record, ``status.json`` and
    ``summary.md``, upload everything produced so far (when asked) and release the marker. A
    failing writer or upload is logged and never masks the outcome of the run.
@@ -96,7 +100,14 @@ from cfdagent.llm.client import ChatBackend, LLMClient
 from cfdagent.llm.cost import PRICING, CostLimitExceeded, CostTracker, Pricing
 from cfdagent.prompts import load_prompt
 from cfdagent.quantities import validate_quantities
-from cfdagent.record import FixLoopRecord, RunRecord, redact, write_record, write_summary
+from cfdagent.record import (
+    FixLoopRecord,
+    RunRecord,
+    critic_agreement,
+    redact,
+    write_record,
+    write_summary,
+)
 from cfdagent.rundir import RunDir, RunDirError
 from cfdagent.sandbox.client import SandboxClient
 from cfdagent.storage.blob import UploadReport, upload_run
@@ -745,7 +756,12 @@ class _Session:
         }
 
     def run_scorer(self) -> None:
-        """Score the quantities (called only after every step passed)."""
+        """Score the quantities of the final pass, once, after the Critic's step (ADR-0007).
+
+        Called only when every step of the final pass passed, the Analyst's among them; the
+        Critic's verdict (``success``, ``partial``, ``failed`` or none) does not matter. It sets
+        ``record.critic_agreement`` and never starts a fix loop.
+        """
         if self.benchmark is None:
             return
         self.current = "scorer"
@@ -761,6 +777,7 @@ class _Session:
             text = json.dumps(comparison, indent=2) + "\n"
             self.record.comparison = comparison
         self.comparison = comparison
+        self.record.critic_agreement = critic_agreement(self.record.critic_verdict, comparison)
         self.log("scorer: done" if "criteria" in comparison else "scorer: could not score")
         try:
             self.run.write_text(COMPARISON_FILE, text)

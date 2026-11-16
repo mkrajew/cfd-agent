@@ -45,7 +45,7 @@ NO_REFERENCE_SENTENCE = (
     "No reference data for this task; result assessed by physical checks only "
     "(convergence, mass balance, plausibility)."
 )
-NO_CRITIC_LINE = "No Critic reviewed this run (the Critic agent is not part of M1)."
+NO_CRITIC_LINE = "No Critic reviewed this run (no Critic verdict was recorded)."
 
 MAX_TEXT_CHARS = 4000  # failure reason
 MAX_ERROR_CHARS = 500  # one attempt error
@@ -287,6 +287,9 @@ class RunRecord(BaseModel):
     critic_verdict: CriticVerdict | None = None
     critic_rounds: int = Field(default=0, ge=0)  # send-backs of the Critic that were followed
     comparison: dict[str, Any] | None = None
+    # Critic accuracy (design 9.2, ADR-0007): ``True`` when "the Critic said success" equals "the
+    # Scorer passed", ``None`` when either is missing. Set by the orchestrator after the Scorer.
+    critic_agreement: bool | None = None
     # Blind-evaluation audit: every file path an agent asked to read through ``read_knowledge``.
     knowledge_reads: list[str] = Field(default_factory=list)
 
@@ -321,6 +324,23 @@ class RunRecord(BaseModel):
         elif self.benchmark_id is None:
             raise ValueError(f"task set {self.task_set!r} needs a benchmark_id")
         return self
+
+
+def critic_agreement(
+    verdict: CriticVerdict | None, comparison: dict[str, Any] | None
+) -> bool | None:
+    """Did the Critic and the Scorer agree (ADR-0007, decision 9)?
+
+    ``True`` when (``verdict.verdict == "success"``) equals ``comparison["passed"]``; ``None`` when
+    there is no verdict or no comparison with a boolean ``passed``. A comparison that could not be
+    made states ``passed: False`` with a problem and counts as a Scorer that did not pass.
+    """
+    if verdict is None or comparison is None:
+        return None
+    passed = comparison.get("passed")
+    if not isinstance(passed, bool):
+        return None
+    return (verdict.verdict == "success") == passed
 
 
 def _normalised(record: RunRecord) -> RunRecord:
@@ -409,6 +429,60 @@ def _stage_label(stage: StageRecord) -> str:
     return name if stage.pass_no == 0 else f"{name} (pass {stage.pass_no})"
 
 
+def _fix_loop_lines(record: RunRecord) -> list[str]:
+    if not record.fix_loops:
+        return []
+    lines = [
+        "",
+        "## Fix loops",
+        "",
+        f"{len(record.fix_loops)} fix loop(s) (run-wide budget, ADR-0006); "
+        f"Critic send-backs followed: {record.critic_rounds}.",
+        "",
+        "| Loop | From | To | Origin | Reason |",
+        "|---|---|---|---|---|",
+    ]
+    for loop in record.fix_loops:
+        lines.append(
+            f"| {loop.n} | {_cell(loop.source)} | {_cell(loop.target)} | {_cell(loop.origin)} "
+            f"| {_cell(loop.reason)} |"
+        )
+    return lines
+
+
+def _critic_lines(record: RunRecord) -> list[str]:
+    """The Critic's final verdict, beside the run status (ADR-0007, decision 8)."""
+    verdict = record.critic_verdict
+    if verdict is None:
+        return []
+    failed = [check for check in verdict.checks if not check.passed]
+    lines = [
+        "",
+        "## Critic",
+        "",
+        f"Verdict: **{verdict.verdict}** (the Critic's judgement; the status above says only what "
+        "the pipeline did).",
+        "",
+        f"{len(failed)} of {len(verdict.checks)} checks failed.",
+    ]
+    lines += [f"- Failed check {_md(c.name)}: {_md(c.evidence)}" for c in failed]
+    if verdict.reasons:
+        lines += ["", "Reasons:"] + [f"- {_md(reason)}" for reason in verdict.reasons]
+    if verdict.send_back_to is not None:
+        lines += [
+            "",
+            f"Send-back not followed: {_md(verdict.send_back_to)}. "
+            f"Instruction: {_md(verdict.instruction or '')}",
+        ]
+    return lines
+
+
+def _agreement_line(agreement: bool | None) -> str:
+    if agreement is None:
+        return "Critic agreed with the Scorer: not available (no Critic verdict or no comparison)."
+    return f"Critic agreed with the Scorer: **{'yes' if agreement else 'no'}**."
+
+
 def write_summary(
     run: RunDir,
     record: RunRecord,
@@ -459,6 +533,8 @@ def write_summary(
                 ]
     else:
         lines.append("No stage was completed.")
+    lines += _fix_loop_lines(record)
+    lines += _critic_lines(record)
     lines += ["", "## Assessment", ""]
     if comparison is not None and "criteria" not in comparison and "problem" in comparison:
         lines += [
@@ -475,6 +551,8 @@ def write_summary(
         )
     else:
         lines.append(NO_REFERENCE_SENTENCE)
+    if comparison is not None:  # the Scorer ran: say whether the Critic agreed with it
+        lines += ["", _agreement_line(record.critic_agreement)]
     if residual_control:
         lines += ["", _md(residual_control)]
     lines += [
@@ -482,7 +560,7 @@ def write_summary(
         f"Knowledge files read by the agents: {len(record.knowledge_reads)} "
         "(listed in run_record.json).",
         "",
-        NO_CRITIC_LINE,
-        "",
     ]
+    if record.critic_verdict is None:
+        lines += [NO_CRITIC_LINE, ""]
     run.write_text(SUMMARY_FILE, "\n".join(lines))

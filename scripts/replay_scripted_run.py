@@ -108,6 +108,13 @@ def critic_line(record: Any) -> str:
     )
 
 
+def agreement_line(record: Any) -> str:
+    """Whether the Critic's verdict and the Scorer's result agree (recorded after the Scorer)."""
+    agreement = getattr(record, "critic_agreement", None)
+    text = "not available" if agreement is None else ("yes" if agreement else "no")
+    return f"Critic agreed with the Scorer: {text}"
+
+
 def summary_lines(result: Any, upload: str | None, size: int, account: str) -> list[str]:
     record, comparison = result.record, result.comparison or {}
     lines = [
@@ -119,6 +126,7 @@ def summary_lines(result: Any, upload: str | None, size: int, account: str) -> l
         *stage_lines(record),
         critic_line(record),
         f"Scorer: passed: {comparison.get('passed')}",
+        agreement_line(record),
     ]
     for criterion in comparison.get("criteria", []):
         lines.append(
