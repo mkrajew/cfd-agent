@@ -1171,6 +1171,7 @@ def test_a_very_long_gate_error_still_leaves_room_for_the_instruction(tmp_path):
     assert route is not None
     assert route.instruction.startswith("Gate: steady state not reached: the run was not ended")
     assert "set endTime to 4000" in route.instruction  # not cut by the 1000-character cap
+    assert route.instruction.count("x") <= 600  # the gate part is clipped
     assert len(route.instruction) <= 1000
 
 

@@ -198,7 +198,8 @@ def test_solver_stage_fails_on_divergent_case(tmp_path):
     assert not attempt.ok
     assert attempt.diagnosis == "the Courant number is far too high"
     assert outcome.route is not None and outcome.route.target == "case_setup"  # routed back
-    assert outcome.route.instruction == "lower deltaT"
+    assert outcome.route.instruction.startswith("Gate: ")
+    assert outcome.route.instruction.endswith("Solver Runner: lower deltaT")
     errors = "\n".join(attempt.errors)
     assert "icoFoam run" in errors and "failed" in errors and "diverged" in errors
     assert len(errors.encode("utf-8")) <= 4000
@@ -329,6 +330,8 @@ def test_solver_stage_routes_unconverged_steady_case(tmp_path):
     route = outcome.route
     assert route is not None
     assert (route.source, route.target, route.origin) == ("solver_runner", "case_setup", "gate")
-    assert route.instruction == "raise endTime to 5000"
+    assert route.instruction.startswith("Gate: ")
+    assert "steady state not reached" in route.instruction
+    assert route.instruction.endswith("Solver Runner: raise endTime to 5000")
     assert not (ctx.run.root / "logs").exists()  # nothing is promoted from a failed stage
     assert len(backend.calls) == 3
