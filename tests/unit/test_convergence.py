@@ -120,6 +120,68 @@ def test_high_final_initial_residuals_block_monitored_steadiness():
     assert "p" in report.details and "residual" in report.details.lower()
 
 
+def test_a_run_that_reached_end_time_gets_the_residuals_and_the_rule_up_front():
+    # residuals below the limit but levelled off, monitors still drifting: the message must give
+    # the levelled-off values and say to raise endTime, early enough to survive clipping
+    monitors = {"coeffs": table(Cd=np.linspace(1.0, 2.0, 1000))}
+    initial = {"Ux": 1.2e-5, "Uy": 1.4e-5, "p": 3e-6}
+    report = steadiness(summary(initial=initial), monitors, T)
+    assert not report.ok
+    details = report.details
+    assert details.startswith("the run was not ended by residualControl; ")
+    assert "final initial residuals Ux 1.2e-05, Uy 1.4e-05, p 3e-06" in details
+    assert "raise endTime" in details
+    assert "Cd" in details  # the monitored change is still reported
+    gate_error = f"steady state not reached: {details}"
+    assert gate_error.index("raise endTime") + len("raise endTime") < 400
+    # the rule comes before the residual list, so it does not depend on the number of fields
+    assert details.index("raise endTime") < details.index("final initial residuals")
+    assert details.count("1.2e-05") == 1  # the residuals are listed once
+
+
+def test_the_rule_guards_against_loosening_and_names_the_threshold_in_force():
+    monitors = {"coeffs": table(Cd=np.linspace(1.0, 2.0, 1000))}
+    for limit, shown in ((1e-4, "0.0001"), (5e-3, "0.005")):
+        thresholds = ConvergenceThresholds(final_residual_max=limit)
+        report = steadiness(summary(initial={"Ux": 1e-6}), monitors, thresholds)
+        assert f"loosen only up to {shown}" in report.details
+        assert "only when the monitored quantities have stopped changing" in report.details
+        assert "tightening it alone cannot make the run converge" in report.details
+        assert "otherwise look for the cause" in report.details
+
+
+def test_the_rule_reads_sensibly_without_any_residuals():
+    report = steadiness(summary(initial={}), {}, T)
+    assert report.details.startswith("the run was not ended by residualControl; ")
+    assert "raise endTime" in report.details and "loosen only up to 0.0001" in report.details
+    assert "final initial residuals" not in report.details
+    assert "the log has no initial residuals to judge" in report.details
+
+
+def test_high_residuals_of_a_run_that_reached_end_time_are_listed_once_with_the_limit():
+    report = steadiness(summary(initial={"Ux": 3e-8, "p": 2e-3}), {}, T)
+    assert "final initial residuals Ux 3e-08, p 0.002 (not below 0.0001: p)" in report.details
+    assert "raise endTime" in report.details
+    assert report.details.count("0.002") == 1
+
+
+def test_the_residual_clause_respects_ignore_residuals_and_is_left_out_without_residuals():
+    initial = {"Ux": 3e-8, "Uz": 5e-2}
+    report = steadiness(summary(initial=initial), {}, T, ignore_residuals=("Uz",))
+    assert "final initial residuals Ux 3e-08" in report.details
+    assert "Uz" not in report.details
+    empty = steadiness(summary(initial={}), {}, T)
+    assert "final initial residuals" not in empty.details
+    assert "raise endTime" in empty.details
+
+
+def test_a_run_ended_by_residual_control_has_no_rule():
+    report = steadiness(summary(converged_at=500.0, completed=False), {}, T)
+    assert not report.ok
+    assert "raise endTime" not in report.details
+    assert "not ended by residualControl" not in report.details
+
+
 def test_a_log_without_initial_residuals_cannot_show_steadiness():
     monitors = {"coeffs": table(Cd=converging())}
     assert not steadiness(summary(initial={}), monitors, T).ok

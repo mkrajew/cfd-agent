@@ -83,6 +83,7 @@ SCAN_BYTES = 512 * 1024 * 1024  # a log is not counted beyond this
 TAIL_BYTES = 2500  # the loop shows the model at most 4096 bytes of all errors together
 SUMMARY_TAIL_BYTES = 3000
 HEADLINE_CHARS = 500
+GATE_TEXT_CHARS = 600  # of the gate errors in a fix request; the rest of its 1000 is the model's
 _CELLS_RE = re.compile(r"^\s*cells:\s+(\d+)\s*$", re.MULTILINE)
 _CHECKMESH_MAX_BYTES = 1_000_000
 _READ_CHUNK = 4096
@@ -408,12 +409,20 @@ class SolverRunnerStage(Stage):
                 reason=f"the solver run failed the gate: {headline}",
                 instruction="\n".join(errors),
             )
+        gate_text = "\n".join(errors)
+        advice = diagnosis.instruction.strip()
         return RouteRequest(
             source=STAGE,
             target=diagnosis.target,
             origin="gate",
             reason=f"the solver run failed the gate: {headline} Diagnosis: {diagnosis.diagnosis}",
-            instruction=diagnosis.instruction.strip() or "\n".join(errors),
+            # the gate's own text first (its rule on what to change must reach the target), so
+            # that the cap of the request cuts the end of the model's text, not the gate's
+            instruction=(
+                f"Gate: {_clip(gate_text, GATE_TEXT_CHARS)} Solver Runner: {advice}"
+                if advice
+                else gate_text
+            ),
         )
 
     def retry_after_failure(self, errors: list[str]) -> bool:

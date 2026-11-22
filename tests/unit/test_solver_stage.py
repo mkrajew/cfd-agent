@@ -1133,10 +1133,46 @@ def test_unconverged_steady_run_routes_back(tmp_path):
     assert (route.source, route.target, route.origin) == ("solver_runner", "case_setup", "gate")
     assert "steady state not reached" in route.reason
     assert "the end time is too short" in route.reason
-    assert route.instruction == "raise endTime to 4000"
+    assert route.instruction == f"Gate: {UNCONVERGED} Solver Runner: raise endTime to 4000"
     assert len(backend.calls) == 3
     (attempt,) = setup.ctx.record.stages[0].attempts
     assert attempt.diagnosis == "the end time is too short"  # the text is still in the record
+
+
+def test_the_instruction_with_a_diagnosis_carries_the_gate_text_first(tmp_path):
+    setup = steady_setup(tmp_path)
+    scripted(
+        setup,
+        [
+            reply(None, run_call("r1")),
+            reply(None, tool_call("k1", "check_stage")),
+            diagnosis_reply("case_setup", "levelled off", "set endTime to 4000"),
+        ],
+    )
+    route = run_stage(setup.stage, setup.ctx).route
+    assert route is not None
+    gate_at = route.instruction.index(UNCONVERGED)
+    model_at = route.instruction.index("set endTime to 4000")
+    assert route.instruction.startswith("Gate: ") and gate_at < model_at
+
+
+def test_a_very_long_gate_error_still_leaves_room_for_the_instruction(tmp_path):
+    long_error = "steady state not reached: the run was not ended by residualControl; " + "x" * 3000
+    setup = steady_setup(tmp_path, convergence=not_converged(long_error))
+    scripted(
+        setup,
+        [
+            reply(None, run_call("r1")),
+            reply(None, tool_call("k1", "check_stage")),
+            diagnosis_reply("case_setup", "levelled off", "set endTime to 4000"),
+        ],
+    )
+    route = run_stage(setup.stage, setup.ctx).route
+    assert route is not None
+    assert route.instruction.startswith("Gate: steady state not reached: the run was not ended")
+    assert "set endTime to 4000" in route.instruction  # not cut by the 1000-character cap
+    assert route.instruction.count("x") <= 600  # the gate part is clipped
+    assert len(route.instruction) <= 1000
 
 
 def test_the_diagnosis_turn_is_one_structured_call_without_tools(tmp_path):
@@ -1176,7 +1212,9 @@ def test_divergence_routes_back(tmp_path):
     outcome = run_stage(setup.stage, setup.ctx)
     assert not outcome.ok and outcome.attempts == 1
     assert outcome.route is not None
-    assert (outcome.route.target, outcome.route.instruction) == ("mesh", "regenerate the mesh")
+    assert outcome.route.target == "mesh"
+    assert outcome.route.instruction.startswith("Gate: ")
+    assert outcome.route.instruction.endswith("Solver Runner: regenerate the mesh")
     assert "diverged" in outcome.route.reason
 
 
