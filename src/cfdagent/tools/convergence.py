@@ -76,6 +76,11 @@ MIN_SAMPLES_PER_PERIOD = 20
 # The residual of the component normal to the wedge planes of an axisymmetric case is round-off
 # noise normalised by itself: it stays near 1e-2 however long the run is, so it is not judged.
 WEDGE_SWIRL_RESIDUALS = ("Uz",)
+# What to change when a steady run reached endTime without meeting residualControl.
+NOT_ENDED_RULE = (
+    "a residualControl tolerance below the level where the residuals level off is never met; "
+    "if they were still falling at endTime, raise endTime; do not only tighten the tolerances"
+)
 # Function-object output that is a residual history, not a quantity of the flow.
 NOT_MONITORED_PREFIXES = ("solverinfo", "residual")
 # The columns of a ``forceCoeffs`` file that are coefficients of the whole body.
@@ -281,7 +286,18 @@ def steadiness(
         )
     if problems:
         if summary.converged_at is None:
-            problems.insert(0, "the run was not ended by residualControl")
+            opening = ["the run was not ended by residualControl"]
+            if residuals:
+                final = ", ".join(f"{k} {v:.2g}" for k, v in sorted(residuals.items()))
+                limit = ""
+                if high:
+                    # this clause already names the residuals that are too high: say it once
+                    problems.pop(0)
+                    limit = f" (not below {thresholds.final_residual_max:g}: "
+                    limit += ", ".join(k for k, _ in high) + ")"
+                opening.append(f"final initial residuals {final}{limit}")
+            opening.append(NOT_ENDED_RULE)
+            problems[0:0] = opening
         return SteadinessReport(False, "none", "; ".join(problems))
     worst = max((c for _, c in changes), default=0.0)
     skipped = (
