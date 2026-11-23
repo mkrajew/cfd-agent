@@ -57,8 +57,9 @@ class Geometry(_Closed):
     description: str = Field(description="What the fluid domain is, in plain words")
     bbox: BoundingBox
     volume_m3: float | None = Field(
-        description="Volume in m^3 of the modelled domain (for 2D the area times thickness_m, for "
-        "axisymmetric the wedge) when it can be computed exactly, else null"
+        description="Volume in m^3 of the fluid region only, solid bodies excluded (for 2D the "
+        "in-plane fluid area times thickness_m, for axisymmetric the fluid solid of revolution "
+        "times wedge_angle_deg/360) when it can be computed exactly, else null"
     )
     key_dimensions: list[KeyDimension] = Field(description="Dimensions the geometry must match")
     thickness_m: float | None = Field(

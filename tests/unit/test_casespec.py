@@ -85,6 +85,14 @@ def test_casespec_schema_has_no_maps_or_tuples():
     assert strict_schema(schema)["additionalProperties"] is False
 
 
+def test_casespec_volume_description_says_fluid_region_only():
+    schema = CaseSpec.model_json_schema()
+    geometry = schema["$defs"]["Geometry"]
+    description = geometry["properties"]["volume_m3"]["description"]
+    assert "fluid region only" in description
+    assert "solid bodies excluded" in description
+
+
 def test_casespec_periodic_outputs_in_strict_schema():
     schema = CaseSpec.model_json_schema()
     field = schema["properties"]["periodic_outputs"]

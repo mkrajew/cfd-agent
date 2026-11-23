@@ -384,6 +384,15 @@ def bbox(**changes) -> dict:
     return {**SPEC["geometry"]["bbox"], **changes}
 
 
+def wedge_geometry(angle) -> dict:
+    """A consistent wedge about the x axis: y from 0 to R, z from -R sin(a/2) to R sin(a/2)."""
+    radius = 0.5
+    shown = angle if isinstance(angle, float) and 0 < angle <= 10 else 5.0
+    half = radius * math.sin(math.radians(shown) / 2)
+    wedge_box = bbox(ymin=0.0, ymax=radius, zmin=-half, zmax=half)
+    return geometry(bbox=wedge_box, volume_m3=None, thickness_m=None, wedge_angle_deg=angle)
+
+
 def gate_errors(**changes) -> list[str]:
     return plan_gate(make_spec(**changes), TASK, LIMITS).errors
 
@@ -396,20 +405,20 @@ def test_planner_gate_checks_2d_thickness_against_the_bbox_z_extent():
     assert gate_errors(geometry=shifted) == []
     tolerant = geometry(thickness_m=0.1, bbox=bbox(zmin=0.0, zmax=0.10005))  # 0.05 % off
     assert gate_errors(geometry=tolerant) == []
-    thin = geometry(thickness_m=0.001, bbox=bbox(zmin=0.0, zmax=0.001))
+    thin = geometry(thickness_m=0.001, bbox=bbox(zmin=0.0, zmax=0.001), volume_m3=0.004)
     assert gate_errors(geometry=thin) == []
 
 
 @pytest.mark.parametrize("angle", [None, 0.0, -5.0, 10.5, math.nan, math.inf])
 def test_planner_gate_requires_a_valid_wedge_angle_for_axisymmetric_cases(angle):
-    spec = make_spec(dimensionality="axisymmetric", geometry=geometry(wedge_angle_deg=angle))
+    spec = make_spec(dimensionality="axisymmetric", geometry=wedge_geometry(angle))
     errors = plan_gate(spec, TASK, LIMITS).errors
     assert len(errors) == 1 and "wedge_angle_deg" in errors[0]
 
 
 @pytest.mark.parametrize("angle", [0.5, 5.0, 10.0])
 def test_planner_gate_accepts_a_wedge_for_axisymmetric_cases(angle):
-    spec = make_spec(dimensionality="axisymmetric", geometry=geometry(wedge_angle_deg=angle))
+    spec = make_spec(dimensionality="axisymmetric", geometry=wedge_geometry(angle))
     assert plan_gate(spec, TASK, LIMITS).ok
 
 
@@ -815,6 +824,23 @@ def test_planner_prompt_states_the_required_instructions():
         "requested_outputs",
     ):
         assert phrase in text, phrase
+
+
+def test_planner_prompt_defines_the_volume_as_the_fluid_region_only():
+    text = load_prompt("planner").text
+    assert "`volume_m3` is the volume of the fluid region only" in text
+    assert "minus the part of every solid body, hole or obstacle that lies inside it" in text
+    assert "overlapping parts counted once" in text
+    assert "in-plane fluid area" in text
+    assert "full fluid solid of revolution" in text
+    assert "if any of them cannot, give `null`, never the outer volume" in text
+    # The negative assertion guards the old wording, which let the outer area slip in.
+    assert "in-plane area times" not in text
+
+
+def test_geometry_prompt_agrees_that_the_checked_volume_is_the_fluid_domain():
+    text = load_prompt("geometry").text
+    assert "(the fluid domain, bodies cut out)" in text
 
 
 def test_planner_prompt_explains_periodic_outputs():
