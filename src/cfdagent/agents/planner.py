@@ -6,10 +6,18 @@ The Planner has no files and no sandbox, so it is a function (``run_planner``) a
 1. A tool loop with the ``calculator`` until the model answers in plain text (at most
    ``PHASE_ONE_MAX_TURNS`` model turns). Reaching the limit is not a failure; phase 2 starts anyway
    with whatever was worked out.
-2. One call with ``response_schema=CaseSpec`` over the conversation of phase 1. A reply that does
-   not validate (``StructuredOutputError``), is cut off (``TruncatedOutputError``) or is
-   unusable in another way, or that ``plan_gate`` rejects, is reported to the model and the call
-   is repeated. Each such call is an *attempt*; ``limits.max_attempts_per_stage`` of them at most.
+2. One call with ``response_schema=CaseSpec`` over the conversation of phase 1, without tools. A
+   reply that does not validate (``StructuredOutputError``), is cut off (``TruncatedOutputError``)
+   or is unusable in another way is reported to the model and the call is repeated. Each such
+   call is an *attempt*; ``limits.max_attempts_per_stage`` of them at most.
+
+A reply that parses but that ``plan_gate`` rejects usually needs new arithmetic (a volume, a
+bounding box, a Reynolds number, an estimate), which the structured call cannot do. So the
+rejection starts a *rework round* before the next attempt: the gate errors are shown to the model,
+which works the plan over in plain text with the ``calculator`` again (the same loop as phase 1,
+with a fresh budget of ``PHASE_ONE_MAX_TURNS`` model turns and the ordinary token limit), and then
+the structured call is repeated. A reply that could not be used at all needs no new calculation
+and is repeated directly. The rework round is not an attempt of its own.
 
 Exception: when the only errors of ``plan_gate`` are resource errors (``exceeds resources:``) the
 run ends at once without a retry. The estimate is a result to record, not something to argue
@@ -520,7 +528,8 @@ class _PlannerRun(ModelConversation):
     def __init__(self, ctx: StageContext, task_text: str) -> None:
         super().__init__(ctx, STAGE, AGENT)
         self.task_text = task_text
-        self.structured = False  # True in phase 2
+        self.structured = False  # True while a structured (CaseSpec) call is the next step
+        self.phase_one_model = self.model  # the model settings of the plain-text rounds
         self.attempt_started = ctx.clock()
 
     # ------------------------------------------------------------------ texts for phase 2
@@ -566,6 +575,7 @@ class _PlannerRun(ModelConversation):
     def _phase_one(self) -> None:
         """Tool loop until the model answers in plain text or runs out of turns."""
         self.registry.add(calculator_tool())
+        self.turns = 0  # a fresh budget, also for each rework round
         while self.turns < PHASE_ONE_MAX_TURNS:
             result = self._ask()
             if self.abort is not None:
@@ -600,13 +610,41 @@ class _PlannerRun(ModelConversation):
         self.attempt_started = now
         self.last_errors = errors
 
-    def _phase_two(self) -> StageOutcome:
+    def _enter_structured(self) -> None:
+        """Switch to the structured call: no tools, the structured token limit, and the request
+        for the CaseSpec as the last message."""
         self.structured = True
-        self.registry = ToolRegistry()  # no tools in the structured call
+        self.registry = ToolRegistry()
         self.model = self.model.model_copy(
             update={"max_tokens": self.ctx.config.planner_structured_max_tokens}
         )
         self.messages.append({"role": "user", "content": _structured_request(self.task_text)})
+
+    def _rework_round(self, errors: list[str], limit: int) -> None:
+        """After a gate rejection: show the errors and run the phase-1 loop again, with the
+        calculator, in plain text. The ordinary token limit applies, and the replies are those of
+        a plain-text conversation."""
+        self.structured = False
+        self.model = self.phase_one_model
+        listing = short("\n".join(f"- {e}" for e in errors), MAX_FEEDBACK_CHARS)
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"The automatic checks rejected the plan (attempt {self.attempts} of "
+                    f"{limit}):\n{listing}\n"
+                    "Rework the plan. Recalculate with the `calculator` every number you change, "
+                    "and every number that depends on one you change; do not do arithmetic in "
+                    "your head. Then reply in plain text with the complete corrected plan and its "
+                    "assumptions (not JSON yet; the CaseSpec is requested next)."
+                ),
+            }
+        )
+        self._phase_one()
+
+    def _phase_two(self) -> StageOutcome:
+        self.phase_one_model = self.model
+        self._enter_structured()
         limit = self.limits.max_attempts_per_stage
         while True:
             result = self._ask(response_schema=CaseSpec, with_tools=False)
@@ -639,18 +677,11 @@ class _PlannerRun(ModelConversation):
                     f"stage {STAGE!r} failed after {self.attempts} attempts; last errors: {shown}"
                 )
             if spec is not None:
-                listing = "\n".join(f"- {e}" for e in errors)
-                self.messages.append(
-                    {
-                        "role": "user",
-                        "content": short(
-                            f"The automatic checks rejected the plan (attempt {self.attempts} of "
-                            f"{limit}):\n{listing}\nReply again with the complete corrected "
-                            "CaseSpec as one JSON object.",
-                            MAX_FEEDBACK_CHARS,
-                        ),
-                    }
-                )
+                self._rework_round(errors, limit)
+                if self.abort is not None:
+                    self._progress()
+                    return self._fail(self.abort)
+                self._enter_structured()
             self._progress()
 
     def run(self) -> StageOutcome:
@@ -667,7 +698,10 @@ class _PlannerRun(ModelConversation):
 def run_planner(ctx: StageContext, task_text: str) -> StageOutcome:
     """Plan the task: phase 1 with the calculator, phase 2 with the ``CaseSpec`` schema.
 
-    On success ``casespec.json`` is written to the run directory and ``ctx.casespec`` is set.
+    A plan the gate rejects is reworked in plain text with the calculator (a rework round, with
+    its own turn budget) before the next structured attempt; an unusable structured reply is
+    repeated directly. On success ``casespec.json`` is written to the run directory and
+    ``ctx.casespec`` is set.
     A plan whose only problem is the resource estimate ends the stage as failed with the
     ``exceeds resources:`` message as reason, without a retry; its ``casespec.json`` is written
     but ``ctx.casespec`` stays unset. See the module docstring for the rest.
