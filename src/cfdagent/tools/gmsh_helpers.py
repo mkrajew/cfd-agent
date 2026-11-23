@@ -143,16 +143,20 @@ def base_face(dimensionality: str, tol: float = 1e-6) -> int:
     if dimensionality == "2D":
         model_zmin = gmsh.model.getBoundingBox(-1, -1)[2]
 
-        def qualifies(bbox: BBox) -> bool:
-            return abs(bbox[2] - model_zmin) <= tol and abs(bbox[5] - model_zmin) <= tol
+        # Both the face's box and the model's box carry Gmsh's padding, so their coordinates
+        # differ by twice the padding even for a face exactly on the plane.
+        plane_tol = tol + _GMSH_BBOX_PADDING
 
-        rule = f"lie on the plane z = {model_zmin:.6g} (the model's zmin)"
+        def qualifies(bbox: BBox) -> bool:
+            return abs(bbox[2] - model_zmin) <= plane_tol and abs(bbox[5] - model_zmin) <= plane_tol
+
+        rule = f"on the plane z = {model_zmin + _GMSH_BBOX_PADDING:.6g} (the model's zmin)"
     else:
 
         def qualifies(bbox: BBox) -> bool:
             return bbox[5] <= tol and bbox[2] < -tol
 
-        rule = "be a -z wedge face (bounding box zmax at most 0, zmin below 0)"
+        rule = "that is a -z wedge face (bounding box zmax at most 0, zmin below 0)"
 
     found = [tag for tag in surfaces if qualifies(bboxes[tag])]
     if len(found) == 1:
@@ -161,5 +165,7 @@ def base_face(dimensionality: str, tol: float = 1e-6) -> int:
         f"surface tag {tag}, bounding box {format_bbox(bboxes[tag])}" for tag in surfaces
     )
     if found:
-        raise ManifestError(f"more than one surface {rule}: {found}. Boundary surfaces: {listing}")
+        raise ManifestError(
+            f"more than one surface {rule}: tags {found}. Boundary surfaces: {listing}"
+        )
     raise ManifestError(f"no surface {rule}. Boundary surfaces: {listing}")

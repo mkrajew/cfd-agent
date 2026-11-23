@@ -138,3 +138,33 @@ def test_tolerance_is_relative_to_the_model_size(helpers):
     # ... and inside a tolerance of 1e-3.
     with pytest.raises(ManifestError, match="more than one"):
         helpers(slab).base_face("2D", tol=1e-3)
+
+
+@pytest.mark.parametrize("z0", [0.0, 0.3])
+def test_2d_on_a_small_slab_where_the_padding_exceeds_the_relative_tolerance(helpers, z0):
+    # Both the face and the model box carry Gmsh's padding, so they differ by twice the padding;
+    # for a model this small the relative part of the tolerance is far below that.
+    t = 0.001
+    slab = {
+        1: (0, 0, z0, 0.05, 0.01, z0),
+        2: (0, 0, z0 + t, 0.05, 0.01, z0 + t),
+        3: (0, 0, z0, 0, 0.01, z0 + t),
+        4: (0.05, 0, z0, 0.05, 0.01, z0 + t),
+    }
+    assert helpers(slab).base_face("2D") == 1
+
+
+def test_error_message_starts_with_the_headline_and_then_lists_the_surfaces(helpers):
+    with pytest.raises(ManifestError) as exc:
+        helpers(WEDGE).base_face("2D")
+    message = str(exc.value)
+    assert message.startswith("no surface on the plane z = ")
+    assert message.index("no surface") < message.index("surface tag 1")
+
+
+def test_two_found_message_names_the_count_first(helpers):
+    slab = dict(SLAB)
+    slab[7] = (2, 0, 0.5, 3, 1, 0.5)
+    with pytest.raises(ManifestError) as exc:
+        helpers(slab).base_face("2D")
+    assert str(exc.value).startswith("more than one surface on the plane z = ")

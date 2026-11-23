@@ -206,3 +206,43 @@ def test_base_face_result_builds_a_one_cell_layer(load_step):
     gmsh.model.occ.synchronize()
     gmsh.model.mesh.generate(3)
     assert gmsh.model.mesh.getElements(3)[1]  # volume cells exist
+
+
+@pytest.mark.parametrize(
+    ("size", "z0"),
+    [((0.05, 0.01, 0.001), 0.0), ((0.05, 0.01, 0.001), 0.3), ((0.001, 0.001, 0.0001), 0.0)],
+)
+def test_base_face_2d_on_small_offset_slabs(load_step, size, z0):
+    length, width, thickness = size
+    slab = (
+        cq.Workplane("XY")
+        .workplane(offset=z0)
+        .rect(length, width, centered=False)
+        .extrude(thickness)
+    )
+    load_step(slab)
+    assert _bbox(base_face("2D"))[2] == pytest.approx(z0, abs=2e-7)  # Gmsh pads boxes by 1e-7
+
+
+def test_base_face_axisymmetric_wedge_off_the_axis(load_step):
+    inner = 0.2
+    wedge = (
+        cq.Workplane("XY")
+        .moveTo(0, inner)
+        .lineTo(2, inner)
+        .lineTo(2, 1)
+        .lineTo(0, 1)
+        .close()
+        .revolve(5.0, (0, 0, 0), (1, 0, 0))
+        .rotate((0, 0, 0), (1, 0, 0), -2.5)
+    )
+    load_step(wedge)
+    zmax = _bbox(base_face("axisymmetric"))[5]
+    assert zmax < 0  # the face stays off the axis
+
+
+def test_base_face_axisymmetric_tiny_wedge(load_step):
+    load_step(_wedge(angle_deg=5.0, length=0.05, radius=0.005))
+    face = base_face("axisymmetric")
+    assert _bbox(face)[2] < 0
+    assert _bbox(face)[5] == pytest.approx(0.0, abs=1e-6)

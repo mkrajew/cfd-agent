@@ -17,8 +17,9 @@ the built-in `geo` kernel, parallel meshing.
    reads or names entities: `getEntities`, `getBoundingBox`, `getBoundary`, `setTransfiniteCurve`,
    `setRecombine`, fields, `addPhysicalGroup`. Before it, `getEntities()` is empty and
    `addPhysicalGroup` is silently a no-op: no error, but the group does not exist.
-4. One cell through the thickness of a 2D case: take the base face, `copy` it, remove the solid,
-   mesh the face as quadrilaterals, extrude with `numElements=[1], recombine=True`:
+4. One cell through the thickness of a 2D case: get the base face with `base_face("2D")` (or
+   `base_face("axisymmetric")` for a wedge) from `cfdagent.tools.gmsh_helpers`,
+   `copy` it, remove the solid, mesh the face as quadrilaterals, extrude with `numElements=[1], recombine=True`:
    `out = gmsh.model.occ.extrude([(2, face)], 0, 0, thickness, numElements=[1], recombine=True)`.
    `out` is ordered: the far (top) face first, then the volume `(3, tag)`, then the side faces.
    Also call `gmsh.model.mesh.setRecombine(2, face)` on the base face, or the layer is made of
