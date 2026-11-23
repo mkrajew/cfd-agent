@@ -806,6 +806,37 @@ def test_a_cut_off_reply_in_the_rework_round_is_reported_in_plain_text_terms(tmp
     assert "output limit" in note and "CaseSpec" not in note
 
 
+def test_a_schema_invalid_reply_after_a_rework_round_gets_the_schema_note(tmp_path):
+    steps = [
+        reply("Plan ready."),
+        reply(BAD),
+        reply("Reworked."),
+        reply('{"title": "incomplete"}'),
+        reply(spec_json()),
+    ]
+    ctx, backend = make_ctx(tmp_path, steps)
+    outcome = run_planner(ctx, TASK)
+    assert outcome.ok and outcome.attempts == 3
+    retry = backend.calls[4]
+    assert "does not match the CaseSpec schema" in retry.messages[-1]["content"]
+    assert retry.response_schema is CaseSpec and not retry.tools
+    assert retry.model.max_tokens == ctx.config.planner_structured_max_tokens
+
+
+def test_a_cut_off_structured_reply_after_a_rework_round_gets_the_shorter_advice(tmp_path):
+    steps = [
+        reply("Plan ready."),
+        reply(BAD),
+        reply("Reworked."),
+        reply('{"title": "cut', finish_reason="length"),
+        reply(spec_json()),
+    ]
+    ctx, backend = make_ctx(tmp_path, steps)
+    assert run_planner(ctx, TASK).ok
+    note = backend.calls[4].messages[-1]["content"]
+    assert "complete CaseSpec as one JSON object" in note
+
+
 def test_planner_gives_up_after_three_attempts(tmp_path):
     steps = [reply("Plan ready."), reply("{}"), reply("[]"), reply("nope")]
     ctx, backend = make_ctx(tmp_path, steps)
