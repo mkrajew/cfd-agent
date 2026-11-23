@@ -58,6 +58,9 @@ RESOURCE_PREFIX = "exceeds resources:"
 REYNOLDS_TOLERANCE = 1e-3  # relative, 0.1 %
 THICKNESS_TOLERANCE = 1e-3  # relative to the thickness
 MAX_WEDGE_ANGLE_DEG = 10.0
+VOLUME_TOLERANCE = 1e-3  # relative to the bbox volume
+WEDGE_Y_TOLERANCE = 1e-6  # relative to ymax
+WEDGE_Z_TOLERANCE = 0.01  # relative to R sin(a/2)
 MAX_SCHEMA_PROBLEMS = 8
 MAX_FEEDBACK_CHARS = 4000
 
@@ -278,6 +281,46 @@ def _geometry_errors(spec: CaseSpec) -> list[str]:
             f"geometry.volume_m3 is {_num(volume)} but must be a finite number greater than 0, "
             "or null when it cannot be calculated exactly"
         )
+    elif volume is not None and bbox_ok:
+        box_volume = (box.xmax - box.xmin) * (box.ymax - box.ymin) * (box.zmax - box.zmin)
+        if math.isfinite(box_volume) and volume > box_volume * (1 + VOLUME_TOLERANCE):
+            errors.append(
+                f"geometry.volume_m3 ({_num(volume)}) is larger than the volume of geometry.bbox "
+                f"({_num(box_volume)}); the fluid volume can never exceed its bounding box. For "
+                "an axisymmetric wedge it is the volume of the full fluid solid of revolution "
+                "times wedge_angle_deg/360, and solid bodies inside the domain are subtracted. "
+                "Recompute it with the calculator, or set it to null"
+            )
+    if spec.dimensionality == "axisymmetric" and bbox_ok:
+        errors += _wedge_bbox_errors(box, angle)
+    return errors
+
+
+def _wedge_bbox_errors(box, angle: float | None) -> list[str]:
+    """The wedge convention: about the x axis, symmetric about the x-y plane, so y runs from
+    r cos(a/2) to R and z from -R sin(a/2) to R sin(a/2). Needs a bbox that passed its checks."""
+    errors = []
+    if box.ymin < -WEDGE_Y_TOLERANCE * box.ymax:
+        errors.append(
+            f"geometry.bbox ymin is {_num(box.ymin)} but an axisymmetric wedge lies on the "
+            "positive side of the axis: y runs from r*cos(wedge_angle_deg/2) to R, with R the "
+            "largest radius and r the smallest radius (0 when the domain reaches the axis), "
+            "and the wedge is symmetric about the x-y plane. Set ymin to a value of 0 or more"
+        )
+    if angle is not None and _positive(angle) and angle <= MAX_WEDGE_ANGLE_DEG and box.ymax > 0:
+        half = box.ymax * math.sin(math.radians(angle) / 2)
+        off = (
+            abs(box.zmax - half) > WEDGE_Z_TOLERANCE * half
+            or abs(box.zmin + half) > WEDGE_Z_TOLERANCE * half
+        )
+        if off:
+            errors.append(
+                f"geometry.bbox z range is {_num(box.zmin)} to {_num(box.zmax)} but for an "
+                "axisymmetric wedge z runs from -R*sin(wedge_angle_deg/2) to "
+                f"R*sin(wedge_angle_deg/2), with R the largest radius (ymax = {_num(box.ymax)}); "
+                f"that gives zmin = {_num(-half)} and zmax = {_num(half)}. Recompute them "
+                "with the calculator"
+            )
     return errors
 
 
