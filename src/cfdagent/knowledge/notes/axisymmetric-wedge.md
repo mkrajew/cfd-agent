@@ -30,9 +30,10 @@ v2512). Statements marked "checked" were run: CadQuery wedge, Gmsh revolve, `gms
    next to the axis has a whole edge on it. A mesh from another tool that has a patch of
    zero-area faces on the axis names it `type empty;` in the stock wedge tutorials, and then
    every field needs `type empty;` on it.
-4. Gmsh mesh: copy the planar face on the -z side (z of its bounding box at most 0), remove the
-   solid, mesh the copy as recombined quadrilaterals, and revolve it about the x axis through
-   the angle in radians: `gmsh.model.occ.revolve(copy, 0, 0, 0, 1, 0, 0, a_rad,
+4. Gmsh mesh: get the planar face on the -z side with `base_face("axisymmetric")` from
+   `cfdagent.tools.gmsh_helpers` (it is tilted, so a search for a face of zero z extent
+   fails), copy it, remove the solid, mesh the copy as recombined quadrilaterals, and revolve
+   it about the x axis through the angle in radians: `gmsh.model.occ.revolve(copy, 0, 0, 0, 1, 0, 0, a_rad,
    numElements=[1], recombine=True)`. The result is ordered like an extrusion: the far face
    (the +z wedge face) first, then the volume `(3, tag)`, then the other faces (checked). The
    copy is the -z wedge face. Name both wedge faces, the volume and every other face as in

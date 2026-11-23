@@ -17,8 +17,9 @@ the built-in `geo` kernel, parallel meshing.
    reads or names entities: `getEntities`, `getBoundingBox`, `getBoundary`, `setTransfiniteCurve`,
    `setRecombine`, fields, `addPhysicalGroup`. Before it, `getEntities()` is empty and
    `addPhysicalGroup` is silently a no-op: no error, but the group does not exist.
-4. One cell through the thickness of a 2D case: take the base face, `copy` it, remove the solid,
-   mesh the face as quadrilaterals, extrude with `numElements=[1], recombine=True`:
+4. One cell through the thickness of a 2D case: get the base face with `base_face("2D")` (or
+   `base_face("axisymmetric")` for a wedge) from `cfdagent.tools.gmsh_helpers`,
+   `copy` it, remove the solid, mesh the face as quadrilaterals, extrude with `numElements=[1], recombine=True`:
    `out = gmsh.model.occ.extrude([(2, face)], 0, 0, thickness, numElements=[1], recombine=True)`.
    `out` is ordered: the far (top) face first, then the volume `(3, tag)`, then the side faces.
    Also call `gmsh.model.mesh.setRecombine(2, face)` on the base face, or the layer is made of
@@ -59,14 +60,14 @@ the built-in `geo` kernel, parallel meshing.
 
 ```python
 import gmsh
+from cfdagent.tools.gmsh_helpers import base_face
 gmsh.initialize()
 gmsh.model.add("m")
 gmsh.model.occ.importShapes("geometry.step")
 gmsh.model.occ.synchronize()
 solid = gmsh.model.getEntities(3)
-base = [t for _, t in gmsh.model.getEntities(2)
-        if abs(gmsh.model.getBoundingBox(2, t)[5] - zmin) < 1e-6]    # face on the plane z = zmin
-copy = gmsh.model.occ.copy([(2, base[0])])
+face = base_face("2D")       # tag of the face on the plane z = zmin; "axisymmetric": the -z wedge face
+copy = gmsh.model.occ.copy([(2, face)])
 gmsh.model.occ.remove(solid, recursive=True)
 gmsh.model.occ.synchronize()
 gmsh.model.mesh.setRecombine(2, copy[0][1])
