@@ -820,9 +820,13 @@ def test_planner_prompt_states_the_required_instructions():
 def test_planner_prompt_defines_the_volume_as_the_fluid_region_only():
     text = load_prompt("planner").text
     assert "`volume_m3` is the volume of the fluid region only" in text
-    assert "minus every solid body, hole or obstacle" in text
+    assert "minus the part of every solid body, hole or obstacle that lies inside it" in text
+    assert "overlapping parts counted once" in text
     assert "in-plane fluid area" in text
-    assert "in-plane area times" not in text  # the outer area would include the bodies
+    assert "full fluid solid of revolution" in text
+    assert "if any of them cannot, give `null`, never the outer volume" in text
+    # The negative assertion guards the old wording, which let the outer area slip in.
+    assert "in-plane area times" not in text
 
 
 def test_geometry_prompt_agrees_that_the_checked_volume_is_the_fluid_domain():
