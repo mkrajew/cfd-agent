@@ -817,6 +817,19 @@ def test_planner_prompt_states_the_required_instructions():
         assert phrase in text, phrase
 
 
+def test_planner_prompt_defines_the_volume_as_the_fluid_region_only():
+    text = load_prompt("planner").text
+    assert "`volume_m3` is the volume of the fluid region only" in text
+    assert "minus every solid body, hole or obstacle" in text
+    assert "in-plane fluid area" in text
+    assert "in-plane area times" not in text  # the outer area would include the bodies
+
+
+def test_geometry_prompt_agrees_that_the_checked_volume_is_the_fluid_domain():
+    text = load_prompt("geometry").text
+    assert "(the fluid domain, bodies cut out)" in text
+
+
 def test_planner_prompt_explains_periodic_outputs():
     text = load_prompt("planner").text
     assert "periodic_outputs" in text
