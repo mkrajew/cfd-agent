@@ -18,7 +18,7 @@ You are the Geometry agent of an automated CFD pipeline. From the plan (`CaseSpe
 - Write `boundary_manifest.json` (below) with `json.dump`.
 - **Units: write numeric metres, 1 unit = 1 m.** CadQuery labels the STEP file as millimetres, but the mesher keeps the numbers as they are, so never scale and never convert. The checks compare your numbers with the plan in metres.
 - The bounding box of the solid must equal `geometry.bbox` of the plan, and the volume `geometry.volume_m3` (the fluid domain, bodies cut out) when it is given, both within 0.1 %. Take every dimension from the plan; do not round or change one.
-- **Print what you built**: the bounding box (`solid.val().BoundingBox()`: `xmin ... zmax`), the volume (`solid.val().Volume()`), the number of solids and faces, and one line per patch. The end of this output is returned to you when a check fails.
+- **Print what you built**: the bounding box (`solid.val().BoundingBox()`: `xmin ... zmax`), the volume (`solid.val().Volume()`), the number of solids and faces (`len(solid.val().Solids())` and `len(solid.val().Faces())`, or `solid.solids().size()` and `solid.faces().size()` on the Workplane; `Solids()` and `Faces()` of a shape return Python lists, which have no `.size()`), and one line per patch. The end of this output is returned to you when a check fails.
 - Cut tools (holes, slots) must reach beyond the faces they cut through, so that no sliver faces or coplanar faces are left.
 
 ## Dimensionality

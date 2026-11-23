@@ -35,6 +35,8 @@ one solid and export it as STEP for the mesher. Not covered: assemblies, sketche
    `solid.val().Volume()`; `solid.faces().size()`; `solid.faces("<Z").val().Center()` and
    `Area()` for one face. Selectors: `"<Z"` lowest z, `">X"` highest x, `"|Z"` faces whose
    normal is along z.
+   Counts on the shape are `len(solid.val().Solids())` and `len(solid.val().Faces())`: these
+   methods return Python lists. `.size()` is a Workplane method (`solid.solids().size()`).
    Print the bounding box, volume and counts so that a failed check can be diagnosed.
 10. Export: `cq.exporters.export(solid, "geometry.step")` (a Workplane or a Shape). The STEP
     file is labelled as millimetres, but the numbers are written unchanged. With default Gmsh
@@ -71,4 +73,7 @@ cq.exporters.export(solid, "geometry.step")
 - `revolve` with `center(...)` before it: wrong axis (see rule 8).
 - Treating `solid.val()` as the whole model when the Workplane holds several solids: it is the
   first object only; check `solids().size()`.
+- `solid.val().Faces().size()` or `.Solids().size()`: `AttributeError`, because `Faces()` and
+  `Solids()` of a shape are lists, and `.size()` is a Workplane method. Use `len(...)` on the
+  shape or `solid.faces().size()` on the Workplane.
 - Converting units twice (script scales by 1000 or 0.001, then the mesher scales again).

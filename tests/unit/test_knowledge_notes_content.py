@@ -45,3 +45,10 @@ def test_the_component_key_check_can_fail():
     assert COMPONENT_KEY.search(found)
     (clean,) = RESIDUAL_CONTROL_BLOCK.findall("residualControl { p 1e-8; U 1e-5; }")
     assert not COMPONENT_KEY.search(clean)
+
+
+def test_cadquery_note_says_shape_faces_and_solids_are_lists():
+    text = (NOTES_DIR / "cadquery-api.md").read_text(encoding="utf-8")
+    assert "len(solid.val().Faces())" in text
+    assert "len(solid.val().Solids())" in text
+    assert "lists" in text and "`.size()`" in text and "Workplane method" in text

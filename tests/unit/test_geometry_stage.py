@@ -514,6 +514,14 @@ def test_opening_message_states_the_plan_geometry_and_boundaries(tmp_path):
     assert "any name" in text and "no face" in text  # the exemptions of the name rule
 
 
+def test_prompt_says_how_to_count_solids_and_faces():
+    # Shape.Solids() and Shape.Faces() return Python lists; .size() belongs to the Workplane.
+    text = load_prompt("geometry").text
+    assert "len(solid.val().Solids())" in text
+    assert "len(solid.val().Faces())" in text
+    assert "lists" in text and "`.size()`" in text and "Workplane" in text
+
+
 def test_prompt_states_the_output_contract_and_the_shared_conventions():
     text = load_prompt("geometry").text
     for needle in (
