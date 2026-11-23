@@ -71,14 +71,23 @@ def test_a_volume_above_the_bbox_volume_fails_in_2d():
     assert len(errors) == 1
     message = errors[0]
     assert "volume_m3" in message and "bounding box" in message
-    assert "0.5" in message and "0.4" in message
-    assert "wedge_angle_deg/360" in message and "subtracted" in message
+    assert "(0.5)" in message and "(0.4)" in message
+    assert "in-plane fluid area times geometry.thickness_m" in message
+    assert "wedge_angle_deg/360" not in message
+    assert "Check geometry.bbox and geometry.volume_m3" in message
+
+
+def test_a_volume_one_percent_above_the_bbox_volume_fails():
+    assert len(errors_of(planar(volume=0.4 * 1.01))) == 1
 
 
 def test_the_full_solid_of_revolution_volume_fails_for_a_wedge():
     errors = errors_of(axisymmetric(volume=3.93e-05))
     assert len(errors) == 1
-    assert "3.93e-05" in errors[0] and "bounding box" in errors[0]
+    assert "(3.93e-05)" in errors[0] and "bounding box" in errors[0]
+    assert "wedge_angle_deg/360" in errors[0] and "subtracted" in errors[0]
+    assert "in-plane" not in errors[0]
+    assert "Check geometry.bbox and geometry.volume_m3" in errors[0]
 
 
 def test_the_volume_check_is_skipped_for_an_invalid_bbox():
@@ -93,11 +102,26 @@ def test_a_negative_wedge_ymin_fails():
     message = errors[0]
     assert "ymin" in message and "cos(wedge_angle_deg/2)" in message
     assert "symmetric" in message
+    assert message.endswith(
+        "Set ymin to r*cos(wedge_angle_deg/2), which is 0 when the domain reaches the axis."
+    )
+
+
+def test_a_wedge_ymin_that_is_zero_up_to_rounding_passes():
+    assert errors_of(axisymmetric(ymin=-1e-9 * RADIUS)) == []
+    big = {"ymax": 0.5, "zmin": -0.5 * math.sin(math.radians(ANGLE / 2))}
+    big["zmax"] = -big["zmin"]
+    assert errors_of(axisymmetric(ymin=-1e-9, volume=None, **big)) == []
 
 
 def test_a_wedge_ymin_that_does_not_reach_the_axis_but_is_positive_passes():
     inner = 0.001
-    spec = axisymmetric(ymin=inner * math.cos(math.radians(ANGLE / 2)), volume=1e-07)
+    cos_half = math.cos(math.radians(ANGLE / 2))
+    ymin = inner * cos_half
+    # annular wedge: a/360 of the ring between r and R over the length of 0.5
+    volume = ANGLE / 360 * math.pi * (RADIUS**2 - inner**2) * 0.5
+    assert 5.0e-07 < volume < 5.5e-07
+    spec = axisymmetric(ymin=ymin, volume=volume)
     assert errors_of(spec) == []
 
 
@@ -107,23 +131,29 @@ def test_a_wedge_z_range_from_the_wrong_radius_fails():
     errors = errors_of(bad)
     assert len(errors) == 1
     message = errors[0]
-    assert "zmax" in message and "sin(wedge_angle_deg/2)" in message
+    assert "sin(wedge_angle_deg/2)" in message
     expected = 0.0045 * math.sin(math.radians(ANGLE / 2))
-    assert f"{expected:.6g}" in message
+    assert f"zmin = {-expected:.6g}" in message and f"zmax = {expected:.6g}" in message
 
 
-def test_a_wedge_with_zmax_off_by_more_than_one_percent_fails():
+def test_a_wedge_with_zmax_off_by_two_percent_fails_with_the_expected_numbers():
     errors = errors_of(axisymmetric(zmin=-HALF_Z, zmax=HALF_Z * 1.02))
-    assert len(errors) == 1 and "zmax" in errors[0]
+    assert len(errors) == 1
+    assert f"zmin = {-HALF_Z:.6g}" in errors[0] and f"zmax = {HALF_Z:.6g}" in errors[0]
+
+
+def test_a_wedge_with_zmax_off_by_half_a_percent_fails():
+    assert len(errors_of(axisymmetric(zmax=HALF_Z * 1.005))) == 1
 
 
 def test_a_wedge_z_range_that_is_not_symmetric_fails():
     errors = errors_of(axisymmetric(zmin=0.0))
-    assert len(errors) == 1 and "zmin" in errors[0]
+    assert len(errors) == 1
+    assert f"zmin = {-HALF_Z:.6g}" in errors[0] and f"zmax = {HALF_Z:.6g}" in errors[0]
 
 
-def test_a_wedge_z_range_within_one_percent_passes():
-    spec = axisymmetric(zmin=-HALF_Z * 1.005, zmax=HALF_Z * 0.995)
+def test_a_wedge_z_range_within_a_tenth_of_a_percent_passes():
+    spec = axisymmetric(zmin=-HALF_Z * 1.001, zmax=HALF_Z * 0.999)
     assert errors_of(spec) == []
 
 

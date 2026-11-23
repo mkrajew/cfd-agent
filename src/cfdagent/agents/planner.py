@@ -26,7 +26,7 @@ import re
 
 from pydantic import ValidationError
 
-from cfdagent.agents.casespec import CaseSpec
+from cfdagent.agents.casespec import BoundingBox, CaseSpec
 from cfdagent.agents.loop import (
     MAX_REASON_CHARS,
     ModelConversation,
@@ -60,7 +60,7 @@ THICKNESS_TOLERANCE = 1e-3  # relative to the thickness
 MAX_WEDGE_ANGLE_DEG = 10.0
 VOLUME_TOLERANCE = 1e-3  # relative to the bbox volume
 WEDGE_Y_TOLERANCE = 1e-6  # relative to ymax
-WEDGE_Z_TOLERANCE = 0.01  # relative to R sin(a/2)
+WEDGE_Z_TOLERANCE = 2e-3  # relative to R sin(a/2); the per-coordinate tolerance of the bbox gate
 MAX_SCHEMA_PROBLEMS = 8
 MAX_FEEDBACK_CHARS = 4000
 
@@ -284,19 +284,27 @@ def _geometry_errors(spec: CaseSpec) -> list[str]:
     elif volume is not None and bbox_ok:
         box_volume = (box.xmax - box.xmin) * (box.ymax - box.ymin) * (box.zmax - box.zmin)
         if math.isfinite(box_volume) and volume > box_volume * (1 + VOLUME_TOLERANCE):
+            if spec.dimensionality == "axisymmetric":
+                hint = (
+                    " For an axisymmetric wedge it is the volume of the full fluid solid of "
+                    "revolution times wedge_angle_deg/360."
+                )
+            elif spec.dimensionality == "2D":
+                hint = " For a 2D case it is the in-plane fluid area times geometry.thickness_m."
+            else:
+                hint = ""
             errors.append(
                 f"geometry.volume_m3 ({_num(volume)}) is larger than the volume of geometry.bbox "
-                f"({_num(box_volume)}); the fluid volume can never exceed its bounding box. For "
-                "an axisymmetric wedge it is the volume of the full fluid solid of revolution "
-                "times wedge_angle_deg/360, and solid bodies inside the domain are subtracted. "
-                "Recompute it with the calculator, or set it to null"
+                f"({_num(box_volume)}); the fluid volume can never exceed its bounding box.{hint}"
+                " Solid bodies inside the domain are subtracted. Check geometry.bbox and "
+                "geometry.volume_m3 with the calculator, or set the volume to null"
             )
     if spec.dimensionality == "axisymmetric" and bbox_ok:
         errors += _wedge_bbox_errors(box, angle)
     return errors
 
 
-def _wedge_bbox_errors(box, angle: float | None) -> list[str]:
+def _wedge_bbox_errors(box: BoundingBox, angle: float | None) -> list[str]:
     """The wedge convention: about the x axis, symmetric about the x-y plane, so y runs from
     r cos(a/2) to R and z from -R sin(a/2) to R sin(a/2). Needs a bbox that passed its checks."""
     errors = []
@@ -305,7 +313,8 @@ def _wedge_bbox_errors(box, angle: float | None) -> list[str]:
             f"geometry.bbox ymin is {_num(box.ymin)} but an axisymmetric wedge lies on the "
             "positive side of the axis: y runs from r*cos(wedge_angle_deg/2) to R, with R the "
             "largest radius and r the smallest radius (0 when the domain reaches the axis), "
-            "and the wedge is symmetric about the x-y plane. Set ymin to a value of 0 or more"
+            "and the wedge is symmetric about the x-y plane. Set ymin to r*cos(wedge_angle_deg/2), "
+            "which is 0 when the domain reaches the axis."
         )
     if angle is not None and _positive(angle) and angle <= MAX_WEDGE_ANGLE_DEG and box.ymax > 0:
         half = box.ymax * math.sin(math.radians(angle) / 2)
