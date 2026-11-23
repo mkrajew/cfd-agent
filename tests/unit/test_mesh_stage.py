@@ -1079,6 +1079,22 @@ def test_prompt_states_the_contract_and_the_physics_rules():
     assert "```python" in text  # a skeleton of the script
 
 
+def test_prompt_points_one_cell_layers_to_the_base_face_helper():
+    text = load_prompt("mesh").text
+    allowed = next(line for line in text.splitlines() if line.startswith("- Use only"))
+    assert "base_face" in allowed
+    bullets = {
+        kind: next(line for line in text.splitlines() if line.startswith(f"- **`{kind}`"))
+        for kind in ("2D", "axisymmetric")
+    }
+    for kind, bullet in bullets.items():
+        assert f'base_face("{kind}")' in bullet, kind
+    assert "tilted" in bullets["axisymmetric"]
+    # The hand-written face search, which fails on a tilted face, is gone.
+    assert "zmax` below 1e-6" not in text
+    assert "take the face of the solid" not in text
+
+
 def test_prompt_limits_match_the_gate():
     from cfdagent.tools.mesh import DEFAULT_THRESHOLDS
 

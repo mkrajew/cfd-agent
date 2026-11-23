@@ -59,14 +59,14 @@ the built-in `geo` kernel, parallel meshing.
 
 ```python
 import gmsh
+from cfdagent.tools.gmsh_helpers import base_face
 gmsh.initialize()
 gmsh.model.add("m")
 gmsh.model.occ.importShapes("geometry.step")
 gmsh.model.occ.synchronize()
 solid = gmsh.model.getEntities(3)
-base = [t for _, t in gmsh.model.getEntities(2)
-        if abs(gmsh.model.getBoundingBox(2, t)[5] - zmin) < 1e-6]    # face on the plane z = zmin
-copy = gmsh.model.occ.copy([(2, base[0])])
+face = base_face("2D")       # tag of the face on the plane z = zmin; "axisymmetric": the -z wedge face
+copy = gmsh.model.occ.copy([(2, face)])
 gmsh.model.occ.remove(solid, recursive=True)
 gmsh.model.occ.synchronize()
 gmsh.model.mesh.setRecombine(2, copy[0][1])

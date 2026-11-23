@@ -5,7 +5,7 @@ import gmsh
 import pytest
 
 from cfdagent.manifest import BoundaryManifest, BoundaryPatch, Locator, ManifestError
-from cfdagent.tools.gmsh_helpers import assign_physical_groups, match_surfaces
+from cfdagent.tools.gmsh_helpers import assign_physical_groups, base_face, match_surfaces
 
 pytestmark = pytest.mark.integration
 
@@ -153,3 +153,56 @@ def test_matching_tolerance_is_relative_to_the_model_size(load_step):
     ]
     groups = match_surfaces(_manifest(patches))
     assert {k: len(v) for k, v in groups.items()} == {"top": 1, "sides": 3, "frontAndBack": 2}
+
+
+def _wedge(angle_deg=5.0, length=2.0, radius=1.0):
+    """The wedge convention of the pipeline: axis = x axis, symmetric about the x-y plane."""
+    return (
+        cq.Workplane("XY")
+        .moveTo(0, 0)
+        .lineTo(length, 0)
+        .lineTo(length, radius)
+        .lineTo(0, radius)
+        .close()
+        .revolve(angle_deg, (0, 0, 0), (1, 0, 0))
+        .rotate((0, 0, 0), (1, 0, 0), -angle_deg / 2)
+    )
+
+
+def _bbox(tag):
+    return gmsh.model.getBoundingBox(2, tag)
+
+
+def test_base_face_2d_is_the_face_on_the_lowest_z_plane(load_step):
+    load_step(cq.Workplane("XY").workplane(offset=0.3).rect(2, 1, centered=False).extrude(0.1))
+    face = base_face("2D")
+    assert _bbox(face)[2] == pytest.approx(0.3, abs=1e-6)
+    assert _bbox(face)[5] == pytest.approx(0.3, abs=1e-6)
+
+
+def test_base_face_axisymmetric_is_the_tilted_minus_z_wedge_face(load_step):
+    load_step(_wedge())
+    face = base_face("axisymmetric")
+    xmin, ymin, zmin, xmax, ymax, zmax = _bbox(face)
+    assert zmax == pytest.approx(0.0, abs=1e-6)
+    assert zmin < -0.01  # tilted: its z extent is not small
+    assert (xmin, xmax) == pytest.approx((0.0, 2.0), abs=1e-6)
+
+
+def test_base_face_2d_finds_nothing_on_a_wedge(load_step):
+    load_step(_wedge())
+    with pytest.raises(ManifestError, match="no surface"):
+        base_face("2D")
+
+
+def test_base_face_result_builds_a_one_cell_layer(load_step):
+    load_step(_wedge())
+    face = base_face("axisymmetric")
+    copy = gmsh.model.occ.copy([(2, face)])
+    gmsh.model.occ.remove(gmsh.model.getEntities(3), recursive=True)
+    gmsh.model.occ.synchronize()
+    gmsh.model.mesh.setRecombine(2, copy[0][1])
+    gmsh.model.occ.revolve(copy, 0, 0, 0, 1, 0, 0, 0.0872664626, numElements=[1], recombine=True)
+    gmsh.model.occ.synchronize()
+    gmsh.model.mesh.generate(3)
+    assert gmsh.model.mesh.getElements(3)[1]  # volume cells exist

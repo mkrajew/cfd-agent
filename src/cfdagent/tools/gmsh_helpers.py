@@ -110,3 +110,56 @@ def assign_physical_groups(
     volume_tags = [tag for _, tag in gmsh.model.getEntities(3)]
     gmsh.model.addPhysicalGroup(3, volume_tags, name=volume_name)
     return matched
+
+
+def base_face(dimensionality: str, tol: float = 1e-6) -> int:
+    """Return the tag of the boundary surface from which a one-cell-thick layer is built.
+
+    Call it after ``gmsh.model.occ.synchronize()`` on the imported solid, then copy that surface,
+    remove the solid, mesh the copy in 2D and extrude or revolve it by one cell.
+
+    * ``"2D"``: the surface on the plane z = zmin of the model, that is the surface whose bounding
+      box has both its zmin and its zmax within the tolerance of the model's zmin.
+    * ``"axisymmetric"``: the planar wedge face on the -z side (axis = x axis, wedge symmetric
+      about the x-y plane). The face is tilted, so its z extent is not small: its bounding box has
+      ``zmin`` below -tolerance and ``zmax`` at or below the tolerance (zmax is 0 when the face
+      reaches the axis and slightly negative when it does not).
+
+    ``tol`` is relative to the model size, as in ``match_surfaces``.
+
+    Raises ``ManifestError`` if the dimensionality has no base face, if the model has no volume,
+    or if no surface or more than one surface qualifies; the message lists every boundary surface
+    with its bounding box.
+    """
+    if dimensionality not in ("2D", "axisymmetric"):
+        raise ManifestError(
+            f"there is no base face for dimensionality {dimensionality!r}; "
+            "it exists only for '2D' and 'axisymmetric'"
+        )
+    surfaces = _boundary_surfaces()
+    tol = _effective_tolerance(tol)
+    bboxes = {tag: tuple(gmsh.model.getBoundingBox(2, tag)) for tag in surfaces}
+
+    if dimensionality == "2D":
+        model_zmin = gmsh.model.getBoundingBox(-1, -1)[2]
+
+        def qualifies(bbox: BBox) -> bool:
+            return abs(bbox[2] - model_zmin) <= tol and abs(bbox[5] - model_zmin) <= tol
+
+        rule = f"lie on the plane z = {model_zmin:.6g} (the model's zmin)"
+    else:
+
+        def qualifies(bbox: BBox) -> bool:
+            return bbox[5] <= tol and bbox[2] < -tol
+
+        rule = "be a -z wedge face (bounding box zmax at most 0, zmin below 0)"
+
+    found = [tag for tag in surfaces if qualifies(bboxes[tag])]
+    if len(found) == 1:
+        return found[0]
+    listing = "; ".join(
+        f"surface tag {tag}, bounding box {format_bbox(bboxes[tag])}" for tag in surfaces
+    )
+    if found:
+        raise ManifestError(f"more than one surface {rule}: {found}. Boundary surfaces: {listing}")
+    raise ManifestError(f"no surface {rule}. Boundary surfaces: {listing}")
