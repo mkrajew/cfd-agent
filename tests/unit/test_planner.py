@@ -666,16 +666,175 @@ def test_planner_retries_after_a_truncated_reply(tmp_path):
     assert "cut off" in backend.calls[2].messages[-1]["content"]
 
 
+BAD = spec_json(requested_outputs=[SPEC["requested_outputs"][1]])  # lacks `centreline_u`
+
+
 def test_planner_feeds_gate_errors_back_and_retries(tmp_path):
-    bad = spec_json(requested_outputs=[SPEC["requested_outputs"][1]])  # lacks `centreline_u`
-    steps = [reply("Plan ready."), reply(bad), reply(spec_json())]
+    steps = [reply("Plan ready."), reply(BAD), reply("Reworked plan."), reply(spec_json())]
     ctx, backend = make_ctx(tmp_path, steps)
     outcome = run_planner(ctx, TASK)
     assert outcome.ok and outcome.attempts == 2
     assert "`centreline_u`" in backend.calls[2].messages[-1]["content"]
     # the rejected reply stays in the conversation so the model can correct it
-    assert any(m["role"] == "assistant" and m["content"] == bad for m in backend.calls[2].messages)
+    assert any(m["role"] == "assistant" and m["content"] == BAD for m in backend.calls[3].messages)
     assert [a.ok for a in ctx.record.stages[-1].attempts] == [False, True]
+
+
+def test_a_gate_rejection_leads_to_a_rework_round_with_the_calculator(tmp_path):
+    steps = [
+        reply("Plan ready."),
+        reply(BAD),
+        reply(None, calc("2 * 3")),
+        reply("Reworked plan: 6."),
+        reply(spec_json()),
+    ]
+    ctx, backend = make_ctx(tmp_path, steps)
+    outcome = run_planner(ctx, TASK)
+    assert outcome.ok and outcome.attempts == 2
+    plan, structured, rework, rework_answer, final = backend.calls
+    assert plan.response_schema is None and structured.response_schema is CaseSpec
+    # the rework round: plain text, the calculator offered, the normal phase-1 token budget
+    for call in (rework, rework_answer):
+        assert call.response_schema is None
+        assert [t["function"]["name"] for t in call.tools] == ["calculator"]
+        assert call.model.max_tokens == ctx.config.models["planner"].max_tokens
+    assert any(m["role"] == "tool" and m["content"] == "6" for m in rework_answer.messages)
+    # the structured call after it: schema, no tools, the structured token budget
+    assert final.response_schema is CaseSpec and not final.tools
+    assert final.model.max_tokens == ctx.config.planner_structured_max_tokens
+    request = final.messages[-1]
+    assert request["role"] == "user"
+    assert "centreline_u" in request["content"] and "drag" in request["content"]
+    assert any(m["role"] == "tool" and m["content"] == "6" for m in final.messages)
+    assert ctx.casespec == make_spec()
+
+
+def test_the_rework_message_lists_the_errors_and_asks_for_a_plain_text_plan(tmp_path):
+    steps = [reply("Plan ready."), reply(BAD), reply("Reworked plan."), reply(spec_json())]
+    ctx, backend = make_ctx(tmp_path, steps)
+    assert run_planner(ctx, TASK).ok
+    message = backend.calls[2].messages[-1]
+    assert message["role"] == "user"
+    text = message["content"]
+    assert "rejected" in text and "attempt 1 of 3" in text
+    assert "`centreline_u`" in text  # the gate error itself
+    assert "calculator" in text and "plain text" in text
+    assert "not JSON yet" in text
+
+
+def test_a_very_long_error_list_is_shortened_but_the_instruction_stays(tmp_path):
+    names = [f"name_{i}_{'x' * 200}" for i in range(40)]
+    task = "Report " + ", ".join(f"`{n}`" for n in names) + "."
+    steps = [reply("Plan ready."), reply(spec_json()), reply("Reworked."), reply("{}"), reply("{}")]
+    ctx, backend = make_ctx(tmp_path, steps)
+    run_planner(ctx, task)
+    text = backend.calls[2].messages[-1]["content"]
+    assert "calculator" in text and "not JSON yet" in text
+    assert len(text) < 6000
+
+
+def test_a_schema_invalid_reply_is_retried_in_phase_two_without_a_rework_round(tmp_path):
+    steps = [reply("Plan ready."), reply('{"title": "incomplete"}'), reply(spec_json())]
+    ctx, backend = make_ctx(tmp_path, steps)
+    assert run_planner(ctx, TASK).ok
+    assert len(backend.calls) == 3
+    retry = backend.calls[2]
+    assert retry.response_schema is CaseSpec and not retry.tools
+    assert retry.model.max_tokens == ctx.config.planner_structured_max_tokens
+
+
+def test_the_rework_round_has_its_own_turn_budget(tmp_path):
+    steps = [reply("Plan ready."), reply(BAD)]
+    steps += [reply(None, calc(f"{i} + 1", f"r{i}")) for i in range(1, 9)]  # never stops by itself
+    steps += [reply(spec_json())]
+    ctx, backend = make_ctx(tmp_path, steps)
+    outcome = run_planner(ctx, TASK)
+    assert outcome.ok and outcome.attempts == 2
+    assert len(backend.calls) == 2 + 8 + 1  # the rework round is cut at eight turns
+    assert all(c.tools for c in backend.calls[2:10]) and not backend.calls[10].tools
+    final = backend.calls[10]
+    assert final.response_schema is CaseSpec
+    ids = [c["id"] for m in final.messages if m.get("tool_calls") for c in m["tool_calls"]]
+    answered = [m["tool_call_id"] for m in final.messages if m["role"] == "tool"]
+    assert ids == answered and len(ids) == 8
+
+
+def test_every_rework_round_gets_a_fresh_turn_budget(tmp_path):
+    steps = [reply("Plan ready.")]
+    for n in range(2):  # two rejections, each followed by a tool loop that never stops itself
+        steps.append(reply(BAD))
+        steps += [reply(None, calc("1 + 1", f"c{n}_{i}")) for i in range(8)]
+    steps.append(reply(spec_json()))
+    ctx, backend = make_ctx(tmp_path, steps)
+    outcome = run_planner(ctx, TASK)
+    assert outcome.ok and outcome.attempts == 3
+    assert len(backend.calls) == 1 + 2 * 9 + 1
+
+
+def test_the_rework_round_stops_at_the_wall_clock(tmp_path):
+    clock = FakeClock()
+    steps = [reply("Plan ready."), reply(BAD), reply(None, calc("1 + 1")), reply(spec_json())]
+    ctx, _ = make_ctx(tmp_path, steps, clock=clock)
+
+    class UsesUpTheTime(ScriptedBackend):
+        def chat(self, *args, **kwargs):
+            result = super().chat(*args, **kwargs)
+            if len(self.calls) == 3:  # the first call of the rework round
+                clock.now += ctx.config.limits.wall_clock_s + 1
+            return result
+
+    backend = UsesUpTheTime(steps)
+    ctx.backend = backend
+    outcome = run_planner(ctx, TASK)
+    assert not outcome.ok
+    assert outcome.reason and "wall-clock" in outcome.reason
+    assert len(backend.calls) == 3  # no structured call after the abort
+    assert ctx.casespec is None
+
+
+def test_a_cut_off_reply_in_the_rework_round_is_reported_in_plain_text_terms(tmp_path):
+    steps = [
+        reply("Plan ready."),
+        reply(BAD),
+        reply("a very long plan", finish_reason="length"),
+        reply("Short plan."),
+        reply(spec_json()),
+    ]
+    ctx, backend = make_ctx(tmp_path, steps)
+    assert run_planner(ctx, TASK).ok
+    note = backend.calls[3].messages[-1]["content"]
+    assert "output limit" in note and "CaseSpec" not in note
+
+
+def test_a_schema_invalid_reply_after_a_rework_round_gets_the_schema_note(tmp_path):
+    steps = [
+        reply("Plan ready."),
+        reply(BAD),
+        reply("Reworked."),
+        reply('{"title": "incomplete"}'),
+        reply(spec_json()),
+    ]
+    ctx, backend = make_ctx(tmp_path, steps)
+    outcome = run_planner(ctx, TASK)
+    assert outcome.ok and outcome.attempts == 3
+    retry = backend.calls[4]
+    assert "does not match the CaseSpec schema" in retry.messages[-1]["content"]
+    assert retry.response_schema is CaseSpec and not retry.tools
+    assert retry.model.max_tokens == ctx.config.planner_structured_max_tokens
+
+
+def test_a_cut_off_structured_reply_after_a_rework_round_gets_the_shorter_advice(tmp_path):
+    steps = [
+        reply("Plan ready."),
+        reply(BAD),
+        reply("Reworked."),
+        reply('{"title": "cut', finish_reason="length"),
+        reply(spec_json()),
+    ]
+    ctx, backend = make_ctx(tmp_path, steps)
+    assert run_planner(ctx, TASK).ok
+    note = backend.calls[4].messages[-1]["content"]
+    assert "complete CaseSpec as one JSON object" in note
 
 
 def test_planner_gives_up_after_three_attempts(tmp_path):
@@ -719,7 +878,7 @@ def test_planner_does_not_retry_when_only_resources_are_exceeded(tmp_path):
 def test_planner_retries_when_resources_are_exceeded_together_with_other_errors(tmp_path):
     big = {"cells": 5_000_000, "runtime_minutes": 5.0, "memory_gb": 0.5}
     bad = spec_json(resource_estimate=big, solver={**SPEC["solver"], "end_time_s": 0.0})
-    steps = [reply("Plan ready."), reply(bad), reply(spec_json())]
+    steps = [reply("Plan ready."), reply(bad), reply("Reworked plan."), reply(spec_json())]
     ctx, backend = make_ctx(tmp_path, steps)
     outcome = run_planner(ctx, TASK)
     assert outcome.ok and outcome.attempts == 2
@@ -859,7 +1018,8 @@ def test_a_steady_plan_cannot_ask_for_periodic_outputs():
 
 def test_planner_gives_up_when_the_gate_rejects_every_attempt(tmp_path):
     bad = spec_json(solver={**SPEC["solver"], "end_time_s": 0.0})
-    steps = [reply("Plan ready."), reply(bad), reply(bad), reply(bad)]
+    steps = [reply("Plan ready."), reply(bad), reply("Rework 1."), reply(bad), reply("Rework 2.")]
+    steps.append(reply(bad))
     ctx, backend = make_ctx(tmp_path, steps)
     outcome = run_planner(ctx, TASK)
     assert not outcome.ok and outcome.attempts == 3
@@ -867,7 +1027,8 @@ def test_planner_gives_up_when_the_gate_rejects_every_attempt(tmp_path):
     assert outcome.reason and "end_time_s" in outcome.reason
     assert not (tmp_path / "run" / "casespec.json").exists()
     assert ctx.casespec is None
-    assert len(backend.calls) == 4
+    # a plan, three structured replies and a rework round between them; none after the last
+    assert len(backend.calls) == 6
 
 
 def test_planner_discards_a_valid_looking_reply_cut_off_at_the_length_limit(tmp_path):
