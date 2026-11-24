@@ -363,6 +363,43 @@ def test_other_cases_get_no_one_sided_hint(tmp_path, monkeypatch, dimensionality
     assert ONE_SIDE_HINT not in error
 
 
+def _wedge_box_for(angle_deg, radius=0.5):
+    h = radius * math.sin(math.radians(angle_deg) / 2)
+    return (0.0, 0.0, -h, 1.0, radius, h), radius * math.sin(math.radians(angle_deg))
+
+
+def _hint_error_for(tmp_path, monkeypatch, expected, actual, dimensionality="axisymmetric"):
+    _fake_cadquery(monkeypatch, actual)
+    gate = check_geometry(_geometry_dir(tmp_path), expected, dimensionality=dimensionality)
+    assert not gate.ok
+    (error,) = [e for e in gate.errors if e.startswith("bounding box mismatch")]
+    return error
+
+
+def test_the_hint_covers_the_true_unrotated_extent_of_a_wide_wedge(tmp_path, monkeypatch):
+    # An unrotated wedge reaches z = R sin(a), which is 2 R sin(a/2) / cos(a/2): for 8 degrees the
+    # two differ by 0.24 %, more than the gate tolerance.
+    expected, z_top = _wedge_box_for(8.0)
+    positive = (0.0, 0.0, 0.0, 1.0, 0.5, z_top)
+    error = _hint_error_for(tmp_path, monkeypatch, expected, positive)
+    assert ONE_SIDE_HINT in error and "minus half" in error
+    negative = (0.0, 0.0, -z_top, 1.0, 0.5, 0.0)
+    error = _hint_error_for(tmp_path, monkeypatch, expected, negative)
+    assert ONE_SIDE_HINT in error and "plus half" in error
+
+
+def test_the_hint_is_not_given_when_the_z_extent_is_outside_the_tolerance(tmp_path, monkeypatch):
+    expected, z_top = _wedge_box_for(8.0)
+    error = _hint_error_for(tmp_path, monkeypatch, expected, (0.0, 0.0, 0.0, 1.0, 0.5, 0.0693))
+    assert ONE_SIDE_HINT not in error
+
+
+def test_the_hint_needs_an_expected_box_that_is_symmetric_about_z_zero(tmp_path, monkeypatch):
+    expected = (0.0, 0.0, -0.01, 1.0, 0.5, 0.03)
+    error = _hint_error_for(tmp_path, monkeypatch, expected, (0.0, 0.0, 0.0, 1.0, 0.5, 0.04))
+    assert ONE_SIDE_HINT not in error
+
+
 def test_a_matching_wedge_passes_without_a_hint(tmp_path, monkeypatch):
     _fake_cadquery(monkeypatch, WEDGE_BOX)
     gate = check_geometry(_geometry_dir(tmp_path), WEDGE_BOX, dimensionality="axisymmetric")

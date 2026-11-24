@@ -530,7 +530,8 @@ def test_prompt_says_to_rotate_the_wedge_after_revolving():
     assert "after `.revolve`" in text
     assert "rotating the sketch before revolving" in text
     assert "has no effect" in text
-    assert "2 R sin(angle/2)" in text
+    assert "about 2 R sin(angle/2)" in text
+    assert "original pending wire, not the rotated copy" in text
 
 
 def test_prompt_states_the_output_contract_and_the_shared_conventions():

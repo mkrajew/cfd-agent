@@ -60,3 +60,5 @@ def test_cadquery_note_says_to_rotate_a_wedge_after_revolving():
     assert "after `.revolve`" in text
     assert "rotating the sketch before `.revolve`" in text
     assert "no effect" in text
+    assert "original pending wire, not the rotated copy" in text
+    assert "about 2 R sin(angle/2)" in text
