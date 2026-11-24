@@ -4,6 +4,7 @@ import json
 import math
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -37,8 +38,17 @@ TASK = "Simulate the flow. Report `centreline_u` and `drag`. Use the mesh file `
 USAGE = Usage(100, 50, None)
 
 
+# The loop tests give no volume: a volume must come from a calculator call of the run (see the
+# tests of the volume rule below), and these tests are about other things.
+NO_VOLUME = {**SPEC["geometry"], "volume_m3": None}
+
+
+def plan_spec(**changes) -> CaseSpec:
+    return make_spec(geometry=NO_VOLUME, **changes)
+
+
 def spec_json(**changes) -> str:
-    return json.dumps({**SPEC, **changes})
+    return json.dumps({**SPEC, "geometry": NO_VOLUME, **changes})
 
 
 def reply(content=None, *calls, usage=USAGE, finish_reason=None) -> ChatResult:
@@ -468,6 +478,44 @@ def test_planner_gate_allows_a_null_volume_but_not_a_nonpositive_one():
         assert len(errors) == 1 and "volume_m3" in errors[0]
 
 
+# The volume must come from the calculator: the geometry stage holds the solid to it within 0.1 %.
+
+VOLUME = 0.4  # the volume of the geometry of SPEC
+
+
+def volume_errors(results, volume=VOLUME) -> list[str]:
+    spec = make_spec(geometry={**SPEC["geometry"], "volume_m3": volume})
+    return plan_gate(spec, TASK, LIMITS, results).errors
+
+
+def test_gate_rejects_a_volume_that_no_calculator_call_returned():
+    errors = volume_errors([100.0, 0.001])
+    assert len(errors) == 1
+    assert "geometry.volume_m3 is 0.4" in errors[0]
+    assert "no calculator call in this conversation returned that value" in errors[0]
+    assert "outer domain minus every body removed" in errors[0]
+    assert "give null if it cannot be calculated exactly" in errors[0]
+    assert volume_errors([]) == errors  # no call at all is the same
+
+
+def test_gate_accepts_a_volume_that_a_calculator_call_returned_within_the_tolerance():
+    assert volume_errors([100.0, 0.4]) == []
+    assert volume_errors([0.4 * (1 + 0.9e-3)]) == []
+    assert volume_errors([0.4 * (1 - 0.9e-3)]) == []
+    assert volume_errors([0.4 * (1 + 1.2e-3)]) != []
+
+
+def test_gate_does_not_check_the_volume_provenance_for_a_null_volume_or_unknown_results():
+    assert volume_errors([], volume=None) == []
+    assert volume_errors(None) == []  # the check is opt-in: no calculator results, no check
+    assert plan_gate(make_spec(), TASK, LIMITS).ok  # the default of the argument
+
+
+def test_the_volume_provenance_error_is_not_a_resource_error():
+    errors = volume_errors([])
+    assert errors and not any(e.startswith("exceeds resources:") for e in errors)
+
+
 @pytest.mark.parametrize(
     ("change", "field"),
     [
@@ -596,8 +644,82 @@ def test_planner_writes_casespec_json(tmp_path):
     outcome = run_planner(ctx, TASK)
     assert outcome.ok and outcome.attempts == 1 and outcome.errors == [] and outcome.reason is None
     written = CaseSpec.model_validate_json((tmp_path / "run" / "casespec.json").read_text("utf-8"))
-    assert written == make_spec()
+    assert written == plan_spec()
     assert ctx.casespec == written
+
+
+WITH_VOLUME = spec_json(geometry={**SPEC["geometry"], "volume_m3": VOLUME})
+
+
+def test_planner_accepts_a_volume_the_calculator_returned(tmp_path):
+    steps = [reply(None, calc("4 * 1 * 0.1")), reply("Volume 0.4."), reply(WITH_VOLUME)]
+    ctx, _ = make_ctx(tmp_path, steps)
+    outcome = run_planner(ctx, TASK)
+    assert outcome.ok and outcome.attempts == 1
+    assert ctx.casespec is not None and ctx.casespec.geometry.volume_m3 == VOLUME
+
+
+def test_planner_rejects_a_volume_no_calculator_call_returned(tmp_path):
+    """The stage hands the calculator results of the run to the gate: a volume written without
+    a calculation is sent back, with the error in the rework message."""
+    steps = [
+        reply(None, calc("1 * 1 / 0.01")),
+        reply("Plan ready."),
+        reply(WITH_VOLUME),
+        reply("Reworked plan."),
+        reply(spec_json()),
+    ]
+    ctx, backend = make_ctx(tmp_path, steps)
+    outcome = run_planner(ctx, TASK)
+    assert outcome.ok and outcome.attempts == 2
+    assert (
+        "no calculator call in this conversation returned that value"
+        in (backend.calls[3].messages[-1]["content"])
+    )
+    assert [a.ok for a in ctx.record.stages[-1].attempts] == [False, True]
+    assert ctx.casespec is not None and ctx.casespec.geometry.volume_m3 is None
+
+
+def test_planner_counts_calculator_results_of_the_rework_round(tmp_path):
+    steps = [
+        reply("Plan ready."),
+        reply(WITH_VOLUME),
+        reply(None, calc("4 * 1 * 0.1")),
+        reply("Reworked plan: volume 0.4."),
+        reply(WITH_VOLUME),
+    ]
+    ctx, _ = make_ctx(tmp_path, steps)
+    outcome = run_planner(ctx, TASK)
+    assert outcome.ok and outcome.attempts == 2
+    assert ctx.casespec is not None and ctx.casespec.geometry.volume_m3 == VOLUME
+
+
+def test_planner_does_not_count_a_failed_calculator_call_or_a_result_that_is_not_a_number(
+    tmp_path,
+):
+    steps = [
+        reply(None, ToolCall("c1", "calculator", {"expression": "import os"})),
+        reply(None, ToolCall("c2", "calculator", {"expression": ""})),
+        reply("Plan ready."),
+        reply(WITH_VOLUME),
+        reply("Reworked plan."),
+        reply(WITH_VOLUME),
+        reply("Reworked again."),
+        reply(WITH_VOLUME),
+    ]
+    ctx, _ = make_ctx(tmp_path, steps)
+    outcome = run_planner(ctx, TASK)
+    assert not outcome.ok and outcome.attempts == 3
+    assert outcome.reason and "geometry.volume_m3" in outcome.reason
+
+
+def test_the_scripted_pipeline_fixture_plans_a_volume_its_calculator_calls_produce(tmp_path):
+    path = Path(__file__).resolve().parents[1] / "fixtures" / "scripted" / "cavity_pipeline.json"
+    steps = ScriptedBackend.from_json(path)._steps[:3]  # the Planner's three replies
+    ctx, _ = make_ctx(tmp_path, steps)
+    outcome = run_planner(ctx, "Simulate the flow. Report `u_vertical_centreline`. Re = 100.")
+    assert outcome.ok and outcome.attempts == 1, outcome.reason
+    assert ctx.casespec is not None and ctx.casespec.geometry.volume_m3 is not None
 
 
 def test_planner_phase_one_uses_calculator_only_and_phase_two_uses_the_schema(tmp_path):
@@ -687,7 +809,7 @@ def test_planner_retries_after_invalid_reply_then_succeeds(tmp_path):
     problem = backend.calls[2].messages[-1]
     assert problem["role"] == "user"
     assert "schema" in problem["content"].lower()
-    assert ctx.casespec == make_spec()
+    assert ctx.casespec == plan_spec()
 
 
 def test_planner_retries_after_a_truncated_reply(tmp_path):
@@ -738,7 +860,7 @@ def test_a_gate_rejection_leads_to_a_rework_round_with_the_calculator(tmp_path):
     assert request["role"] == "user"
     assert "centreline_u" in request["content"] and "drag" in request["content"]
     assert any(m["role"] == "tool" and m["content"] == "6" for m in final.messages)
-    assert ctx.casespec == make_spec()
+    assert ctx.casespec == plan_spec()
 
 
 def test_the_rework_message_lists_the_errors_and_asks_for_a_plain_text_plan(tmp_path):
@@ -1032,6 +1154,16 @@ def test_planner_prompt_defines_the_volume_as_the_fluid_region_only():
 def test_geometry_prompt_agrees_that_the_checked_volume_is_the_fluid_domain():
     text = load_prompt("geometry").text
     assert "(the fluid domain, bodies cut out)" in text
+
+
+def test_geometry_prompt_forbids_changing_the_solid_to_meet_the_volume():
+    text = load_prompt("geometry").text
+    assert "Build exactly the solid the plan describes." in text
+    assert "Never add or cut material that the description does not call for" in text
+    assert "just to meet `volume_m3`" in text
+    assert "matches the description, the bbox and the key dimensions but not the volume" in text
+    assert "say so plainly in your reply, with both numbers" in text
+    assert "the plan's volume may be wrong" in text
 
 
 def test_planner_prompt_explains_periodic_outputs():
