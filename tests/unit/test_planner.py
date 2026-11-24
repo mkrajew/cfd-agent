@@ -30,7 +30,7 @@ from cfdagent.llm.client import (
 from cfdagent.llm.cost import PRICING, CostTracker
 from cfdagent.llm.scripted import ScriptedBackend
 from cfdagent.prompts import load_prompt
-from cfdagent.record import RunRecord
+from cfdagent.record import RunRecord, StageRecord
 from cfdagent.rundir import RunDir
 
 LIMITS = RunLimits()
@@ -1039,20 +1039,108 @@ def test_planner_respects_the_attempt_limit_of_the_run(tmp_path):
     assert not outcome.ok and outcome.attempts == 2
 
 
-def test_planner_does_not_retry_when_only_resources_are_exceeded(tmp_path):
-    big = {"cells": 5_000_000, "runtime_minutes": 5.0, "memory_gb": 0.5}
-    steps = [reply("Plan ready."), reply(spec_json(resource_estimate=big))]  # no third step
+BIG = {"cells": 5_000_000, "runtime_minutes": 5.0, "memory_gb": 0.5}
+
+
+def test_planner_retries_once_after_a_resource_only_rejection(tmp_path):
+    steps = [
+        reply("Plan ready."),
+        reply(spec_json(resource_estimate=BIG)),
+        reply("Reduced plan."),
+        reply(spec_json()),
+    ]
+    ctx, backend = make_ctx(tmp_path, steps)
+    outcome = run_planner(ctx, TASK)
+    assert outcome.ok and outcome.attempts == 2
+    assert len(backend.calls) == 4  # phase 1, structured, rework round, structured
+    feedback = backend.calls[2].messages[-1]["content"]
+    assert "exceeds resources:" in feedback and "legitimate reduction" in feedback
+    assert ctx.casespec is not None and ctx.casespec.resource_estimate.cells == 8000
+    written = json.loads((tmp_path / "run" / "casespec.json").read_text("utf-8"))
+    assert written["resource_estimate"]["cells"] == 8000  # the accepted plan, not the big one
+    stage = ctx.record.stages[-1]
+    assert stage.ok and stage.resource_retries == 1
+    assert [a.ok for a in stage.attempts] == [False, True]
+    assert stage.attempts[0].errors[0].startswith("exceeds resources:")
+
+
+def test_planner_ends_failed_after_two_resource_only_plans(tmp_path):
+    steps = [  # no further step: a third plan would fail the test
+        reply("Plan ready."),
+        reply(spec_json(resource_estimate=BIG)),
+        reply("Reworked."),
+        reply(spec_json(resource_estimate={**BIG, "cells": 4_000_000})),
+    ]
     ctx, backend = make_ctx(tmp_path, steps)
     outcome = run_planner(ctx, TASK)
     assert not outcome.ok
-    assert outcome.attempts == 1
+    assert outcome.attempts == 2
+    assert outcome.reason and outcome.reason.startswith("exceeds resources:")
+    assert len(backend.calls) == 4
+    written = json.loads((tmp_path / "run" / "casespec.json").read_text("utf-8"))
+    assert written["resource_estimate"]["cells"] == 4_000_000  # the last recorded estimate
+    stage = ctx.record.stages[-1]
+    assert not stage.ok and len(stage.attempts) == 2 and stage.resource_retries == 1
+    assert ctx.casespec is None  # the plan is recorded, but it is not an accepted plan
+
+
+def test_planner_resource_retry_is_followed_by_the_normal_rules_for_other_errors(tmp_path):
+    bad = spec_json(solver={**SPEC["solver"], "end_time_s": 0.0})
+    steps = [
+        reply("Plan ready."),
+        reply(spec_json(resource_estimate=BIG)),
+        reply("Reduced plan."),
+        reply(bad),  # a non-resource error: the ordinary retry
+        reply("Fixed plan."),
+        reply(spec_json()),
+    ]
+    ctx, backend = make_ctx(tmp_path, steps)
+    outcome = run_planner(ctx, TASK)
+    assert outcome.ok and outcome.attempts == 3
+    assert "end_time_s" in backend.calls[4].messages[-1]["content"]
+    assert ctx.record.stages[-1].resource_retries == 1
+
+
+def test_planner_resource_retry_budget_is_used_once_even_after_other_errors(tmp_path):
+    bad = spec_json(solver={**SPEC["solver"], "end_time_s": 0.0})
+    steps = [  # no step after the last plan: a second resource retry would fail the test
+        reply("Plan ready."),
+        reply(spec_json(resource_estimate=BIG)),
+        reply("Reduced plan."),
+        reply(bad),
+        reply("Fixed plan."),
+        reply(spec_json(resource_estimate=BIG)),
+    ]
+    ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_attempts_per_stage=4))
+    outcome = run_planner(ctx, TASK)
+    assert not outcome.ok and outcome.attempts == 3
+    assert outcome.reason and outcome.reason.startswith("exceeds resources:")
+    assert len(backend.calls) == 6
+    assert ctx.record.stages[-1].resource_retries == 1
+
+
+def test_planner_resource_retry_needs_an_attempt_left(tmp_path):
+    steps = [reply("Plan ready."), reply(spec_json(resource_estimate=BIG))]
+    ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_attempts_per_stage=1))
+    outcome = run_planner(ctx, TASK)
+    assert not outcome.ok and outcome.attempts == 1
     assert outcome.reason and outcome.reason.startswith("exceeds resources:")
     assert len(backend.calls) == 2
-    written = json.loads((tmp_path / "run" / "casespec.json").read_text("utf-8"))
-    assert written["resource_estimate"]["cells"] == 5_000_000  # the recorded estimate
-    stage = ctx.record.stages[-1]
-    assert not stage.ok and len(stage.attempts) == 1
-    assert ctx.casespec is None  # the plan is recorded, but it is not an accepted plan
+    assert ctx.record.stages[-1].resource_retries == 0
+
+
+def test_planner_resource_retry_is_a_budget_of_the_run_not_of_one_pass(tmp_path):
+    steps = [reply("Plan ready."), reply(spec_json(resource_estimate=BIG))]  # no retry step
+    ctx, backend = make_ctx(tmp_path, steps)
+    ctx.record.stages.append(  # an earlier pass of the Planner already used the retry
+        StageRecord(name="planner", ok=True, resource_retries=1)
+    )
+    ctx.pass_no = 1
+    outcome = run_planner(ctx, TASK)
+    assert not outcome.ok and outcome.attempts == 1
+    assert outcome.reason and outcome.reason.startswith("exceeds resources:")
+    assert len(backend.calls) == 2
+    assert ctx.record.stages[-1].resource_retries == 0
 
 
 def test_planner_retries_when_resources_are_exceeded_together_with_other_errors(tmp_path):
@@ -1064,6 +1152,23 @@ def test_planner_retries_when_resources_are_exceeded_together_with_other_errors(
     assert outcome.ok and outcome.attempts == 2
     feedback = backend.calls[2].messages[-1]["content"]
     assert "exceeds resources:" in feedback and "end_time_s" in feedback
+    assert ctx.record.stages[-1].resource_retries == 0  # mixed errors do not use the budget
+
+
+def test_planner_mixed_errors_leave_the_resource_retry_for_a_later_resource_only_plan(tmp_path):
+    mixed = spec_json(resource_estimate=BIG, solver={**SPEC["solver"], "end_time_s": 0.0})
+    steps = [
+        reply("Plan ready."),
+        reply(mixed),  # resource error plus another error: the ordinary retry
+        reply("Reworked plan."),
+        reply(spec_json(resource_estimate=BIG)),  # resource-only: the one resource retry
+        reply("Reduced plan."),
+        reply(spec_json()),
+    ]
+    ctx, _ = make_ctx(tmp_path, steps)
+    outcome = run_planner(ctx, TASK)
+    assert outcome.ok and outcome.attempts == 3
+    assert ctx.record.stages[-1].resource_retries == 1
 
 
 def test_planner_moves_on_after_eight_tool_turns(tmp_path):

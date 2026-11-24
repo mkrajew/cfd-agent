@@ -161,6 +161,7 @@ class StageRecord(BaseModel):
     attempts: list[AttemptRecord] = Field(default_factory=list)
     ok: bool
     free_restarts: int = Field(default=0, ge=0)
+    resource_retries: int = Field(default=0, ge=0)
     pass_no: int = Field(default=0, ge=0)  # 0 for the first run of the stage, n after fix loop n
 
 
@@ -530,6 +531,14 @@ def write_summary(
                     f"Stage {_stage_label(stage)}: {stage.free_restarts} free restart(s) after "
                     "attempts in which the model sent only blank replies (not counted as "
                     "attempts).",
+                ]
+        for stage in record.stages:
+            if stage.resource_retries:
+                lines += [
+                    "",
+                    f"Stage {_stage_label(stage)}: the plan was reworked once after a resource "
+                    "rejection (the first plan's estimate exceeded the run limits; see its "
+                    "failed attempt).",
                 ]
     else:
         lines.append("No stage was completed.")

@@ -449,6 +449,43 @@ def test_free_restarts_are_in_the_summary_and_old_records_still_load(run):
         StageRecord(name="x", ok=True, free_restarts=-1)
 
 
+def test_resource_retry_is_in_the_summary_and_old_records_still_load(run):
+    attempt = AttemptRecord(n=1, ok=True, seconds=1)
+    record = make_record(
+        status="completed",
+        finished_at=NOW,
+        stages=[
+            StageRecord(name="planner", attempts=[attempt], ok=True, resource_retries=1),
+            StageRecord(name="mesh", attempts=[attempt], ok=True),
+        ],
+    )
+    write_summary(run, record, None)
+    text = run.read_text("summary.md")
+    assert "Stage planner: the plan was reworked once after a resource rejection" in text
+    assert "Stage mesh" not in text
+    write_record(run, record)
+    assert read_record(run).stages[0].resource_retries == 1
+    old = run.read_json("run_record.json")
+    del old["stages"][0]["resource_retries"]
+    assert RunRecord.model_validate(old).stages[0].resource_retries == 0
+    with pytest.raises(ValidationError):
+        StageRecord(name="x", ok=True, resource_retries=-1)
+
+
+def test_resource_retry_line_names_the_pass_of_the_stage(run):
+    attempt = AttemptRecord(n=1, ok=True, seconds=1)
+    record = make_record(
+        status="completed",
+        finished_at=NOW,
+        stages=[
+            StageRecord(name="planner", attempts=[attempt], ok=True, pass_no=1, resource_retries=1)
+        ],
+    )
+    write_summary(run, record, None)
+    text = run.read_text("summary.md")
+    assert "Stage planner (pass 1): the plan was reworked once after a resource rejection" in text
+
+
 def test_summary_contains_comparison_for_benchmark_run(run):
     comparison = {
         "passed": False,
