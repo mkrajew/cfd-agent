@@ -84,7 +84,10 @@ class MeshSpec(_Closed):
 
 class SolverSpec(_Closed):
     suggested_solver: str = Field(description="OpenFOAM solver name")
-    end_time_s: float = Field(description="End time in seconds (iterations for a steady case)")
+    end_time_s: float = Field(
+        description="End time in seconds for a transient case. For a steady solver it is the "
+        "number of iterations (a positive number such as the planned iteration count, never 0)"
+    )
     time_step_s: float | None = Field(
         description="Time step in seconds for a transient case, else null"
     )

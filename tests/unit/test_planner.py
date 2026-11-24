@@ -424,9 +424,41 @@ def test_planner_gate_accepts_a_wedge_for_axisymmetric_cases(angle):
 
 @pytest.mark.parametrize("dimensionality", ["2D", "3D"])
 def test_planner_gate_rejects_a_wedge_angle_unless_axisymmetric(dimensionality):
-    spec = make_spec(dimensionality=dimensionality, geometry=geometry(wedge_angle_deg=5.0))
-    errors = plan_gate(spec, TASK, LIMITS).errors
+    thickness = 0.1 if dimensionality == "2D" else None  # a 3D plan has no thickness
+    wedged = geometry(thickness_m=thickness, wedge_angle_deg=5.0)
+    errors = plan_gate(
+        make_spec(dimensionality=dimensionality, geometry=wedged), TASK, LIMITS
+    ).errors
     assert len(errors) == 1 and "wedge_angle_deg" in errors[0] and "null" in errors[0]
+
+
+def test_planner_gate_rejects_a_3d_plan_with_a_slab_thickness():
+    spec = make_spec(dimensionality="3D", geometry=geometry(thickness_m=0.002))
+    errors = plan_gate(spec, TASK, LIMITS).errors
+    assert len(errors) == 1
+    assert 'dimensionality is "3D" but geometry.thickness_m is set (0.002)' in errors[0]
+    assert "thickness_m null" in errors[0]
+    assert 'dimensionality "2D"' in errors[0] and "empty" in errors[0]
+
+
+def test_planner_gate_rejects_a_3d_plan_with_a_wedge_angle_and_names_the_alternative():
+    spec = make_spec(dimensionality="3D", geometry=geometry(thickness_m=None, wedge_angle_deg=5.0))
+    errors = plan_gate(spec, TASK, LIMITS).errors
+    assert len(errors) == 1
+    assert 'dimensionality is "3D" but geometry.wedge_angle_deg is set (5)' in errors[0]
+    assert 'dimensionality "axisymmetric"' in errors[0]
+
+
+def test_planner_gate_accepts_a_3d_plan_without_thickness_and_wedge_angle():
+    geom = geometry(thickness_m=None, wedge_angle_deg=None)
+    assert gate_errors(dimensionality="3D", geometry=geom) == []
+
+
+def test_planner_gate_rejects_an_axisymmetric_plan_with_a_thickness():
+    wedge = {**wedge_geometry(5.0), "thickness_m": 0.002}
+    errors = gate_errors(dimensionality="axisymmetric", geometry=wedge)
+    assert len(errors) == 1 and 'dimensionality is "axisymmetric"' in errors[0]
+    assert "thickness_m" in errors[0] and "null" in errors[0]
 
 
 def test_planner_gate_allows_a_null_volume_but_not_a_nonpositive_one():
@@ -1053,3 +1085,12 @@ def test_planner_retries_after_any_other_unusable_reply(tmp_path):
     text = backend.calls[2].messages[-1]["content"]
     assert "EmptyChoicesError" in text and "CaseSpec" in text
     assert "tool call" not in text  # phase 2 has no tools
+
+
+def test_end_time_is_described_as_the_iteration_count_for_a_steady_case():
+    from cfdagent.agents.casespec import SolverSpec
+
+    description = SolverSpec.model_fields["end_time_s"].description
+    assert "steady" in description and "iterations" in description and "never 0" in description
+    text = load_prompt("planner").text
+    assert "never 0" in text
