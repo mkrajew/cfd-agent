@@ -174,6 +174,7 @@ class CheckGeometryArgs(ArgsModel):
     expected_bbox: BBox
     expected_volume: _PositiveFinite | None = None
     rel_tol: _PositiveFinite = 1e-3
+    dimensionality: Literal["2D", "axisymmetric", "3D"] | None = None  # selects hints only
 
 
 @op_args("convert_mesh")

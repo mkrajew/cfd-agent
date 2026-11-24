@@ -52,3 +52,11 @@ def test_cadquery_note_says_shape_faces_and_solids_are_lists():
     assert "len(solid.val().Faces())" in text
     assert "len(solid.val().Solids())" in text
     assert "lists" in text and "`.size()`" in text and "Workplane method" in text
+
+
+def test_cadquery_note_says_to_rotate_a_wedge_after_revolving():
+    text = " ".join((NOTES_DIR / "cadquery-api.md").read_text(encoding="utf-8").split())
+    assert "rotate the revolved solid" in text
+    assert "after `.revolve`" in text
+    assert "rotating the sketch before `.revolve`" in text
+    assert "no effect" in text

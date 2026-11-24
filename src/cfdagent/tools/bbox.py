@@ -111,3 +111,34 @@ def compare_bbox(
         f"bounding box mismatch: expected {format_bbox(expected)}, got {format_bbox(actual)} "
         f"(tolerance per coordinate: {format_bbox(tols)})." + mismatch_hint
     )
+
+
+def one_sided_wedge_hint(actual: Sequence[float], expected: Sequence[float], rel_tol: float) -> str:
+    """A hint for an axisymmetric wedge that lies on one side of the x-y plane, else ``""``.
+
+    The expected wedge is symmetric about z = 0. If the actual z range is, within the tolerance of
+    the gate, [0, E] or [-E, 0] with E the expected total z extent, the solid has the right size
+    and sits on one side: the usual cause is a rotation applied to the sketch before ``.revolve``,
+    which does not move the revolved solid. The hint names the rotation that centres it.
+    """
+    if len(actual) != 6 or len(expected) != 6:
+        return ""
+    if not all(math.isfinite(v) for v in (*actual, *expected)):
+        return ""
+    extent = expected[5] - expected[2]
+    if extent <= 0 or not (math.isfinite(rel_tol) and rel_tol > 0):
+        return ""
+    tol = max(rel_tol, REPR_EPS) * extent
+    if abs(expected[2] + expected[5]) <= tol:
+        direction = None
+        if abs(actual[2]) <= tol and abs(actual[5] - extent) <= tol:
+            direction = "minus"  # z from 0 to +E
+        elif abs(actual[5]) <= tol and abs(actual[2] + extent) <= tol:
+            direction = "plus"  # z from -E to 0
+        if direction is not None:
+            return (
+                " Hint: the wedge lies on one side of the x-y plane: rotate the revolved solid "
+                f"about the x axis by {direction} half the wedge angle after .revolve (rotating "
+                "the sketch before revolving has no effect)."
+            )
+    return ""

@@ -305,3 +305,65 @@ def test_mesh_gate_default_tolerance_accepts_an_inscribed_polygon(tmp_path, monk
     strict = check_mesh(tmp_path, _manifest(), expected, rel_tol=1e-3)
     assert not strict.ok
     assert any("bounding box" in e for e in strict.errors)
+
+
+# --------------------------------------------------------------------------------------------
+# Hint for a wedge that lies on one side of the x-y plane
+# --------------------------------------------------------------------------------------------
+
+WEDGE_BOX = (0.0, 0.0, -0.01, 1.0, 0.5, 0.01)  # symmetric about z = 0, total z extent 0.02
+ONE_SIDE_HINT = "the wedge lies on one side of the x-y plane"
+
+
+def _hint_error(tmp_path, monkeypatch, actual, dimensionality):
+    _fake_cadquery(monkeypatch, actual)
+    gate = check_geometry(_geometry_dir(tmp_path), WEDGE_BOX, dimensionality=dimensionality)
+    assert not gate.ok
+    (error,) = [e for e in gate.errors if e.startswith("bounding box mismatch")]
+    return error
+
+
+def test_wedge_on_the_positive_side_gets_the_minus_half_angle_hint(tmp_path, monkeypatch):
+    error = _hint_error(tmp_path, monkeypatch, (0.0, 0.0, 0.0, 1.0, 0.5, 0.02), "axisymmetric")
+    assert ONE_SIDE_HINT in error
+    assert "minus half the wedge angle" in error
+    assert "after .revolve" in error
+    assert "rotating the sketch before revolving has no effect" in error
+
+
+def test_wedge_on_the_negative_side_gets_the_plus_half_angle_hint(tmp_path, monkeypatch):
+    error = _hint_error(tmp_path, monkeypatch, (0.0, 0.0, -0.02, 1.0, 0.5, 0.0), "axisymmetric")
+    assert ONE_SIDE_HINT in error
+    assert "plus half the wedge angle" in error
+    assert "minus half" not in error
+
+
+def test_the_one_sided_hint_tolerates_the_gate_tolerance(tmp_path, monkeypatch):
+    # 0.02 is the expected z extent; a deviation within rel_tol (1e-3) of it still counts.
+    actual = (0.0, 0.0, 1e-8, 1.0, 0.5, 0.02 + 1e-5)
+    error = _hint_error(tmp_path, monkeypatch, actual, "axisymmetric")
+    assert ONE_SIDE_HINT in error
+
+
+def test_a_symmetric_wedge_wrong_in_another_coordinate_gets_no_one_sided_hint(
+    tmp_path, monkeypatch
+):
+    error = _hint_error(tmp_path, monkeypatch, (0.0, 0.0, -0.01, 1.2, 0.5, 0.01), "axisymmetric")
+    assert ONE_SIDE_HINT not in error
+
+
+def test_a_wedge_of_the_wrong_z_extent_gets_no_one_sided_hint(tmp_path, monkeypatch):
+    error = _hint_error(tmp_path, monkeypatch, (0.0, 0.0, 0.0, 1.0, 0.5, 0.03), "axisymmetric")
+    assert ONE_SIDE_HINT not in error
+
+
+@pytest.mark.parametrize("dimensionality", ["2D", "3D", None])
+def test_other_cases_get_no_one_sided_hint(tmp_path, monkeypatch, dimensionality):
+    error = _hint_error(tmp_path, monkeypatch, (0.0, 0.0, 0.0, 1.0, 0.5, 0.02), dimensionality)
+    assert ONE_SIDE_HINT not in error
+
+
+def test_a_matching_wedge_passes_without_a_hint(tmp_path, monkeypatch):
+    _fake_cadquery(monkeypatch, WEDGE_BOX)
+    gate = check_geometry(_geometry_dir(tmp_path), WEDGE_BOX, dimensionality="axisymmetric")
+    assert gate.ok, gate.errors

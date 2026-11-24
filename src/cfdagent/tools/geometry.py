@@ -7,7 +7,7 @@ from pathlib import Path
 
 from cfdagent.gates import GateResult
 from cfdagent.manifest import MANIFEST_FILE_NAME, BoundaryManifest, ManifestError
-from cfdagent.tools.bbox import compare_bbox, validate_expected_bbox
+from cfdagent.tools.bbox import compare_bbox, one_sided_wedge_hint, validate_expected_bbox
 from cfdagent.tools.process import ToolResult, fail_after_run, run_tool
 
 STEP_FILE_NAME = "geometry.step"
@@ -88,6 +88,7 @@ def check_geometry(
     expected_bbox: tuple[float, ...],
     expected_volume: float | None = None,
     rel_tol: float = 1e-3,
+    dimensionality: str | None = None,
 ) -> GateResult:
     """Check the geometry stage output in ``workdir``.
 
@@ -107,6 +108,7 @@ def check_geometry(
     list is rejected); this step is skipped when the manifest is missing or invalid or a solid is
     invalid. NaN or inf in the actual or expected values, a non-numeric ``expected_volume``, and
     a ``rel_tol`` that is not a finite positive number, are gate errors and never pass.
+    ``dimensionality`` only selects hints in the mismatch message; it never changes the verdict.
     """
     workdir = Path(workdir)
     errors: list[str] = []
@@ -175,7 +177,11 @@ def check_geometry(
         max(b.ymax for b in boxes),
         max(b.zmax for b in boxes),
     )
-    mismatch = compare_bbox(actual, tuple(float(v) for v in expected_bbox), rel_tol)
+    expected = tuple(float(v) for v in expected_bbox)
+    hint = (
+        one_sided_wedge_hint(actual, expected, rel_tol) if dimensionality == "axisymmetric" else ""
+    )
+    mismatch = compare_bbox(actual, expected, rel_tol, hint)
     if mismatch is not None:
         errors.append(mismatch)
 

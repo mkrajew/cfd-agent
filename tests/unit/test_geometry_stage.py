@@ -153,6 +153,7 @@ def test_gate_passes_and_sends_the_plan_numbers_to_the_sandbox(tmp_path):
     assert check_args.expected_bbox == [0.0, -0.5, 0.0, 4.0, 0.5, 0.1]
     assert check_args.expected_volume == 0.4
     assert check_args.rel_tol == 1e-3
+    assert check_args.dimensionality == "2D"
     assert check_timeout == GATE_TIMEOUT_S + OUTER_TIMEOUT_MARGIN_S
 
 
@@ -520,6 +521,16 @@ def test_prompt_says_how_to_count_solids_and_faces():
     assert "len(solid.val().Solids())" in text
     assert "len(solid.val().Faces())" in text
     assert "lists" in text and "`.size()`" in text and "Workplane" in text
+
+
+def test_prompt_says_to_rotate_the_wedge_after_revolving():
+    # Rotating the sketch before .revolve() does not move the pending wire: the wedge then lies
+    # on one side of the x-y plane. The rotation belongs on the revolved solid.
+    text = load_prompt("geometry").text
+    assert "after `.revolve`" in text
+    assert "rotating the sketch before revolving" in text
+    assert "has no effect" in text
+    assert "2 R sin(angle/2)" in text
 
 
 def test_prompt_states_the_output_contract_and_the_shared_conventions():
