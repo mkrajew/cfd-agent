@@ -49,9 +49,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -80,7 +81,7 @@ from cfdagent.llm.client import (
 )
 from cfdagent.llm.cost import CostLimitExceeded
 from cfdagent.record import AttemptRecord, StageRecord, redact
-from cfdagent.rundir import UnsafePath
+from cfdagent.rundir import DEFAULT_WRITE_BYTES, MAX_DEPTH, UnsafePath
 
 CONTEXT_CHAR_LIMIT = 200_000  # estimated size of the messages above which old tool output goes
 KEEP_LAST_MESSAGES = 6  # never elided
@@ -139,6 +140,43 @@ UNCHANGED_FIX_PASS = (
 DIAGNOSIS_RESUME = (
     "Your diagnosis is recorded. Continue with attempt {n} of {limit}, in {directory}."
 )
+
+
+FINGERPRINT_MAX_BYTES = DEFAULT_WRITE_BYTES  # a larger file is fingerprinted by size and mtime
+FINGERPRINT_CHUNK = 65536
+
+
+def _fingerprint(path: Path) -> str:
+    """A hash of the content of the regular file ``path``, or a marker (``large:`` or
+    ``unreadable:``, with size and modification time) when it is too big or cannot be read. Never
+    follows a link, never blocks on a FIFO, never reads more than ``FINGERPRINT_MAX_BYTES``."""
+    try:
+        info = os.lstat(path)
+        marker = f"{info.st_size}:{info.st_mtime_ns}"
+        if not stat.S_ISREG(info.st_mode):
+            return f"unreadable:{marker}"
+        if info.st_size > FINGERPRINT_MAX_BYTES:
+            return f"large:{marker}"
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(path, flags)
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                return f"unreadable:{marker}"
+            digest = hashlib.sha256()
+            total = 0
+            with os.fdopen(fd, "rb", closefd=False) as handle:
+                while chunk := handle.read(FINGERPRINT_CHUNK):
+                    total += len(chunk)
+                    if total > FINGERPRINT_MAX_BYTES:  # it grew after the lstat
+                        return f"large:{marker}"
+                    digest.update(chunk)
+            return digest.hexdigest()
+        finally:
+            os.close(fd)
+    except OSError:
+        return f"unreadable:{path.name}"
 
 
 @dataclass(frozen=True)
@@ -466,32 +504,53 @@ class _StageRun(ModelConversation):
 
     def _writable_files(self) -> dict[str, str]:
         """The files of the attempt directory that the stage's scope lets the agent write, as
-        path inside the directory -> hash of the content (a link is never followed)."""
+        path inside the directory -> a fingerprint of the content.
+
+        The directory is hostile input (``rundir``): the walk lists entries without following
+        links, descends only into real directories (to ``MAX_DEPTH``), and never opens anything
+        but a regular file. A FIFO, a device or a link is left out. A file is opened with
+        ``O_NOFOLLOW`` and ``O_NONBLOCK``, checked again with ``fstat`` and hashed in chunks;
+        one larger than ``FINGERPRINT_MAX_BYTES`` or one that cannot be read gets a marker built
+        from its size and modification time, so that it is never read whole and never taken for
+        an absent file."""
         found: dict[str, str] = {}
         root = self.attempt_dir
-        for directory, subdirs, names in os.walk(root):
-            subdirs[:] = [d for d in subdirs if not (Path(directory) / d).is_symlink()]
-            for name in names:
-                path = Path(directory) / name
+        stack = [(root, 0)]
+        while stack:
+            directory, depth = stack.pop()
+            try:
+                entries = list(os.scandir(directory))
+            except OSError:
+                continue
+            for entry in entries:
+                path = Path(entry.path)
                 try:
-                    if path.is_symlink() or not self.stage.scope.can_write(
-                        self.ctx.run.relative(path)
-                    ):
+                    if entry.is_symlink() or getattr(entry, "is_junction", lambda: False)():
                         continue
-                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                    if entry.is_dir(follow_symlinks=False):
+                        if depth < MAX_DEPTH:
+                            stack.append((path, depth + 1))
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue  # a FIFO, socket or device
+                    if not self.stage.scope.can_write(self.ctx.run.relative(path)):
+                        continue
                 except (OSError, UnsafePath):
                     continue
-                found[path.relative_to(root).as_posix()] = digest
+                found[path.relative_to(root).as_posix()] = _fingerprint(path)
         return found
 
     def _unchanged_fix_pass(self, result: GateResult) -> GateResult:
         """``result``, or a failure when it passed in a pass that a fix request started and no file
         the agent may write has changed since the pass began: the same files would fail again for
         the same reason that sent the run back. The comparison is made before the gate runs, so
-        the files a gate writes do not count."""
+        the files a gate writes do not count. Only a pass that was seeded with the stage's earlier
+        files is checked (repair mode ``in_place``); in mode ``fresh`` nothing is seeded, there is
+        no baseline, and the check does not apply."""
         if result.ok and self.tracking_changes and not self.files_changed:
             reason = short(self.ctx.fix_request.reason.strip(), 400) if self.ctx.fix_request else ""
-            return GateResult(False, [UNCHANGED_FIX_PASS.format(reason=reason or "of the request")])
+            message = UNCHANGED_FIX_PASS.format(reason=reason or "of the request")
+            return replace(result, ok=False, errors=[message])
         return result
 
     def _seeded_directory(self, seeded: SeededAttempt) -> Path:

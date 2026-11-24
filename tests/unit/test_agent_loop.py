@@ -1786,6 +1786,79 @@ def test_a_new_file_in_a_fix_pass_is_a_change(tmp_path):
     assert run_stage(ToyStage([GateResult(True, [])]), ctx, seeded=seeded).ok
 
 
+def test_the_rejected_gate_result_keeps_its_data_and_passed_text(tmp_path):
+    class Data(ToyStage):
+        def execute_and_gate(self, ctx, attempt_dir):
+            return GateResult(True, [], data={"found": 1})
+
+        def passed_text(self, result):
+            return f"found {result.data['found']}"
+
+    steps = [reply(None, check("k1")), reply(None, check("k2"))]
+    ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_attempts_per_stage=2))
+    ctx.pass_no, ctx.fix_request = 1, FIX
+    seeded = seeded_attempt(ctx, {"a.py": "x = 1\n"})
+    run_stage(Data([]), ctx, seeded=seeded)
+    attempt = ctx.record.stages[0].attempts[0]
+    assert not attempt.ok and "no file was changed" in attempt.errors[0]
+    seen = [m["content"] for m in backend.calls[1].messages if m["role"] == "tool"]
+    assert "found 1" in seen[-1]  # the data of the gate result reached passed_text
+
+
+def _fingerprints(tmp_path, files=None):
+    """The loop's view of the writable files of a seeded attempt directory."""
+    ctx, _ = make_ctx(tmp_path, [])
+    ctx.pass_no, ctx.fix_request = 1, FIX
+    seeded = seeded_attempt(ctx, files or {"a.py": "x = 1\n"})
+    run = loop._StageRun(ToyStage([]), ctx)
+    run.attempt_dir = seeded.path
+    return run, seeded.path
+
+
+def test_a_symlinked_file_or_directory_is_not_followed_when_looking_for_changes(tmp_path):
+    run, attempt = _fingerprints(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.py").write_text("s = 1\n", encoding="utf-8")
+    try:
+        (attempt / "link.py").symlink_to(outside / "secret.py")
+        (attempt / "linkdir").symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links are not available")
+    assert set(run._writable_files()) == {"a.py"}
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
+def test_a_fifo_with_a_writable_name_is_never_opened(tmp_path):
+    run, attempt = _fingerprints(tmp_path)
+    os.mkfifo(attempt / "pipe.py")  # reading it would block the host for ever
+    assert set(run._writable_files()) == {"a.py"}
+
+
+def test_an_oversize_file_is_marked_not_read_and_a_change_of_it_counts(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "FINGERPRINT_MAX_BYTES", 100)
+    reads = []
+    real_open = loop.os.fdopen
+    monkeypatch.setattr(loop.os, "fdopen", lambda *a, **k: reads.append(a) or real_open(*a, **k))
+    run, attempt = _fingerprints(tmp_path, {"a.py": "x = 1\n", "big.py": "#" * 500})
+    before = run._writable_files()
+    assert before["big.py"].startswith("large:")  # not "absent", not a content hash
+    assert before["a.py"] != before["big.py"] and len(reads) == 1  # only the small file was read
+    (attempt / "big.py").write_bytes(b"#" * 600)
+    assert run._writable_files() != before  # the size is in the marker
+
+
+def test_an_unreadable_file_gets_a_marker_that_is_not_absence(tmp_path, monkeypatch):
+    run, attempt = _fingerprints(tmp_path)
+
+    def refuse(*args, **kwargs):
+        raise PermissionError("no")
+
+    monkeypatch.setattr(loop.os, "open", refuse)
+    marker = run._writable_files()["a.py"]
+    assert marker.startswith("unreadable:")
+
+
 def test_a_failing_gate_in_a_fix_pass_keeps_its_own_message(tmp_path):
     ctx, _ = make_ctx(tmp_path, [reply(None, check())], limits=ONE_TRY)
     ctx.pass_no, ctx.fix_request = 1, FIX
