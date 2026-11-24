@@ -521,6 +521,53 @@ def test_the_steady_criterion_is_reported_with_the_other_problems(tmp_path):
     assert any("laplacianSchemes" in e for e in errors) and any(CRITERION in e for e in errors)
 
 
+# ------------------------------------------------------------------ a wrapper around the entries
+
+
+def wrap_body(text, wrapper):
+    """``text`` with everything after its FoamFile header inside ``wrapper { ... }``."""
+    header, _, body = text.partition("}\n")
+    return f"{header}}}\n{wrapper}\n{{\n{body}}}\n"
+
+
+def test_schemes_wrapped_in_another_dictionary_are_reported_as_nested(tmp_path):
+    def mutate(files):
+        files["system/fvSchemes"] = wrap_body(files["system/fvSchemes"], "schemes")
+
+    errors = errors_of(write_case(tmp_path, "simpleFoam", mutate), "simpleFoam")
+    for name in ("gradSchemes", "divSchemes", "laplacianSchemes"):
+        assert (
+            f"system/fvSchemes: {name} is inside 'schemes {{ }}'; OpenFOAM reads it only at the "
+            "top level of the file: remove the wrapping dictionary"
+        ) in errors
+    assert not any("missing" in e for e in errors)
+    assert len(errors) == 3  # one message per required dictionary, nothing else
+
+
+def test_a_scheme_missing_everywhere_keeps_the_plain_message(tmp_path):
+    def mutate(files):
+        files["system/fvSchemes"] = wrap_body(files["system/fvSchemes"], "schemes").replace(
+            "gradSchemes\n{\n    default Gauss linear;\n}\n", ""
+        )
+
+    errors = errors_of(write_case(tmp_path, "simpleFoam", mutate), "simpleFoam")
+    assert any(e.startswith("system/fvSchemes: missing gradSchemes; add ") for e in errors)
+    assert not any("gradSchemes is inside" in e for e in errors)
+    assert any("divSchemes is inside 'schemes { }'" in e for e in errors)
+
+
+def test_solvers_wrapped_in_another_dictionary_are_reported_as_nested(tmp_path):
+    def mutate(files):
+        files["system/fvSolution"] = wrap_body(files["system/fvSolution"], "solution")
+
+    errors = errors_of(write_case(tmp_path, "icoFoam", mutate), "icoFoam")
+    assert (
+        "system/fvSolution: solvers is inside 'solution { }'; OpenFOAM reads it only at the "
+        "top level of the file: remove the wrapping dictionary"
+    ) in errors
+    assert not any("missing `solvers`" in e for e in errors)
+
+
 def test_a_pison_dictionary_has_no_residual_control(tmp_path):
     def mutate(files):
         with_residual_control(files, "PISO")

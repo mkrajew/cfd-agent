@@ -206,6 +206,21 @@ def _div_skeleton(viscous: bool) -> str:
     return "divSchemes { default none; " + " ".join(entries) + " }"
 
 
+def _nested_message(rel: str, name: str, top: Dictionary) -> str | None:
+    """The message for a required top-level dictionary ``name`` that is not at the top level of
+    the file but inside another top-level dictionary (a wrapper such as ``schemes { ... }``), or
+    ``None`` when it is not found inside any. OpenFOAM reads these only at the top level."""
+    for key, value in top.items():
+        if key == cc.DIRECTIVES or not isinstance(value, dict) or cc.DIRECTIVES in value:
+            continue
+        if isinstance(value.get(name), dict):
+            return (
+                f"{rel}: {name} is inside '{key} {{ }}'; OpenFOAM reads it only at the top level "
+                "of the file: remove the wrapping dictionary"
+            )
+    return None
+
+
 def _schemes_problems(
     case_dir: Path, needs: _Needs, ddt: bool, viscous: bool, skipped: list[str], note: str
 ) -> list[str]:
@@ -226,7 +241,7 @@ def _schemes_problems(
     if schemes is None or cc.DIRECTIVES in schemes:
         return []
     problems = [
-        f'{rel}: missing {name}; add "{skeletons[name]}"'
+        _nested_message(rel, name, schemes) or f'{rel}: missing {name}; add "{skeletons[name]}"'
         for name in required
         if not isinstance(schemes.get(name), dict)
     ]
@@ -325,7 +340,10 @@ def _solution_problems(case_dir: Path, needs: _Needs, skipped: list[str], note: 
         wanted = tuple(name for name in wanted if not name.startswith("U"))
     solvers = solution.get("solvers")
     if not isinstance(solvers, dict):
-        problems.append(f'{rel}: missing `solvers`; add "{_solvers_skeleton(wanted)}"')
+        problems.append(
+            _nested_message(rel, "solvers", solution)
+            or f'{rel}: missing `solvers`; add "{_solvers_skeleton(wanted)}"'
+        )
     elif cc.DIRECTIVES not in solvers:
         keys = [key for key in solvers if key != cc.DIRECTIVES]
         missing = [name for name in wanted if not _covers(keys, name)]
