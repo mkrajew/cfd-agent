@@ -19,9 +19,15 @@ with a fresh budget of ``PHASE_ONE_MAX_TURNS`` model turns and the ordinary toke
 the structured call is repeated. A reply that could not be used at all needs no new calculation
 and is repeated directly. The rework round is not an attempt of its own.
 
-Exception: when the only errors of ``plan_gate`` are resource errors (``exceeds resources:``) the
-run ends at once without a retry. The estimate is a result to record, not something to argue
-away (design 6.8); ``casespec.json`` is written so the estimate is kept.
+Resource errors (``exceeds resources:``) are special. Design 6.8 ends the run when the estimate
+still exceeds the run limits after legitimate reductions; the gate message asks for those
+reductions, so a plan whose only errors are resource errors gets exactly one more attempt, with the
+message as feedback (a rework round like any other). The budget is one retry per run, kept in
+``StageRecord.resource_retries`` (also across the passes of a fix loop), and it needs an attempt
+left within ``limits.max_attempts_per_stage``. When the budget or the attempts are used up, the run
+ends failed with the ``exceeds resources:`` reason; ``casespec.json`` is written so the estimate is
+kept, but it is not an accepted plan. A plan with other errors too is retried by the ordinary rules
+and does not use the budget.
 
 Model calls, billing, logging and the wall-clock and cost limits are shared with the gated stage
 loop (``agents.loop.ModelConversation``).
@@ -662,6 +668,10 @@ class _PlannerRun(ModelConversation):
         )
         self._phase_one()
 
+    def _resource_retry_used(self) -> bool:
+        """Has the run's one resource-reduction retry been spent (in this or an earlier pass)?"""
+        return any(s.resource_retries for s in self.ctx.record.stages if s.name == STAGE)
+
     def _phase_two(self) -> StageOutcome:
         self.phase_one_model = self.model
         self._enter_structured()
@@ -687,9 +697,12 @@ class _PlannerRun(ModelConversation):
                 self._progress()
                 return StageOutcome(ok=True, attempts=self.attempts)
             if spec is not None and _only_resource_errors(errors):
-                self._write(spec)  # the recorded estimate; no retry (design 6.8)
-                self._progress()
-                return self._fail("; ".join(errors))
+                if self.attempts < limit and not self._resource_retry_used():
+                    self.record.resource_retries += 1  # the one reduction attempt of the run
+                else:
+                    self._write(spec)  # the recorded estimate; the run ends (design 6.8)
+                    self._progress()
+                    return self._fail("; ".join(errors))
             if self.attempts >= limit:
                 self._progress()
                 shown = short("; ".join(errors), MAX_REASON_CHARS - 200)
@@ -722,8 +735,9 @@ def run_planner(ctx: StageContext, task_text: str) -> StageOutcome:
     its own turn budget) before the next structured attempt; an unusable structured reply is
     repeated directly. On success ``casespec.json`` is written to the run directory and
     ``ctx.casespec`` is set.
-    A plan whose only problem is the resource estimate ends the stage as failed with the
-    ``exceeds resources:`` message as reason, without a retry; its ``casespec.json`` is written
-    but ``ctx.casespec`` stays unset. See the module docstring for the rest.
+    A plan whose only problem is the resource estimate is reworked once per run (the gate message
+    is the feedback); if the retry is spent or no attempt is left, the stage ends as failed with the
+    ``exceeds resources:`` message as reason; its ``casespec.json`` is written but
+    ``ctx.casespec`` stays unset. See the module docstring for the rest.
     """
     return _PlannerRun(ctx, task_text).run()
