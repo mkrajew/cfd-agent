@@ -4,7 +4,13 @@ import math
 
 import pytest
 
-from cfdagent.tools.bbox import REPR_EPS, compare_bbox, format_bbox, validate_expected_bbox
+from cfdagent.tools.bbox import (
+    REPR_EPS,
+    box_shortfalls,
+    compare_bbox,
+    format_bbox,
+    validate_expected_bbox,
+)
 
 BOX = (0.0, 0.0, 0.0, 1.0, 1.0, 0.1)
 NAN = math.nan
@@ -137,3 +143,32 @@ def test_repr_eps_floor_does_not_hide_a_real_error_far_from_the_origin():
     actual = (100.1, 0.0, 0.0, 100.11, 0.01, 0.01)  # shifted by 1e-3 relative to the offset
     assert abs(actual[0] - expected[0]) > REPR_EPS * abs(expected[0])
     assert compare_bbox(actual, expected, 1e-3) is not None
+
+
+def test_box_shortfalls_empty_when_the_box_contains_the_bbox():
+    assert box_shortfalls((0, 0, 0, 1, 1, 1), (0.1, 0.1, 0.1, 0.9, 0.9, 0.9), 0.0) == []
+    assert box_shortfalls((0, 0, 0, 1, 1, 1), (0, 0, 0, 1, 1, 1), 0.0) == []
+
+
+def test_box_shortfalls_one_bound():
+    # The surface starts 0.01 below the box in y.
+    (miss,) = box_shortfalls((0, 0, 0, 1, 1, 1), (0, -0.01, 0, 1, 1, 1), 0.0)
+    assert miss.bound == "ymin"
+    assert miss.surface == -0.01
+    assert miss.box == 0
+    assert miss.amount == pytest.approx(0.01)
+    assert miss.below  # the surface value is below the box value
+
+
+def test_box_shortfalls_two_bounds_in_bound_order():
+    misses = box_shortfalls((0, 0, 0, 1, 1, 1), (0, 0, -0.5, 1, 1, 1.25), 0.0)
+    assert [m.bound for m in misses] == ["zmin", "zmax"]
+    assert [m.amount for m in misses] == [pytest.approx(0.5), pytest.approx(0.25)]
+    assert [m.below for m in misses] == [True, False]
+
+
+def test_box_shortfalls_subtract_the_tolerance():
+    # 0.01 short, but the box is grown by 0.004 on each side: 0.006 remain.
+    (miss,) = box_shortfalls((0, 0, 0, 1, 1, 1), (0, -0.01, 0, 1, 1, 1), 0.004)
+    assert miss.amount == pytest.approx(0.006)
+    assert box_shortfalls((0, 0, 0, 1, 1, 1), (0, -0.01, 0, 1, 1, 1), 0.01) == []
