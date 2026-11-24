@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -65,10 +66,12 @@ from cfdagent.agents.tools import (
     truncate_utf8,
 )
 from cfdagent.errors import AgentInputError, ToolFailure, as_gate
+from cfdagent.gates import GateResult
 from cfdagent.llm.client import (
     ChatResult,
     LLMError,
     LLMTransportError,
+    StructuredOutputError,
     ToolCall,
     TruncatedOutputError,
     Usage,
@@ -77,6 +80,7 @@ from cfdagent.llm.client import (
 )
 from cfdagent.llm.cost import CostLimitExceeded
 from cfdagent.record import AttemptRecord, StageRecord, redact
+from cfdagent.rundir import UnsafePath
 
 CONTEXT_CHAR_LIMIT = 200_000  # estimated size of the messages above which old tool output goes
 KEEP_LAST_MESSAGES = 6  # never elided
@@ -123,6 +127,15 @@ TURNS_LEFT_NOTE = (
 MAX_REASON_CHARS = 1500
 MAX_ECHOED_ERROR_CHARS = 600
 DIAGNOSIS_TOOL_ANSWER = "not run: this turn is for the diagnosis; reply with plain text"
+DIAGNOSIS_INVALID = (
+    "Your last reply could not be used: {problem}. This turn has no tools: reply again with only "
+    "the JSON object that matches the required schema, with no markdown and no other text."
+)
+UNCHANGED_FIX_PASS = (
+    "this pass was asked to change the files of this stage because {reason}, but no file was "
+    "changed; the same work would fail the same way: change what the fix request names, then "
+    "call check_stage"
+)
 DIAGNOSIS_RESUME = (
     "Your diagnosis is recorded. Continue with attempt {n} of {limit}, in {directory}."
 )
@@ -220,6 +233,7 @@ class ModelConversation:
         self.abort: str | None = None  # why the stage must stop, if it must
         self.logged = 0  # messages already written to the transcript
         self.last_problem: str | None = None  # what the last unusable reply was reported as
+        self.last_error: LLMError | None = None  # the error behind ``last_problem``
         self.last_errors: list[str] = []  # the errors of the last failed attempt
         self.log_attempt: int | None = None  # transcript label override (the diagnosis turn)
         self.record = StageRecord(name=stage_name, ok=False, pass_no=ctx.pass_no)
@@ -292,6 +306,7 @@ class ModelConversation:
         """
         _elide_old_outputs(self.messages)
         self.last_problem = None
+        self.last_error = None
         retries = 0
         while True:
             if self._time_left() <= 0:
@@ -322,6 +337,7 @@ class ModelConversation:
                 self._bill(exc.usage, prompt_chars, len(raw))
                 self._log(sent, None, error=f"{type(exc).__name__}: {exc}")
                 if self.abort is None:
+                    self.last_error = exc
                     self.last_problem = self._unusable_text(exc)
                     self.messages.append({"role": "user", "content": self.last_problem})
                 return None
@@ -380,6 +396,12 @@ class _StageRun(ModelConversation):
         self.no_retry = False  # the stage ended because the stage said a retry cannot help
         # failed attempt, question, schema of a structured reply (None: free text)
         self.diagnosis_due: tuple[AttemptRecord, str, type[BaseModel] | None] | None = None
+        # A pass that a fix request started must change at least one file of its own (see
+        # ``_unchanged_fix_pass``): the files at the start of the attempt, and whether any attempt
+        # of the pass has changed them yet.
+        self.tracking_changes = False
+        self.files_at_start: dict[str, str] = {}
+        self.files_changed = False
         self.blank_replies = 0  # blank replies in a row, answered with a nudge
         self.blank_streak_start = 0  # index of the first blank reply of the current streak
         self.did_work = False  # the model has sent a tool call or text in this attempt
@@ -438,7 +460,39 @@ class _StageRun(ModelConversation):
         for tool in extra:
             registry.add(tool)
         self.registry = registry
+        if self.tracking_changes:
+            self.files_at_start = self._writable_files()
         return carried
+
+    def _writable_files(self) -> dict[str, str]:
+        """The files of the attempt directory that the stage's scope lets the agent write, as
+        path inside the directory -> hash of the content (a link is never followed)."""
+        found: dict[str, str] = {}
+        root = self.attempt_dir
+        for directory, subdirs, names in os.walk(root):
+            subdirs[:] = [d for d in subdirs if not (Path(directory) / d).is_symlink()]
+            for name in names:
+                path = Path(directory) / name
+                try:
+                    if path.is_symlink() or not self.stage.scope.can_write(
+                        self.ctx.run.relative(path)
+                    ):
+                        continue
+                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                except (OSError, UnsafePath):
+                    continue
+                found[path.relative_to(root).as_posix()] = digest
+        return found
+
+    def _unchanged_fix_pass(self, result: GateResult) -> GateResult:
+        """``result``, or a failure when it passed in a pass that a fix request started and no file
+        the agent may write has changed since the pass began: the same files would fail again for
+        the same reason that sent the run back. The comparison is made before the gate runs, so
+        the files a gate writes do not count."""
+        if result.ok and self.tracking_changes and not self.files_changed:
+            reason = short(self.ctx.fix_request.reason.strip(), 400) if self.ctx.fix_request else ""
+            return GateResult(False, [UNCHANGED_FIX_PASS.format(reason=reason or "of the request")])
+        return result
 
     def _seeded_directory(self, seeded: SeededAttempt) -> Path:
         """The directory of a seeded first attempt, after checking that it is the one the loop would
@@ -468,8 +522,11 @@ class _StageRun(ModelConversation):
         if self._time_left() <= 0:
             self.abort = self._wall_clock_reason()
             return "The run's time budget is used up; the stage stops here."
+        if self.tracking_changes and not self.files_changed:
+            self.files_changed = self._writable_files() != self.files_at_start
         # An AgentInputError from the gate is the agent's work being wrong: a failed attempt.
         result = as_gate(lambda: self.stage.execute_and_gate(self.ctx, self.attempt_dir))
+        result = self._unchanged_fix_pass(result)
         seconds = max(0.0, self.ctx.clock() - self.attempt_started)
         self.attempts += 1
         errors = [] if result.ok else [str(e) for e in result.errors]
@@ -518,6 +575,13 @@ class _StageRun(ModelConversation):
     # ------------------------------------------------------------------ the loop
 
     def run(self, seeded: SeededAttempt | None = None) -> StageOutcome:
+        # Only a stage that was seeded with its earlier files has files that "the request names".
+        self.tracking_changes = bool(
+            self.ctx.fix_request is not None
+            and self.ctx.pass_no >= 1
+            and seeded is not None
+            and seeded.carried
+        )
         self._start_attempt(seeded=seeded)
         parts = [self.stage.opening_message(self.ctx)]
         if self.ctx.fix_request is not None:
@@ -658,6 +722,17 @@ class _StageRun(ModelConversation):
         self.log_attempt = attempt.n
         try:
             result = self._ask(response_schema=schema, with_tools=False)
+            invalid = self.last_error
+            if (
+                result is None
+                and schema is not None
+                and isinstance(invalid, StructuredOutputError)
+                and self.abort is None
+            ):
+                # A reply that is not the structured answer (markdown instead of JSON) is shown
+                # its parse error and asked once more.
+                self.messages[-1]["content"] = DIAGNOSIS_INVALID.format(problem=short(invalid))
+                result = self._ask(response_schema=schema, with_tools=False)
         finally:
             self.log_attempt = None
             self.turns = turns_before
@@ -672,6 +747,12 @@ class _StageRun(ModelConversation):
         if schema is not None:
             parsed = result.parsed if result is not None else None
             text = self.stage.take_diagnosis(parsed if isinstance(parsed, schema) else None)
+            error = self.last_error
+            if result is None and not text and isinstance(error, StructuredOutputError):
+                # Still not valid: the model's own words are kept rather than dropped.
+                raw = error.raw_text.strip()[:MAX_REASON_CHARS]
+                if raw:
+                    text = self.stage.take_unparsed_diagnosis(raw)
         else:
             text = (result.content or "").strip() if result is not None else ""
         if text:

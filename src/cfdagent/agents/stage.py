@@ -276,6 +276,15 @@ class Stage(ABC):
         with a ``diagnosis_schema``; the default stores nothing."""
         return None
 
+    def take_unparsed_diagnosis(self, raw: str) -> str | None:
+        """Receive the raw reply of a structured diagnosis turn that still did not validate after
+        one more try (already cut to the reason limit), and return the text to store as
+        ``AttemptRecord.diagnosis`` (``None`` for no text). Called right after
+        ``take_diagnosis(None)``, only when the model sent some text. A stage may keep the text for
+        ``route_after_failure``: a diagnosis in the wrong format is still the model's diagnosis.
+        The default stores nothing."""
+        return None
+
     def retry_after_failure(self, errors: list[str]) -> bool:
         """Whether another attempt can fix a failure (``errors`` are the gate's). A stage whose
         failures are deterministic and outside the agent's reach returns ``False``: the loop then

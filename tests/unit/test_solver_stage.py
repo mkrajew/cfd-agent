@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from test_geometry_stage import Clock, FakeSandbox, make_ctx, plan
 
-from cfdagent.agents.loop import run_stage
+from cfdagent.agents.loop import MAX_REASON_CHARS, run_stage
 from cfdagent.agents.routing import RouteRequest
 from cfdagent.agents.solver_runner import (
     MAX_LOG_LINES,
@@ -1226,15 +1226,52 @@ def test_invalid_diagnosis_reply_defaults_to_case_setup(tmp_path):
             reply(None, run_call("r1")),
             reply(None, tool_call("k1", "check_stage")),
             reply("I think the mesh is bad."),  # not the structured reply that was asked for
+            reply("I still think the mesh is bad."),  # the second try is no better
         ],
     )
     outcome = run_stage(setup.stage, setup.ctx)
     assert not outcome.ok
     route = outcome.route
     assert route is not None and (route.source, route.target) == ("solver_runner", "case_setup")
-    assert "steady state not reached" in route.instruction  # the gate errors are the instruction
+    assert "steady state not reached" in route.instruction  # the gate errors come first
+    # the model's own words are kept, not dropped
+    assert route.instruction.endswith("Solver Runner: I still think the mesh is bad.")
+    assert "Diagnosis: I still think the mesh is bad." in route.reason
     (attempt,) = setup.ctx.record.stages[0].attempts
-    assert attempt.diagnosis is None
+    assert attempt.diagnosis == "I still think the mesh is bad."
+
+
+def test_a_markdown_diagnosis_is_asked_for_again_and_the_json_one_is_used(tmp_path):
+    setup = steady_setup(tmp_path)
+    scripted(
+        setup,
+        [
+            reply(None, run_call("r1")),
+            reply(None, tool_call("k1", "check_stage")),
+            reply("**Diagnosis:** the mesh is bad."),
+            diagnosis_reply("mesh", "bad cells", "remesh"),
+        ],
+    )
+    route = run_stage(setup.stage, setup.ctx).route
+    assert route is not None and route.target == "mesh"
+    assert route.instruction.endswith("Solver Runner: remesh")
+
+
+def test_a_raw_diagnosis_is_cut_to_the_reason_limit(tmp_path):
+    setup = steady_setup(tmp_path)
+    long = "lower endTime " * 500
+    scripted(
+        setup,
+        [
+            reply(None, run_call("r1")),
+            reply(None, tool_call("k1", "check_stage")),
+            reply("markdown"),
+            reply(long),
+        ],
+    )
+    run_stage(setup.stage, setup.ctx)
+    (attempt,) = setup.ctx.record.stages[0].attempts
+    assert attempt.diagnosis == long.strip()[:MAX_REASON_CHARS]
 
 
 def test_a_diagnosis_with_an_empty_instruction_falls_back_to_the_gate_errors(tmp_path):
@@ -1300,11 +1337,13 @@ def test_a_diagnosis_of_one_pass_does_not_leak_into_the_next(tmp_path):
             reply(None, run_call("r2")),
             reply(None, tool_call("k2", "check_stage")),
             reply("not the structured reply"),
+            reply("still not the structured reply"),
         ],
     )
     second = run_stage(setup.stage, setup.ctx)
     assert second.route is not None
     assert second.route.target == "case_setup" and "bad cells" not in second.route.reason
+    assert "still not the structured reply" in second.route.reason
 
 
 def test_the_diagnosis_schema_has_no_length_keywords():
