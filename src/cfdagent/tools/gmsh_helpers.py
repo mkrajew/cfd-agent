@@ -50,6 +50,13 @@ def _effective_tolerance(tol: float) -> float:
     return _GMSH_BBOX_PADDING + tol * largest
 
 
+_OVERLAP_ADVICE = (
+    "a box selects every surface whose whole bounding box lies inside it, so a box that encloses "
+    "the whole solid selects every face: shrink that patch's box (or give it a bound that the "
+    "other surfaces cross) until it holds only its own surfaces"
+)
+
+
 def _join_and(items: list[str]) -> str:
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
 
@@ -105,25 +112,31 @@ def match_surfaces(manifest: BoundaryManifest, tol: float = 1e-6) -> dict[str, l
     bboxes = {tag: tuple(gmsh.model.getBoundingBox(2, tag)) for tag in surfaces}
 
     matched: dict[str, list[int]] = {}
-    owners: dict[int, list[str]] = {tag: [] for tag in surfaces}
+    # surface tag -> (patch name, 1-based number and kind of its first selecting locator)
+    owners: dict[int, list[tuple[str, int, str]]] = {tag: [] for tag in surfaces}
     for patch in manifest.patches:
-        tags = [
-            tag
-            for tag in surfaces
-            if any(_locator_matches(loc, bboxes[tag], tol) for loc in patch.locators)
-        ]
+        tags = []
+        for tag in surfaces:
+            for number, loc in enumerate(patch.locators, start=1):
+                if _locator_matches(loc, bboxes[tag], tol):
+                    tags.append(tag)
+                    owners[tag].append((patch.name, number, loc.kind))
+                    break
         matched[patch.name] = tags
-        for tag in tags:
-            owners[tag].append(patch.name)
 
     problems = []
+    overlap = False
     for tag in surfaces:
         where = f"surface tag {tag}, bounding box {format_bbox(bboxes[tag])}"
         if not owners[tag]:
             hint = _nearest_box_hint(manifest, bboxes[tag], tol)
             problems.append(f"{where} is not matched by any patch{hint}")
         elif len(owners[tag]) > 1:
-            problems.append(f"{where} is matched by more than one patch: {owners[tag]}")
+            who = ", ".join(f"'{n}' (locator {i}, {kind})" for n, i, kind in owners[tag])
+            problems.append(f"{where} is matched by more than one patch: {who}")
+            overlap = True
+    if overlap:
+        problems.append(_OVERLAP_ADVICE)
     problems += [
         f"patch '{name}' matches no boundary surface" for name, tags in matched.items() if not tags
     ]

@@ -615,6 +615,13 @@ def test_opening_messages_state_input_paths(tmp_path):
     assert "only file" in text and "no other" not in text  # the plan is the one file it may read
 
 
+def test_the_prompt_builds_each_box_from_the_face_it_selects():
+    prompt = load_prompt("geometry").text
+    assert "BoundingBox()" in prompt and "own" in prompt
+    assert "never from the bounding box of the whole solid" in prompt
+    assert "larger than the matching tolerance" in prompt
+
+
 def test_the_plan_path_given_to_scripts_leads_from_the_attempt_directory_to_the_plan(tmp_path):
     ctx = make_ctx(tmp_path, FakeSandbox({}))
     (ctx.run.root / "casespec.json").write_text("{}", encoding="utf-8")
