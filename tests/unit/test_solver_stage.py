@@ -1236,7 +1236,7 @@ def test_invalid_diagnosis_reply_defaults_to_case_setup(tmp_path):
     assert "steady state not reached" in route.instruction  # the gate errors come first
     # the model's own words are kept, not dropped
     assert route.instruction.endswith("Solver Runner: I still think the mesh is bad.")
-    assert "Diagnosis: I still think the mesh is bad." in route.reason
+    assert "I still think" not in route.reason  # said once, in the instruction
     (attempt,) = setup.ctx.record.stages[0].attempts
     assert attempt.diagnosis == "I still think the mesh is bad."
 
@@ -1343,7 +1343,7 @@ def test_a_diagnosis_of_one_pass_does_not_leak_into_the_next(tmp_path):
     second = run_stage(setup.stage, setup.ctx)
     assert second.route is not None
     assert second.route.target == "case_setup" and "bad cells" not in second.route.reason
-    assert "still not the structured reply" in second.route.reason
+    assert "still not the structured reply" in second.route.instruction
 
 
 def test_the_diagnosis_schema_has_no_length_keywords():

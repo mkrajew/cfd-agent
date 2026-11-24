@@ -417,8 +417,7 @@ class SolverRunnerStage(Stage):
                 source=STAGE,
                 target="case_setup",
                 origin="gate",
-                reason=f"the solver run failed the gate: {headline}"
-                + (f" Diagnosis: {raw}" if raw else ""),
+                reason=f"the solver run failed the gate: {headline}",  # the text: instruction
                 instruction=(
                     f"Gate: {_clip(gate_text, GATE_TEXT_CHARS)} Solver Runner: {raw}"
                     if raw
