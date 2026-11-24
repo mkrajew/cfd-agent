@@ -247,7 +247,7 @@ CLAUDE.md README.md LICENSE CITATION.cff pyproject.toml .pre-commit-config.yaml
 - **README:** overview, architecture diagram, quick start, Validation section with benchmark results, roadmap, CI badges.
 - **Tests (pytest):** unit (no real LLM; recorded responses; free), integration (full CadQuery → Gmsh → OpenFOAM pipeline in Docker on known-good hand-written scripts, no LLM), e2e (real model + benchmark; manual trigger only, costs money).
 - **CI (GitHub Actions):** on PR — lint (ruff), unit tests, image build, integration tests. On `main` — publish image to GHCR (public).
-- **Branch protection:** `main` only via PR with green CI; **the owner merges**.
+- **Branch protection:** `main` only via PR with green CI; the main session merges after an approving review, and the owner is told afterwards (ADR-0009).
 - **PR template:** what, why, how verified, Azure cost impact.
 - **Issues** with bug/feature templates, labels, **Milestones = §12**.
 - **Dependabot** for Python deps, GitHub Actions and the base image.
@@ -293,7 +293,7 @@ Rules:
 
 ## 10. Local development agents (Claude Code)
 
-Claude (main session) coordinates: talks to the owner in Polish, plans, delegates, ensures nothing merges without review and owner approval. Subagents are defined in `.claude/agents/*.md` (committed).
+Claude (main session) coordinates: talks to the owner in Polish, plans, delegates, ensures nothing merges without green CI and an approving review (ADR-0009). Subagents are defined in `.claude/agents/*.md` (committed).
 
 | Agent | Role | Instruction essentials |
 |---|---|---|
@@ -305,12 +305,12 @@ Claude (main session) coordinates: talks to the owner in Polish, plans, delegate
 | `report-writer` | Final report | Process in §11 |
 
 Other Claude Code files:
-- `CLAUDE.md` (root, ~100–150 lines): project summary and repo map with pointers to docs; language rule; working rules (TDD, PR flow, owner merges, no Azure spending without approval, no secrets, journal); key commands.
+- `CLAUDE.md` (root, ~100–150 lines): project summary and repo map with pointers to docs; language rule; working rules (TDD, PR flow, merges after review, no Azure spending without approval, no secrets, journal); key commands.
 - `infra/CLAUDE.md`: subscription limits, allowed regions, mandatory shutdown, cost estimation.
 - `.claude/settings.json`: allow tests, linting, image builds and (from 2026-11-14, §14.2) `az` without prompting; deny the common irreversible deletes and force pushes.
 - Cloud-agent prompts are **not** CLAUDE.md files; they live in `src/cfdagent/prompts/`.
 
-**Owner approval points:** (1) design decisions / ADRs, (2) PR merge (description + green CI), (3) CFD results at milestones, (4) Azure work outside the standing approval of §14.2 (outside `rg-cfdagent`, irreversible deletes, above $5 or beyond the envelope).
+**Owner approval points:** (1) design decisions / ADRs, (2) CFD results at milestones, (3) Azure work outside the standing approval of §14.2 (outside `rg-cfdagent`, irreversible deletes, above $5 or beyond the envelope).
 
 ## 11. Research documentation and report
 
