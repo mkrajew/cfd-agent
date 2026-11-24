@@ -963,7 +963,7 @@ def test_planner_resource_retry_budget_is_used_once_even_after_other_errors(tmp_
         reply("Fixed plan."),
         reply(spec_json(resource_estimate=BIG)),
     ]
-    ctx, backend = make_ctx(tmp_path, steps)
+    ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_attempts_per_stage=4))
     outcome = run_planner(ctx, TASK)
     assert not outcome.ok and outcome.attempts == 3
     assert outcome.reason and outcome.reason.startswith("exceeds resources:")
@@ -1004,6 +1004,23 @@ def test_planner_retries_when_resources_are_exceeded_together_with_other_errors(
     assert outcome.ok and outcome.attempts == 2
     feedback = backend.calls[2].messages[-1]["content"]
     assert "exceeds resources:" in feedback and "end_time_s" in feedback
+    assert ctx.record.stages[-1].resource_retries == 0  # mixed errors do not use the budget
+
+
+def test_planner_mixed_errors_leave_the_resource_retry_for_a_later_resource_only_plan(tmp_path):
+    mixed = spec_json(resource_estimate=BIG, solver={**SPEC["solver"], "end_time_s": 0.0})
+    steps = [
+        reply("Plan ready."),
+        reply(mixed),  # resource error plus another error: the ordinary retry
+        reply("Reworked plan."),
+        reply(spec_json(resource_estimate=BIG)),  # resource-only: the one resource retry
+        reply("Reduced plan."),
+        reply(spec_json()),
+    ]
+    ctx, _ = make_ctx(tmp_path, steps)
+    outcome = run_planner(ctx, TASK)
+    assert outcome.ok and outcome.attempts == 3
+    assert ctx.record.stages[-1].resource_retries == 1
 
 
 def test_planner_moves_on_after_eight_tool_turns(tmp_path):

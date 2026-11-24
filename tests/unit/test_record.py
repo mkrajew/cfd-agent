@@ -472,6 +472,20 @@ def test_resource_retry_is_in_the_summary_and_old_records_still_load(run):
         StageRecord(name="x", ok=True, resource_retries=-1)
 
 
+def test_resource_retry_line_names_the_pass_of_the_stage(run):
+    attempt = AttemptRecord(n=1, ok=True, seconds=1)
+    record = make_record(
+        status="completed",
+        finished_at=NOW,
+        stages=[
+            StageRecord(name="planner", attempts=[attempt], ok=True, pass_no=1, resource_retries=1)
+        ],
+    )
+    write_summary(run, record, None)
+    text = run.read_text("summary.md")
+    assert "Stage planner (pass 1): the plan was reworked once after a resource rejection" in text
+
+
 def test_summary_contains_comparison_for_benchmark_run(run):
     comparison = {
         "passed": False,
