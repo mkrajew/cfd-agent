@@ -46,6 +46,7 @@ replies.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -103,6 +104,22 @@ CUT_OFF_ADVICE = (
 )
 # Put before the errors of a gate that reports exactly what the previous attempt's gate reported.
 SAME_PROBLEM = "This is the same problem as in the previous attempt; it was not fixed:"
+# A model that goes in circles asks the same question again and again (live runs showed one
+# directory listing requested ten times) and spends the attempt's turns without writing its files.
+# A call that repeats an earlier call of the same attempt and returns the same output is still
+# answered, but the note below is appended: the model learns that the answer is not new.
+REPEATED_CALL_NOTE = (
+    "Note: you already made this exact call in this attempt; its result has not changed. Do not "
+    "repeat calls: use what you have, write the files of this stage and call check_stage."
+)
+# The model cannot see how many turns an attempt has left. When this many are left (and the limit
+# is larger than the number), the last tool result of the turn carries a warning; one warning for
+# each number per attempt. An attempt that runs out of turns fails the stage.
+TURNS_LEFT_WARNINGS = (10, 3)
+TURNS_LEFT_NOTE = (
+    "Turns left in this attempt without a check: {left} of {limit}. Write the files of this "
+    "stage now and call {check}; an attempt that runs out of turns fails the stage."
+)
 MAX_REASON_CHARS = 1500
 MAX_ECHOED_ERROR_CHARS = 600
 DIAGNOSIS_TOOL_ANSWER = "not run: this turn is for the diagnosis; reply with plain text"
@@ -369,6 +386,9 @@ class _StageRun(ModelConversation):
         self.free_restarts = 0  # restarts after a blank-only attempt, for the whole stage
         self.attempt_dir = Path()
         self.attempt_started = 0.0
+        # tool name and normalised arguments -> hash of the output, for the calls of this attempt
+        self.answered: dict[tuple[str, str], str] = {}
+        self.warned_left: set[int] = set()  # the turns-left warnings already given in this attempt
 
     # ------------------------------------------------------------------ attempts and tools
 
@@ -398,6 +418,8 @@ class _StageRun(ModelConversation):
         self.attempt_started = self.ctx.clock()
         self.turns = 0
         self.did_work = False
+        self.answered = {}
+        self.warned_left = set()
         registry = ToolRegistry()
         for tool in builtin_tools(self.ctx.run, self.stage.scope):
             registry.add(tool)
@@ -554,6 +576,8 @@ class _StageRun(ModelConversation):
                 output = self._answer(call, ran_gate)
                 ran_gate = ran_gate or self.attempts != before
                 self.messages.append({"role": "tool", "tool_call_id": call.id, "content": output})
+            if not ran_gate and self.abort is None and not (self.passed or self.exhausted):
+                self._warn_turns_left()
             self._collect_diagnosis()
             if self.passed or self.exhausted or self.abort is not None:
                 break
@@ -680,7 +704,38 @@ class _StageRun(ModelConversation):
                 "not run: the checks already ran in this reply; work in "
                 f"{self._relative(self.attempt_dir)}"
             )
-        return self.registry.dispatch(call)
+        output = self.registry.dispatch(call)
+        if call.name == CHECK_TOOL:
+            return output
+        return self._note_repeated_call(call, output)
+
+    def _note_repeated_call(self, call: ToolCall, output: str) -> str:
+        """``output`` with ``REPEATED_CALL_NOTE`` appended when this exact call was already
+        answered in this attempt with this exact output (it found nothing new)."""
+        try:
+            arguments = json.dumps(call.arguments, sort_keys=True)
+        except (TypeError, ValueError):
+            arguments = repr(call.arguments)
+        key = (call.name, arguments)
+        digest = hashlib.sha256(output.encode("utf-8", "replace")).hexdigest()
+        repeated = self.answered.get(key) == digest
+        self.answered[key] = digest
+        return f"{output}\n\n{REPEATED_CALL_NOTE}" if repeated else output
+
+    def _warn_turns_left(self) -> None:
+        """Append the turns-left warning to the last tool result when the attempt is running low.
+        Only the numbers below the limit apply, and each is given once per attempt (a number that a
+        turn skipped, for example after an unusable reply, is given at the next turn)."""
+        limit = self._turn_limit()
+        left = limit - self.turns
+        if left < 1 or not self.messages or self.messages[-1].get("role") != "tool":
+            return
+        due = {n for n in TURNS_LEFT_WARNINGS if n < limit and left <= n}
+        if not due - self.warned_left:
+            return
+        self.warned_left |= due
+        note = TURNS_LEFT_NOTE.format(left=left, limit=limit, check=CHECK_TOOL)
+        self.messages[-1]["content"] = f"{self.messages[-1]['content']}\n\n{note}"
 
 
 def run_stage(stage: Stage, ctx: StageContext, seeded: SeededAttempt | None = None) -> StageOutcome:

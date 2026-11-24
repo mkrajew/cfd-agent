@@ -715,7 +715,7 @@ def test_old_tool_outputs_are_elided_when_the_conversation_grows(tmp_path, monke
     assert final[0]["content"] == "SYSTEM PROMPT" and final[1]["content"].startswith("Do the toy")
     outputs = [m["content"] for m in final if m["role"] == "tool"]
     assert outputs[0] == "[output elided to save context]"
-    assert outputs[-1] == "B" * 3000  # the newest outputs stay intact
+    assert outputs[-1].startswith("B" * 3000)  # the newest outputs stay intact (plus a repeat note)
     assert len(final) == 2 + 2 * 8
     assert [m["tool_call_id"] for m in final if m["role"] == "tool"] == [f"b{i}" for i in range(8)]
 
@@ -724,7 +724,7 @@ def test_a_small_conversation_is_never_elided(tmp_path):
     steps = [reply(None, tc("big", f"b{i}")) for i in range(4)] + [reply(None, check())]
     ctx, backend = make_ctx(tmp_path, steps)
     run_stage(ToyStage([GateResult(True, [])]), ctx)
-    assert all(m["content"] == "B" * 3000 for m in tool_messages(4, backend))
+    assert all(m["content"].startswith("B" * 3000) for m in tool_messages(4, backend))
 
 
 # ------------------------------------------------------------------ transcript
@@ -1859,3 +1859,128 @@ def test_the_schema_decision_belongs_to_the_gate_that_just_failed(tmp_path):
 def test_the_default_stage_has_no_diagnosis_schema():
     assert ToyStage([GateResult(True, [])]).diagnosis_schema() is None
     assert ToyStage([GateResult(True, [])]).take_diagnosis(None) is None
+
+
+# ------------------------------------------------------------------ going in circles
+
+
+def _tool_texts(backend) -> list[str]:
+    """The tool results the model saw by the time of its last turn, in order."""
+    return [m["content"] for m in tool_messages(len(backend.calls) - 1, backend)]
+
+
+def _calc(i: int, expression: str = "1+1") -> ChatResult:
+    return reply(None, tc("calculator", f"c{i}", expression=expression))
+
+
+def test_a_repeated_identical_call_with_the_same_output_gets_a_note(tmp_path):
+    steps = [_calc(1), _calc(2), reply("done")]
+    ctx, backend = make_ctx(tmp_path, steps)
+    run_stage(ToyStage([GateResult(True, [])]), ctx)
+    first, second = _tool_texts(backend)[:2]
+    assert loop.REPEATED_CALL_NOTE not in first
+    assert second.endswith(loop.REPEATED_CALL_NOTE) and second.startswith(first)
+    assert "already made this exact call" in loop.REPEATED_CALL_NOTE
+
+
+def test_the_note_ignores_the_order_of_the_arguments(tmp_path):
+    first = reply(None, ToolCall(id="r1", name="read_file", arguments={"path": ".", "offset": 0}))
+    again = reply(None, ToolCall(id="r2", name="read_file", arguments={"offset": 0, "path": "."}))
+    ctx, backend = make_ctx(tmp_path, [first, again, reply("x")])
+    run_stage(ToyStage([GateResult(True, [])]), ctx)
+    assert loop.REPEATED_CALL_NOTE in _tool_texts(backend)[1]
+
+
+def test_a_call_with_different_arguments_gets_no_note(tmp_path):
+    steps = [_calc(1, "1+1"), _calc(2, "2+2"), reply("done")]
+    ctx, backend = make_ctx(tmp_path, steps)
+    run_stage(ToyStage([GateResult(True, [])]), ctx)
+    assert all(loop.REPEATED_CALL_NOTE not in t for t in _tool_texts(backend))
+
+
+def test_a_repeated_call_whose_output_changed_gets_no_note(tmp_path):
+    path = "attempts/toy-1/a.txt"
+    steps = [
+        reply(None, tc("write_file", "w1", path=path, content="one")),
+        reply(None, tc("read_file", "r1", path=path)),
+        reply(None, tc("write_file", "w2", path=path, content="two")),
+        reply(None, tc("read_file", "r2", path=path)),  # same call, new content
+        reply(None, tc("read_file", "r3", path=path)),  # same call, same content
+        reply("done"),
+    ]
+    ctx, backend = make_ctx(tmp_path, steps)
+    run_stage(ToyStage([GateResult(True, [])]), ctx)
+    texts = _tool_texts(backend)
+    assert [loop.REPEATED_CALL_NOTE in t for t in texts] == [False, False, False, False, True]
+
+
+def test_the_memory_of_calls_resets_with_a_new_attempt(tmp_path):
+    steps = [_calc(1), reply(None, check("k1")), _calc(2), _calc(3), reply("done")]
+    ctx, backend = make_ctx(tmp_path, steps)
+    run_stage(ToyStage([GateResult(False, ["bad"]), GateResult(True, [])]), ctx)
+    texts = _tool_texts(backend)  # calculator, check result, calculator, calculator
+    assert loop.REPEATED_CALL_NOTE not in texts[0]
+    assert loop.REPEATED_CALL_NOTE not in texts[2]  # first call of attempt 2
+    assert loop.REPEATED_CALL_NOTE in texts[3]
+
+
+def test_check_stage_never_gets_the_note(tmp_path):
+    steps = [reply(None, check("k1")), reply(None, check("k2")), reply(None, check("k3"))]
+    ctx, backend = make_ctx(tmp_path, steps)
+    run_stage(ToyStage([GateResult(False, ["same"])] * 3), ctx)
+    assert all(loop.REPEATED_CALL_NOTE not in t for t in _tool_texts(backend))
+
+
+def _warned(texts: list[str]) -> dict[int, str]:
+    return {i: t for i, t in enumerate(texts) if "Turns left in this attempt" in t}
+
+
+def test_turns_left_warnings_come_at_ten_and_three(tmp_path):
+    steps = [_calc(i, f"{i}+1") for i in range(1, 16)] + [reply("done")]
+    ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_turns_per_attempt=16))
+    run_stage(ToyStage([GateResult(True, [])]), ctx)
+    warned = _warned(_tool_texts(backend))
+    assert sorted(warned) == [5, 12]  # after the 6th turn 10 are left, after the 13th 3
+    assert "10 of 16" in warned[5] and "3 of 16" in warned[12]
+    assert "call check_stage" in warned[5] and "fails the stage" in warned[5]
+
+
+def test_a_short_limit_has_only_the_warning_for_three_left(tmp_path):
+    steps = [_calc(i, f"{i}+1") for i in range(1, 9)]
+    ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_turns_per_attempt=8))
+    run_stage(ToyStage([]), ctx)
+    warned = _warned(_tool_texts(backend))
+    assert sorted(warned) == [4] and "3 of 8" in warned[4]
+
+
+def test_no_warning_when_the_limit_is_three_or_less(tmp_path):
+    steps = [_calc(i, f"{i}+1") for i in range(1, 4)]
+    ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_turns_per_attempt=3))
+    run_stage(ToyStage([]), ctx)
+    assert _warned(_tool_texts(backend)) == {}
+
+
+def test_turns_left_warnings_start_again_in_the_next_attempt(tmp_path):
+    steps = [_calc(i, f"{i}+1") for i in range(1, 5)]  # 4 turns: the warning at 3 left of 7
+    steps.append(reply(None, check("k1")))
+    steps += [_calc(i, f"{i}+9") for i in range(5, 9)]
+    steps.append(reply("done"))
+    ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_turns_per_attempt=7))
+    run_stage(ToyStage([GateResult(False, ["bad"]), GateResult(True, [])]), ctx)
+    assert len(_warned(_tool_texts(backend))) == 2
+
+
+def test_the_reply_that_runs_the_gate_gets_no_warning(tmp_path):
+    # limit 10 would warn "10 left" if the turns of the new attempt were mistaken for the old
+    steps = [reply(None, check("k1")), reply("done")]
+    ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_turns_per_attempt=10))
+    run_stage(ToyStage([GateResult(False, ["bad"]), GateResult(True, [])]), ctx)
+    assert _warned(_tool_texts(backend)) == {}
+
+
+def test_a_blank_reply_refund_does_not_trigger_a_warning(tmp_path):
+    steps = [_calc(1), reply(None), reply(None), _calc(2, "2+2"), reply("done")]
+    ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_turns_per_attempt=5))
+    run_stage(ToyStage([GateResult(True, [])]), ctx)
+    # 5-turn limit: after the 2nd real turn 3 are left, so exactly the second result warns
+    assert sorted(_warned(_tool_texts(backend))) == [1]
