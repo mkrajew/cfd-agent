@@ -19,6 +19,10 @@ with a fresh budget of ``PHASE_ONE_MAX_TURNS`` model turns and the ordinary toke
 the structured call is repeated. A reply that could not be used at all needs no new calculation
 and is repeated directly. The rework round is not an attempt of its own.
 
+The gate also checks where ``geometry.volume_m3`` comes from: when it is not null it has to equal
+a number a ``calculator`` call returned in this run (phase 1 or any rework round), because the
+Geometry stage holds the solid to it within 0.1 %.
+
 Resource errors (``exceeds resources:``) are special. Design 6.8 ends the run when the estimate
 still exceeds the run limits after legitimate reductions; the gate message asks for those
 reductions, so a plan whose only errors are resource errors gets exactly one more attempt, with the
@@ -73,6 +77,7 @@ REYNOLDS_TOLERANCE = 1e-3  # relative, 0.1 %
 THICKNESS_TOLERANCE = 1e-3  # relative to the thickness
 MAX_WEDGE_ANGLE_DEG = 10.0
 VOLUME_TOLERANCE = 1e-3  # relative to the bbox volume
+VOLUME_SOURCE_TOLERANCE = 1e-3  # relative; the geometry gate's 0.1 %
 WEDGE_Y_TOLERANCE = 1e-6  # relative to ymax
 WEDGE_Z_TOLERANCE = 2e-3  # relative to R sin(a/2); the per-coordinate tolerance of the bbox gate
 MAX_SCHEMA_PROBLEMS = 8
@@ -475,8 +480,36 @@ def _resource_errors(spec: CaseSpec, limits: RunLimits) -> list[str]:
     return errors
 
 
-def plan_gate(spec: CaseSpec, task_text: str, limits: RunLimits) -> GateResult:
+def _volume_source_errors(spec: CaseSpec, calculator_results: list[float]) -> list[str]:
+    """``geometry.volume_m3`` must be the result of a calculator call of the run.
+
+    The Geometry stage holds the solid to this number within 0.1 %, so a volume that was not
+    calculated (a guess, or arithmetic done in the head) makes it cut or add material.
+    """
+    volume = spec.geometry.volume_m3
+    if volume is None or not _positive(volume):  # null: nothing to check; invalid: reported above
+        return []
+    for result in calculator_results:
+        if math.isfinite(result) and abs(result - volume) <= VOLUME_SOURCE_TOLERANCE * volume:
+            return []
+    return [
+        f"geometry.volume_m3 is {_num(volume)}, but no calculator call in this conversation "
+        "returned that value (to within 0.1 %); compute the fluid volume (the outer domain "
+        "minus every body removed from it) with the calculator and copy its result without "
+        "rounding, or give null if it cannot be calculated exactly"
+    ]
+
+
+def plan_gate(
+    spec: CaseSpec,
+    task_text: str,
+    limits: RunLimits,
+    calculator_results: list[float] | None = None,
+) -> GateResult:
     """The deterministic checks on a ``CaseSpec`` (design 6.2, stage 1).
+
+    ``calculator_results`` are the numbers the calculator returned in the planning conversation;
+    when given, a non-null ``geometry.volume_m3`` has to be one of them. ``None`` skips that check.
 
     The messages are read by the model on a retry, so each says what is wrong and what to do.
     A resource excess is reported as one message that starts with ``exceeds resources:``; values
@@ -498,6 +531,8 @@ def plan_gate(spec: CaseSpec, task_text: str, limits: RunLimits) -> GateResult:
     errors += _reynolds_errors(spec)
     errors += _stated_reynolds_errors(spec, task_text)
     errors += _geometry_errors(spec)
+    if calculator_results is not None:
+        errors += _volume_source_errors(spec, calculator_results)
     errors += _boundary_errors(spec)
     errors += _solver_errors(spec)
     errors += _resource_errors(spec, limits)
@@ -557,6 +592,8 @@ class _PlannerRun(ModelConversation):
         self.structured = False  # True while a structured (CaseSpec) call is the next step
         self.phase_one_model = self.model  # the model settings of the plain-text rounds
         self.attempt_started = ctx.clock()
+        # every number the calculator returned in this run, phase 1 and the rework rounds
+        self.calculator_results: list[float] = []
 
     # ------------------------------------------------------------------ texts for phase 2
 
@@ -596,7 +633,21 @@ class _PlannerRun(ModelConversation):
         if self._time_left() <= 0:
             self.abort = self._wall_clock_reason()
             return "not run: wall-clock limit reached"
-        return self.registry.dispatch(call)
+        output = self.registry.dispatch(call)
+        self._note_calculator_result(call, output)
+        return output
+
+    def _note_calculator_result(self, call: ToolCall, output: str) -> None:
+        """Keep the number of a successful calculator call (the gate checks the plan's volume
+        against them). An error text and a result that is not a finite number are not kept."""
+        if call.name != "calculator":
+            return
+        try:
+            value = float(output)
+        except ValueError:
+            return
+        if math.isfinite(value):
+            self.calculator_results.append(value)
 
     def _phase_one(self) -> None:
         """Tool loop until the model answers in plain text or runs out of turns."""
@@ -687,7 +738,7 @@ class _PlannerRun(ModelConversation):
                 if not isinstance(result.parsed, CaseSpec):
                     raise TypeError("the backend returned no parsed CaseSpec for a schema call")
                 spec = result.parsed
-                gate = plan_gate(spec, self.task_text, self.limits)
+                gate = plan_gate(spec, self.task_text, self.limits, self.calculator_results)
                 errors = [str(e) for e in gate.errors]
             self._record_attempt(errors)
             if spec is not None and not errors:

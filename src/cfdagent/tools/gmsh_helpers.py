@@ -18,7 +18,7 @@ from __future__ import annotations
 import gmsh
 
 from cfdagent.manifest import BoundaryManifest, Locator, ManifestError
-from cfdagent.tools.bbox import BBox, format_bbox
+from cfdagent.tools.bbox import BBox, box_shortfalls, format_bbox
 
 _AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
 
@@ -48,6 +48,42 @@ def _effective_tolerance(tol: float) -> float:
     xmin, ymin, zmin, xmax, ymax, zmax = gmsh.model.getBoundingBox(-1, -1)
     largest = max(xmax - xmin, ymax - ymin, zmax - zmin)
     return _GMSH_BBOX_PADDING + tol * largest
+
+
+def _join_and(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _nearest_box_hint(manifest: BoundaryManifest, bbox: BBox, tol: float) -> str:
+    """Text naming the box locator that comes closest to selecting ``bbox``, or ``""``.
+
+    Closest means the smallest total shortfall (``box_shortfalls``); the first box in manifest
+    order wins a tie. Empty when the manifest has no box locator.
+    """
+    best = None
+    for patch in manifest.patches:
+        for number, loc in enumerate(patch.locators, start=1):
+            if loc.kind != "box":
+                continue
+            misses = box_shortfalls(loc.box, bbox, tol)
+            if not misses:
+                continue  # a box that selects the surface (or is degenerate) is no near miss
+            total = sum(m.amount for m in misses)
+            if best is None or total < best[0]:
+                best = (total, patch.name, number, misses)
+    if best is None:
+        return ""
+    _, name, number, misses = best
+    parts = [
+        f"{m.bound} (surface {m.surface:.10g} {'<' if m.below else '>'} box {m.box:.10g}, "
+        f"short by {m.amount:.6g})"
+        for m in misses
+    ]
+    return (
+        f"; nearest box: patch '{name}' locator {number} (1-based) misses it at "
+        f"{_join_and(parts)}; a box selects a surface only when the surface's whole bounding "
+        "box lies inside it, so grow the box past the surface, never shrink it"
+    )
 
 
 def match_surfaces(manifest: BoundaryManifest, tol: float = 1e-6) -> dict[str, list[int]]:
@@ -84,7 +120,8 @@ def match_surfaces(manifest: BoundaryManifest, tol: float = 1e-6) -> dict[str, l
     for tag in surfaces:
         where = f"surface tag {tag}, bounding box {format_bbox(bboxes[tag])}"
         if not owners[tag]:
-            problems.append(f"{where} is not matched by any patch")
+            hint = _nearest_box_hint(manifest, bboxes[tag], tol)
+            problems.append(f"{where} is not matched by any patch{hint}")
         elif len(owners[tag]) > 1:
             problems.append(f"{where} is matched by more than one patch: {owners[tag]}")
     problems += [

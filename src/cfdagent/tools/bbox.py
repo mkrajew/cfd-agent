@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from typing import NamedTuple
 
 BBox = tuple[float, float, float, float, float, float]  # xmin, ymin, zmin, xmax, ymax, zmax
 
@@ -21,6 +22,38 @@ REPR_EPS = 1e-5
 
 def format_bbox(bbox: Sequence[float]) -> str:
     return "(" + ", ".join(f"{v:.6g}" for v in bbox) + ")"
+
+
+_BOUND_NAMES = ("xmin", "ymin", "zmin", "xmax", "ymax", "zmax")
+
+
+class BoundMiss(NamedTuple):
+    """One bound of a bounding box that sticks out of a box locator's (grown) box."""
+
+    bound: str  # xmin, ymin, zmin, xmax, ymax or zmax
+    surface: float  # the bounding box value
+    box: float  # the box value on the same bound
+    amount: float  # how far the surface is beyond the box grown by the tolerance (> 0)
+    below: bool  # True: the surface value is below the box value; False: above it
+
+
+def box_shortfalls(box: Sequence[float], bbox: Sequence[float], tol: float) -> list[BoundMiss]:
+    """The bounds at which ``bbox`` extends beyond ``box`` grown by ``tol``, in bound order.
+
+    A box locator selects a surface only if every bound of the surface's bounding box lies inside
+    the box (grown by the tolerance); an empty list therefore means the box selects the surface.
+    The sum of ``amount`` over the result is the total shortfall: how far the box is from
+    selecting the surface.
+    """
+    misses = []
+    for i, name in enumerate(_BOUND_NAMES):
+        if i < 3:
+            amount = (box[i] - tol) - bbox[i]
+        else:
+            amount = bbox[i] - (box[i] + tol)
+        if amount > 0:
+            misses.append(BoundMiss(name, bbox[i], box[i], amount, below=i < 3))
+    return misses
 
 
 def _largest_extent(bbox: Sequence[float]) -> float:
