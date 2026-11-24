@@ -73,6 +73,11 @@ CRITIC_MAX_TURNS = 12  # read-only model turns, then the verdict (ADR-0007)
 REQUIRED_CHECKS = ("requested_outputs", "task_parameters", "convergence", "plausibility")
 SOLVER_SUMMARY = "logs/solver_run.json"
 LOG_TAIL_BYTES = 3000  # the end of the solver log that the opening message carries
+MIN_SUMMARY_CHARS = 3  # a reply shorter than this (empty, ".", "ok") is no summary of the findings
+SUMMARY_AGAIN = (
+    "Your last reply was empty. Reply in plain text with a short summary of your findings (what "
+    "you read and what you found for each of the required checks); the verdict is asked for next."
+)
 MAX_SCHEMA_PROBLEMS = 8
 MAX_FEEDBACK_CHARS = 4000
 MAX_PROBLEM_CHARS = 1000
@@ -125,6 +130,14 @@ def verdict_problems(verdict: CriticVerdict) -> list[str]:
                 "evidence (a check that does not apply to this case passes with the evidence "
                 "'not applicable: <why>')"
             )
+    elif not failed and not verdict.reasons and not verdict.checks:
+        problems.append(
+            f"the verdict is {verdict.verdict} but `checks` and `reasons` are both empty, so it "
+            f"says nothing. List all of {', '.join(REQUIRED_CHECKS)} in `checks`, each with its "
+            "name, whether it passed and its evidence, with passed false for the check that "
+            "found the fault; and give at least one sentence in `reasons` that says what is "
+            "wrong"
+        )
     elif not failed and not verdict.reasons:
         problems.append(
             f"the verdict is {verdict.verdict} but no check failed and no reason is given; "
@@ -266,6 +279,7 @@ class _CriticRun(ModelConversation):
         for tool in file_tools(self.ctx.run, CRITIC_SCOPE):
             if tool.name != "write_file":  # the Critic changes nothing
                 self.registry.add(tool)
+        summary_asked = False
         while self.turns < CRITIC_MAX_TURNS:
             result = self._ask()
             if self.abort is not None:
@@ -273,6 +287,10 @@ class _CriticRun(ModelConversation):
             if result is None:
                 continue
             if not result.tool_calls:
+                if len((result.content or "").strip()) < MIN_SUMMARY_CHARS and not summary_asked:
+                    summary_asked = True  # a blank summary is asked for once more, not twice
+                    self.messages.append({"role": "user", "content": SUMMARY_AGAIN})
+                    continue
                 return
             for call in result.tool_calls:
                 output = self._answer(call)
