@@ -688,6 +688,15 @@ def test_the_prompt_tells_to_take_end_points_from_the_mesh():
     assert "end points" in text and "mesh" in text and "wedge" in text
 
 
+def test_the_prompt_normalises_a_position_by_the_boundary_position_in_the_mesh():
+    text = " ".join(load_prompt("analyst").text.lower().split())
+    assert "divide by the boundary's position in the mesh, not by the ideal length" in text
+    assert "exactly the dimensionless range of the ideal geometry" in text
+    assert "0 to 1" in text
+    assert "which length you used" in text
+    assert "only to the position coordinate" in text
+
+
 # ------------------------------------------------------------------ with the stage loop
 
 
