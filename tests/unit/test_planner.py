@@ -493,7 +493,9 @@ def test_gate_rejects_a_volume_that_no_calculator_call_returned():
     assert len(errors) == 1
     assert "geometry.volume_m3 is 0.4" in errors[0]
     assert "no calculator call in this conversation returned that value" in errors[0]
+    assert "(to within 0.1 %)" in errors[0]
     assert "outer domain minus every body removed" in errors[0]
+    assert "copy its result without rounding" in errors[0]
     assert "give null if it cannot be calculated exactly" in errors[0]
     assert volume_errors([]) == errors  # no call at all is the same
 
@@ -509,6 +511,13 @@ def test_gate_does_not_check_the_volume_provenance_for_a_null_volume_or_unknown_
     assert volume_errors([], volume=None) == []
     assert volume_errors(None) == []  # the check is opt-in: no calculator results, no check
     assert plan_gate(make_spec(), TASK, LIMITS).ok  # the default of the argument
+
+
+@pytest.mark.parametrize("bad", [0.0, -0.4, math.nan, math.inf])
+def test_an_invalid_volume_gets_exactly_one_error_not_a_second_about_its_source(bad):
+    errors = volume_errors([], volume=bad)
+    assert len(errors) == 1
+    assert "greater than 0" in errors[0]
 
 
 def test_the_volume_provenance_error_is_not_a_resource_error():
@@ -691,6 +700,23 @@ def test_planner_counts_calculator_results_of_the_rework_round(tmp_path):
     ctx, _ = make_ctx(tmp_path, steps)
     outcome = run_planner(ctx, TASK)
     assert outcome.ok and outcome.attempts == 2
+    assert ctx.casespec is not None and ctx.casespec.geometry.volume_m3 == VOLUME
+
+
+def test_calculator_results_of_phase_one_survive_a_rework_round(tmp_path):
+    """A rework round for another error must not forget the volume calculated in phase 1."""
+    wrong_re = {"length_m": 1.0, "velocity_m_s": 1.0, "reynolds_number": 150.0}
+    steps = [
+        reply(None, calc("4 * 1 * 0.1")),
+        reply("Plan ready: volume 0.4."),
+        reply(spec_json(geometry={**SPEC["geometry"], "volume_m3": VOLUME}, reference=wrong_re)),
+        reply("Reworked plan: the volume stays 0.4, Reynolds number 100."),  # no new calculation
+        reply(WITH_VOLUME),
+    ]
+    ctx, backend = make_ctx(tmp_path, steps)
+    outcome = run_planner(ctx, TASK)
+    assert outcome.ok and outcome.attempts == 2, outcome.reason
+    assert "reynolds" in backend.calls[3].messages[-1]["content"].lower()
     assert ctx.casespec is not None and ctx.casespec.geometry.volume_m3 == VOLUME
 
 

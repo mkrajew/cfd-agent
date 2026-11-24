@@ -488,9 +488,9 @@ def _volume_source_errors(spec: CaseSpec, calculator_results: list[float]) -> li
             return []
     return [
         f"geometry.volume_m3 is {_num(volume)}, but no calculator call in this conversation "
-        "returned that value; compute the fluid volume (the outer domain minus every body "
-        "removed from it) with the calculator and use its result, or give null if it cannot be "
-        "calculated exactly"
+        "returned that value (to within 0.1 %); compute the fluid volume (the outer domain "
+        "minus every body removed from it) with the calculator and copy its result without "
+        "rounding, or give null if it cannot be calculated exactly"
     ]
 
 
