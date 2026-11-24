@@ -173,7 +173,7 @@ Mechanism is left to the builder. Suggested: the orchestrator launches executor 
 
 ### 6.8 Every task is treated the same (owner's decision)
 There are **no task categories** (no "validated / experimental / out of scope" labels). The system attempts every task with the same pipeline, prompts and tools.
-- **Resources.** If the Planner's estimate still exceeds the run limits (§6.5) after legitimate reductions, the run ends `failed` at stage 1 with the reason ("exceeds resources: …"). This is a recorded result, not a refusal. The same applies when a limit is hit later.
+- **Resources.** If the Planner's estimate still exceeds the run limits (§6.5) after legitimate reductions, the run ends `failed` at stage 1 with the reason ("exceeds resources: …"). The Planner gets one further attempt after a resource-only rejection to find such a reduction (ADR-0008). This is a recorded result, not a refusal. The same applies when a limit is hit later.
 - **Reference comparison.** Whether a result is compared with literature is not decided by any classifier or LLM. A run started from a benchmark task file (`cfdagent bench`, or `cfdagent run --benchmark <id>`) carries a link to that benchmark's reference data in the registry (§9), and the Scorer uses it. Every other run is an ad hoc run without reference data. The agents never see this link (blind evaluation, §9.2).
 - **What the user sees.** `summary.md` always contains either the Scorer's comparison with reference data, or the plain statement *"No reference data for this task; result assessed by physical checks only (convergence, mass balance, plausibility)."*
 
