@@ -615,6 +615,16 @@ def test_opening_messages_state_input_paths(tmp_path):
     assert "only file" in text and "no other" not in text  # the plan is the one file it may read
 
 
+def test_the_plan_path_is_exact_and_not_to_be_derived_from_the_script_location(tmp_path):
+    ctx = make_ctx(tmp_path, FakeSandbox({}))
+    opening = GeometryStage().opening_message(ctx)
+    prompt = load_prompt("geometry").text
+    for text in (opening, prompt):
+        assert "__file__" in text and "never" in text.lower()
+        assert f"open({CASESPEC_FROM_ATTEMPT!r})" in text or f'"{CASESPEC_FROM_ATTEMPT}"' in text
+    assert "attempts/" in prompt  # why: the script's parent's parent is the attempts directory
+
+
 def test_the_prompt_builds_each_box_from_the_face_it_selects():
     prompt = load_prompt("geometry").text
     assert "BoundingBox()" in prompt and "own" in prompt
