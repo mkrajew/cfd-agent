@@ -269,6 +269,20 @@ def _geometry_errors(spec: CaseSpec) -> list[str]:
                     f"geometry.bbox, zmax - zmin = {_num(extent)}; a 2D case is extruded along z "
                     "and the thickness is that extent"
                 )
+    if thickness is not None and spec.dimensionality != "2D":
+        if spec.dimensionality == "3D":
+            errors.append(
+                f'dimensionality is "3D" but geometry.thickness_m is set ({_num(thickness)}); a '
+                "3D plan has thickness_m null. A domain that is one cell thick in z with front "
+                'and back faces is a "2D" case: use dimensionality "2D" with an empty '
+                "front/back boundary, or give a real 3D domain with thickness_m null"
+            )
+        else:
+            errors.append(
+                f'dimensionality is "{spec.dimensionality}" but geometry.thickness_m is set '
+                f"({_num(thickness)}); set it to null (it applies to 2D cases only; the wedge "
+                "opening angle sets the thickness of an axisymmetric case)"
+            )
     angle = geometry.wedge_angle_deg
     if spec.dimensionality == "axisymmetric":
         if angle is None or not (_positive(angle) and angle <= MAX_WEDGE_ANGLE_DEG):
@@ -278,6 +292,12 @@ def _geometry_errors(spec: CaseSpec) -> list[str]:
                 f"{shown}; give the wedge opening angle in degrees, above 0 and at most "
                 f"{MAX_WEDGE_ANGLE_DEG:g} (5 is a good choice)"
             )
+    elif angle is not None and spec.dimensionality == "3D":
+        errors.append(
+            f'dimensionality is "3D" but geometry.wedge_angle_deg is set ({_num(angle)}); a 3D '
+            "plan has wedge_angle_deg null (it applies to axisymmetric cases only). An "
+            'axisymmetric wedge is dimensionality "axisymmetric"; otherwise set it to null'
+        )
     elif angle is not None:
         errors.append(
             f"geometry.wedge_angle_deg is {_num(angle)} but the case is "
