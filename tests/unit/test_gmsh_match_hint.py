@@ -72,7 +72,10 @@ def test_hint_at_one_bound(match):
     assert message.startswith("surface tag 1, bounding box (")
     assert (
         "is not matched by any patch; nearest box: patch 'wall' locator 1 (1-based) "
-        "misses it at ymin (surface -1e-07 < box 0.01); a box selects a surface only when "
+        "misses it at ymin (surface -1e-07 < box 0.01, short by 0.0099"
+    ) in message
+    assert (
+        "); a box selects a surface only when "
         "the surface's whole bounding box lies inside it, so grow the box past the surface, "
         "never shrink it"
     ) in message
@@ -80,9 +83,8 @@ def test_hint_at_one_bound(match):
 
 def test_hint_lists_every_violated_bound(match):
     message = _error(match, FACE, [_patch("wall", _box(-1, -1, 0.002, 1, 2, 0.998))])
-    assert "misses it at zmin (surface -1e-07 < box 0.002) and zmax (surface 1 > box 0.998);" in (
-        message
-    )
+    assert "misses it at zmin (surface -1e-07 < box 0.002, short by 0.0019" in message
+    assert ") and zmax (surface 1.0000001 > box 0.998, short by 0.0019" in message
 
 
 def test_hint_picks_the_box_with_the_smallest_total_shortfall(match):
@@ -110,7 +112,7 @@ def test_hint_shortfall_is_measured_beyond_the_matching_tolerance(match):
     # and no error is raised; 5e-6 short does not match and is reported as such.
     assert match(FACE, [_patch("wall", _box(-1, 5e-7, -1, 1, 2, 2))]) == {"wall": [1]}
     message = _error(match, FACE, [_patch("wall", _box(-1, 5e-6, -1, 1, 2, 2))])
-    assert "at ymin (surface -1e-07 < box 5e-06)" in message
+    assert "at ymin (surface -1e-07 < box 5e-06, short by 4e-06)" in message
 
 
 def test_no_hint_without_box_locators(match):
@@ -125,3 +127,50 @@ def test_no_hint_for_a_surface_that_a_box_matches(match):
     assert "surface tag 1" not in message
     assert message.count("nearest box") == 1
     assert message.startswith("surface tag 2, bounding box (")
+
+
+def test_hint_prints_enough_digits_for_coordinates_of_one_or_more(match):
+    # A face at x = 2 and a box shrunk inward by 3e-6: with 6 significant digits both values
+    # would print as 2 and the hint would read "surface 2 > box 2".
+    surfaces = {1: (2, 0, 0, 2, 1, 1)}
+    message = _error(match, surfaces, [_patch("wall", _box(1, -1, -1, 2 - 3e-6, 2, 2))])
+    assert "xmax (surface 2.0000001 > box 1.999997, short by " in message
+    assert "short by 2e-06)" in message
+
+
+def test_hint_names_only_the_bounds_missed_beyond_the_effective_tolerance(match):
+    # The box starts 1e-6 above the surface in y: inside the effective tolerance (1.1e-6 minus
+    # the 1e-7 Gmsh padding), so the matcher accepts that bound. The box starts 0.01 above the
+    # surface in z: a real miss. Only zmin may be named, whatever tolerance the hint uses.
+    message = _error(match, FACE, [_patch("wall", _box(-1, 1e-6, 0.01, 1, 2, 2))])
+    assert "misses it at zmin (surface -1e-07 < box 0.01, short by " in message
+    assert "ymin" not in message
+    assert " and " not in message.split("misses it at")[1].split(";")[0]
+
+
+def test_hint_prefers_the_smaller_sum_over_the_smaller_maximum(match):
+    patches = [
+        _patch("two_bounds", _box(-1, 0.1, 0.1, 1, 2, 2)),  # 0.1 + 0.1 = 0.2, maximum 0.1
+        _patch("one_bound", _box(-1, 0.15, -1, 1, 2, 2)),  # 0.15, maximum 0.15
+    ]
+    message = _error(match, FACE, patches)
+    assert "nearest box: patch 'one_bound'" in message
+
+
+def test_hint_prefers_the_smaller_sum_over_the_smaller_count(match):
+    patches = [
+        _patch("one_bound", _box(-1, 0.05, -1, 1, 2, 2)),  # one bound, 0.05
+        _patch("two_bounds", _box(-1, 0.01, 0.01, 1, 2, 2)),  # two bounds, 0.02 in total
+    ]
+    message = _error(match, FACE, patches)
+    assert "nearest box: patch 'two_bounds'" in message
+
+
+def test_a_degenerate_box_does_not_hide_the_real_nearest_box(match):
+    nan = float("nan")
+    patches = [
+        _patch("broken", _box(nan, nan, nan, nan, nan, nan)),
+        _patch("real", _box(-1, 0.01, -1, 1, 2, 2)),
+    ]
+    message = _error(match, FACE, patches)
+    assert "nearest box: patch 'real' locator 1" in message

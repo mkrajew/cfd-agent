@@ -172,3 +172,14 @@ def test_box_shortfalls_subtract_the_tolerance():
     (miss,) = box_shortfalls((0, 0, 0, 1, 1, 1), (0, -0.01, 0, 1, 1, 1), 0.004)
     assert miss.amount == pytest.approx(0.006)
     assert box_shortfalls((0, 0, 0, 1, 1, 1), (0, -0.01, 0, 1, 1, 1), 0.01) == []
+
+
+def test_box_shortfalls_tolerance_applies_to_the_upper_bounds():
+    box = (0, 0, 0, 1, 1, 1)
+    # 0.01 beyond the box on every max bound, the box grown by 0.004: 0.006 remain on each.
+    misses = box_shortfalls(box, (0, 0, 0, 1.01, 1.01, 1.01), 0.004)
+    assert [m.bound for m in misses] == ["xmax", "ymax", "zmax"]
+    assert [m.amount for m in misses] == [pytest.approx(0.006)] * 3
+    assert not any(m.below for m in misses)
+    # 0.003 beyond the box is inside the grown box.
+    assert box_shortfalls(box, (0, 0, 0, 1.003, 1.003, 1.003), 0.004) == []

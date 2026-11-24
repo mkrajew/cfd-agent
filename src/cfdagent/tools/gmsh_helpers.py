@@ -66,14 +66,18 @@ def _nearest_box_hint(manifest: BoundaryManifest, bbox: BBox, tol: float) -> str
             if loc.kind != "box":
                 continue
             misses = box_shortfalls(loc.box, bbox, tol)
+            if not misses:
+                continue  # a box that selects the surface (or is degenerate) is no near miss
             total = sum(m.amount for m in misses)
             if best is None or total < best[0]:
                 best = (total, patch.name, number, misses)
-    if best is None or not best[3]:
+    if best is None:
         return ""
     _, name, number, misses = best
     parts = [
-        f"{m.bound} (surface {m.surface:g} {'<' if m.below else '>'} box {m.box:g})" for m in misses
+        f"{m.bound} (surface {m.surface:.10g} {'<' if m.below else '>'} box {m.box:.10g}, "
+        f"short by {m.amount:.6g})"
+        for m in misses
     ]
     return (
         f"; nearest box: patch '{name}' locator {number} (1-based) misses it at "
