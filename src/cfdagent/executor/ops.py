@@ -256,7 +256,11 @@ def check_geometry(args: protocol.CheckGeometryArgs, jail: RunDir) -> dict[str, 
     workdir = _directory(jail, args.workdir)
     _no_links(jail, args.workdir, (geometry_tools.STEP_FILE_NAME, MANIFEST_FILE_NAME))
     gate = geometry_tools.check_geometry(
-        workdir, tuple(args.expected_bbox), args.expected_volume, args.rel_tol
+        workdir,
+        tuple(args.expected_bbox),
+        args.expected_volume,
+        args.rel_tol,
+        args.dimensionality,
     )
     return _gate(gate)
 

@@ -226,6 +226,7 @@ class GeometryStage(KnowledgeTools, Stage):
                 expected_bbox=list(spec.expected_bbox()),
                 expected_volume=spec.expected_volume(),
                 rel_tol=REL_TOL,
+                dimensionality=spec.dimensionality,
             ),
             outer_timeout(gate_s),
         )

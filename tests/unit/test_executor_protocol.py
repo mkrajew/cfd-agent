@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import types
 from pathlib import Path
 
 import pytest
@@ -20,8 +21,11 @@ from cfdagent.errors import AgentInputError, ToolFailure
 from cfdagent.executor import __main__ as executor_main
 from cfdagent.executor import ops, protocol
 from cfdagent.executor.__main__ import main
+from cfdagent.gates import GateResult
+from cfdagent.manifest import MANIFEST_FILE_NAME, BoundaryManifest, BoundaryPatch, Locator
 from cfdagent.rundir import RunDir
 from cfdagent.tools import foam, process
+from cfdagent.tools import geometry as geometry_tools
 
 BRIEF_OPS = {
     "run_script",
@@ -858,3 +862,52 @@ def test_convergence_report_op_passes_the_dimensionality_on(run):
     assert wedge.ok, wedge.error  # the swirl residual is not judged
     _code, flat = _call(run, "convergence_report", {**args, "dimensionality": "2D"}, name="c2")
     assert not flat.ok and "Uz" in flat.error
+
+
+# ------------------------------------------------------------------ check_geometry dimensionality
+
+
+def test_check_geometry_args_dimensionality_is_optional_and_validated():
+    model = protocol.ARG_MODELS["check_geometry"]
+    base = {"workdir": ".", "expected_bbox": [0, 0, 0, 1, 1, 1]}
+    assert model.model_validate(base).dimensionality is None
+    parsed = model.model_validate({**base, "dimensionality": "axisymmetric"})
+    assert parsed.dimensionality == "axisymmetric"
+    with pytest.raises(ValidationError):
+        model.model_validate({**base, "dimensionality": "4D"})
+
+
+def test_check_geometry_passes_the_dimensionality_to_the_tool(run, monkeypatch):
+    seen = {}
+
+    def record(*args, **kwargs):
+        seen["values"] = (*args, *kwargs.values())
+        return GateResult(True, [])
+
+    monkeypatch.setattr(ops.geometry_tools, "check_geometry", record)
+    args = {"workdir": ".", "expected_bbox": [0, 0, 0, 1, 1, 1], "dimensionality": "axisymmetric"}
+    code, answer = _call(run, "check_geometry", args)
+    assert code == 0 and answer.ok
+    assert "axisymmetric" in seen["values"]
+
+
+def test_check_geometry_reports_the_one_sided_wedge_hint_end_to_end(run, monkeypatch):
+    box = types.SimpleNamespace(xmin=0.0, ymin=0.0, zmin=0.0, xmax=1.0, ymax=0.5, zmax=0.02)
+    solid = types.SimpleNamespace(isValid=lambda: True, BoundingBox=lambda: box, Volume=lambda: 1.0)
+    vals = types.SimpleNamespace(vals=lambda: [solid])
+    shape = types.SimpleNamespace(solids=lambda: vals)
+    importers = types.SimpleNamespace(importStep=lambda _path: shape)
+    monkeypatch.setitem(sys.modules, "cadquery", types.SimpleNamespace(importers=importers))
+    monkeypatch.setattr(geometry_tools, "_manifest_coverage_error", lambda *_a: None)
+    patch = BoundaryPatch(
+        name="w", type="wall", locators=[Locator(kind="plane", axis="x", value=0.0)]
+    )
+    BoundaryManifest(dimensionality="axisymmetric", patches=[patch]).to_file(
+        run.path(MANIFEST_FILE_NAME)
+    )
+    run.path(geometry_tools.STEP_FILE_NAME).write_text("stub", encoding="utf-8")
+    args = {"workdir": ".", "expected_bbox": [0, 0, -0.01, 1, 0.5, 0.01]}
+    _, plain = _call(run, "check_geometry", args)
+    _, wedge = _call(run, "check_geometry", {**args, "dimensionality": "axisymmetric"}, name="c2")
+    assert not plain.ok and "one side of the x-y plane" not in plain.error
+    assert not wedge.ok and "one side of the x-y plane" in wedge.error

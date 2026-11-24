@@ -111,3 +111,42 @@ def compare_bbox(
         f"bounding box mismatch: expected {format_bbox(expected)}, got {format_bbox(actual)} "
         f"(tolerance per coordinate: {format_bbox(tols)})." + mismatch_hint
     )
+
+
+def one_sided_wedge_hint(actual: Sequence[float], expected: Sequence[float], rel_tol: float) -> str:
+    """A hint for an axisymmetric wedge that lies on one side of the x-y plane, else ``""``.
+
+    The expected wedge is symmetric about z = 0 with half-thickness ``h = zmax`` and outer radius
+    ``R = ymax``. An unrotated wedge reaches z = R sin(a) = 2 h sqrt(1 - (h / R)^2), a little less
+    than the total extent ``E = 2 h`` (by a factor cos(a / 2), more than the gate tolerance above
+    about 5 degrees). If the actual z range is, within the per-coordinate tolerance of the gate,
+    [0, E] or [0, E_true] (or the same below z = 0), the solid has the right size and sits on one
+    side: the usual cause is a rotation applied to the sketch before ``.revolve``, which does not
+    move the revolved solid. The hint names the rotation that centres it.
+    """
+    if len(actual) != 6 or len(expected) != 6:
+        return ""
+    if not all(math.isfinite(v) for v in (*actual, *expected)):
+        return ""
+    extent = expected[5] - expected[2]
+    if extent <= 0 or not (math.isfinite(rel_tol) and rel_tol > 0):
+        return ""
+    tol_low, tol_high = _axis_tolerances(expected, rel_tol)[2::3]
+    if abs(expected[2] + expected[5]) > tol_low:
+        return ""  # the expected box is not symmetric about z = 0: not a wedge
+    half, radius = expected[5], expected[4]
+    candidates = [extent]
+    if 0 < half < radius:
+        candidates.append(2 * half * math.sqrt(1 - (half / radius) ** 2))
+    direction = None
+    if abs(actual[2]) <= tol_low and any(abs(actual[5] - c) <= tol_high for c in candidates):
+        direction = "minus"  # z from 0 up: rotate by minus half the angle
+    elif abs(actual[5]) <= tol_high and any(abs(actual[2] + c) <= tol_low for c in candidates):
+        direction = "plus"  # z from below up to 0
+    if direction is None:
+        return ""
+    return (
+        " Hint: the wedge lies on one side of the x-y plane: rotate the revolved solid "
+        f"about the x axis by {direction} half the wedge angle after .revolve (rotating "
+        "the sketch before revolving has no effect)."
+    )

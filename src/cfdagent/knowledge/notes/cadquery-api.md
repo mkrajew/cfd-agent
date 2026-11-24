@@ -71,6 +71,10 @@ cq.exporters.export(solid, "geometry.step")
 - Obstacle tool that stops short of a face it should cut through: the hole does not open and
   the obstacle is not a boundary face of the domain. Always count solids and faces.
 - `revolve` with `center(...)` before it: wrong axis (see rule 8).
+- Tilting a wedge by rotating the sketch before `.revolve`: it has no effect, because
+  `.revolve` uses the original pending wire, not the rotated copy, and the wedge stays on one
+  side of the x-y plane (z from 0 to about 2 R sin(angle/2)). To centre it, rotate the revolved
+  solid about the axis by minus half the angle after `.revolve`, then check the bounding box.
 - Treating `solid.val()` as the whole model when the Workplane holds several solids: it is the
   first object only; check `solids().size()`.
 - `solid.val().Faces().size()` or `.Solids().size()`: `AttributeError`, because `Faces()` and
