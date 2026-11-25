@@ -34,10 +34,14 @@ class Pricing:
 # Keyed by Foundry deployment name. Pay-per-token global deployments, read from the public Azure
 # retail prices API (serviceName "Foundry Models", region italynorth, 2026-10-30): gpt-oss-120B
 # 0.00015 / 0.0006 USD per 1K tokens, Llama 3.3 70B 0.00071 / 0.00071 USD per 1K tokens.
-# A model that is not listed here needs explicit prices on the command line.
+# gpt-5.4 (2026-11-25, standard global): 2.50 / 15.00 USD per 1M tokens; a commercial model for
+# a comparison run (ADR-0009), not the default. Cached input is billed lower (0.25), so the
+# tracker overstates its cost; its long-context price is higher, far above the agents' requests.
+# A model that is not listed here cannot be chosen on the command line.
 PRICING: dict[str, Pricing] = {
     "gpt-oss-120b": Pricing(input_per_m=0.15, output_per_m=0.60),
     "Llama-3.3-70B-Instruct": Pricing(input_per_m=0.71, output_per_m=0.71),
+    "gpt-5.4": Pricing(input_per_m=2.50, output_per_m=15.00),
 }
 
 

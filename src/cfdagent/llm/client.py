@@ -411,8 +411,10 @@ class LLMClient:
             params["reasoning_effort"] = model.reasoning_effort
         if tools:
             params["tools"] = tools
-            # The raw tokens let `recover_dropped_calls` act on a reply the service parsed as blank.
-            params["logprobs"] = True
+            if model.request_logprobs:
+                # The raw tokens let `recover_dropped_calls` act on a reply the service parsed as
+                # blank.
+                params["logprobs"] = True
         if response_format is not None:
             params["response_format"] = response_format
 

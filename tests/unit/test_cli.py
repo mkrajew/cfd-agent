@@ -251,6 +251,22 @@ def test_another_model_gets_no_effort_unless_one_is_asked_for(
     models = fake_run_task.calls[0]["config"].models
     assert {m.deployment for m in models.values()} == {"Llama-3.3-70B-Instruct"}
     assert {m.reasoning_effort for m in models.values()} == {None}
+    assert {m.request_logprobs for m in models.values()} == {False}
+
+
+def test_only_the_default_model_requests_logprobs(runner, root, fake_run_task, task_file):
+    assert invoke(runner, "run", str(task_file)).exit_code == 0
+    assert invoke(runner, "run", str(task_file), "--model", "gpt-oss-120b").exit_code == 0
+    result = invoke(
+        runner, "run", str(task_file), "--model", "gpt-5.4", "--reasoning-effort", "medium"
+    )
+    assert result.exit_code == 0, result.output
+    for call, expected in zip(fake_run_task.calls, (True, True, False), strict=True):
+        models = call["config"].models.values()
+        assert {m.request_logprobs for m in models} == {expected}
+    assert {m.reasoning_effort for m in fake_run_task.calls[2]["config"].models.values()} == {
+        "medium"
+    }
 
 
 def test_the_default_model_keeps_the_default_effort(runner, root, fake_run_task, task_file):
@@ -300,6 +316,24 @@ def test_an_unpriced_model_is_a_usage_error(runner, root, fake_run_task, task_fi
     result = invoke(runner, "run", str(task_file), "--model", "mystery-model")
     assert result.exit_code == 2
     assert "mystery-model" in result.output and "gpt-oss-120b" in result.output
+    assert fake_run_task.calls == []
+
+
+def test_max_cost_sets_the_run_cost_cap(runner, root, fake_run_task, task_file):
+    assert invoke(runner, "run", str(task_file)).exit_code == 0
+    assert fake_run_task.calls[0]["config"].limits.max_cost_usd == 1.0  # the default stays
+    result = invoke(runner, "run", str(task_file), "--max-cost-usd", "6")
+    assert result.exit_code == 0, result.output
+    assert fake_run_task.calls[1]["config"].limits.max_cost_usd == 6.0
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "11", "lots"])
+def test_an_invalid_or_too_large_max_cost_is_a_usage_error(
+    runner, root, fake_run_task, task_file, value
+):
+    result = invoke(runner, "run", str(task_file), "--max-cost-usd", value)
+    assert result.exit_code == 2, result.output
+    assert "Traceback" not in result.output
     assert fake_run_task.calls == []
 
 
@@ -1108,6 +1142,8 @@ def test_detach_passes_the_options_on_and_never_the_benchmark_to_a_file(
         "low",
         "--repair-mode",
         "in_place",
+        "--max-cost-usd",
+        "2.5",
         "--no-upload",
         "--detach",
     )
@@ -1118,6 +1154,7 @@ def test_detach_passes_the_options_on_and_never_the_benchmark_to_a_file(
     assert argv[argv.index("--model") + 1] == "Llama-3.3-70B-Instruct"
     assert argv[argv.index("--reasoning-effort") + 1] == "low"
     assert argv[argv.index("--repair-mode") + 1] == "in_place"
+    assert argv[argv.index("--max-cost-usd") + 1] == "2.5"
     assert "--no-upload" in argv
     assert "bench-one" not in run_id  # the id comes from the task text
     for path in root.rglob("*"):

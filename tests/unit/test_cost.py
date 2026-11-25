@@ -15,6 +15,8 @@ def usage(prompt: int, completion: int) -> Usage:
 def test_pricing_table():
     assert PRICING["gpt-oss-120b"] == Pricing(0.15, 0.60)
     assert PRICING["Llama-3.3-70B-Instruct"] == Pricing(0.71, 0.71)
+    assert PRICING["gpt-5.4"] == Pricing(2.50, 15.00)
+    assert "gpt-6.2-sol" not in PRICING
 
 
 def test_cost_tracker_adds_and_caps():
