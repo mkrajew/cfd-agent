@@ -210,7 +210,8 @@ def env(tmp_path: Path) -> dict[str, str]:
         'echo "docker $*" >> "$STUB_CALLS"\n'
         '[ -z "$STUB_DOCKER_FAIL" ] || exit 1\n'
         'case "$1 $2" in\n'
-        '  "image ls") printf "%s" "$STUB_DOCKER_IMAGES" ;;\n'
+        '  "image ls") [ -z "$STUB_DOCKER_LS_FAIL" ] || exit 1\n'
+        '    printf "%s" "$STUB_DOCKER_IMAGES" ;;\n'
         '  "image rm") [ -z "$STUB_DOCKER_RM_FAIL" ] ;;\n'
         "esac\n",
     )
@@ -542,7 +543,12 @@ def test_nothing_is_removed_when_the_image_pull_failed(env):
 
 
 def test_a_pulled_image_of_another_repository_removes_nothing(env):
-    for image in ("registry.example.invalid/team/img:abc", f"{REPO_IMAGE}@sha256:{'a' * 64}"):
+    images = (
+        "registry.example.invalid/team/img:abc",
+        f"{REPO_IMAGE}@sha256:{'a' * 64}",
+        f"{REPO_IMAGE}:sha-aaaaaaa@sha256:{'a' * 64}",
+    )
+    for image in images:
         Path(env["STUB_CALLS"]).unlink(missing_ok=True)
         result = prune_old(env, f"IMAGE_ARG={image};")
         assert result.returncode == 0, result.stderr
@@ -554,7 +560,25 @@ def test_a_tag_that_is_still_in_use_is_reported_and_does_not_stop_the_script(env
     result = prune_old(env)
     assert result.returncode == 0, result.stderr
     assert f"could not remove {REPO_IMAGE}:sha-aaaaaaa" in result.stderr
+    attempts = [c for c in docker_calls(env) if c.startswith("docker image rm")]
+    assert len(attempts) == 3, "one failure does not stop the others"
     assert docker_calls(env)[-1] == "docker image prune -f"
+
+
+def test_nothing_is_removed_when_the_images_cannot_be_listed(env):
+    env["STUB_DOCKER_LS_FAIL"] = "1"
+    result = prune_old(env)
+    assert result.returncode == 0, result.stderr
+    assert "could not list" in result.stderr
+    assert not any(c.startswith("docker image rm") for c in docker_calls(env))
+
+
+def test_nothing_is_removed_when_the_pulled_image_is_missing_from_the_listing(env):
+    listing = f"{REPO_IMAGE}:sha-aaaaaaa\n{REPO_IMAGE}:latest"
+    result = prune_old(env, listing=listing)
+    assert result.returncode == 0, result.stderr
+    assert "is not in the local image list" in result.stderr
+    assert not any(c.startswith("docker image rm") for c in docker_calls(env))
 
 
 def test_cleanup_with_no_old_images_only_prunes_dangling_ones(env):

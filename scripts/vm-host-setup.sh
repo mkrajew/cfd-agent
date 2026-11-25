@@ -402,19 +402,32 @@ pull_image() {
 # tags, and never with --force, so an image that a container uses stays), then dangling images are
 # pruned. Nothing is removed when the pull failed or the pulled image is not from IMAGE_REPO.
 remove_old_images() {
-    local keep ref tag removed=0
+    local keep ref tag listing removed=0
     keep="$(image_reference)"
     if [ "${PULL_FAILED}" = 1 ]; then
         echo "note: the image pull failed, so old images are kept" >&2
         return 0
     fi
     case "${keep}" in
+        *@*)
+            info "old images are not removed: ${keep} is a digest reference"
+            return 0
+            ;;
         "${IMAGE_REPO}":*) ;;
         *)
             info "old images are not removed: ${keep} is not a tag of ${IMAGE_REPO}"
             return 0
             ;;
     esac
+    if ! listing="$(docker image ls --format '{{.Repository}}:{{.Tag}}' "${IMAGE_REPO}")"; then
+        echo "note: could not list the images of ${IMAGE_REPO}; old images are kept" >&2
+        return 0
+    fi
+    # The image just pulled must be in the list, or "every other tag" would be everything.
+    if ! grep -qxF "${keep}" <<<"${listing}"; then
+        echo "note: ${keep} is not in the local image list; old images are kept" >&2
+        return 0
+    fi
     info "old images of ${IMAGE_REPO} (keeping ${keep})"
     while IFS= read -r ref || [ -n "${ref}" ]; do
         case "${ref}" in
@@ -425,13 +438,13 @@ remove_old_images() {
         if [ "${ref}" = "${keep}" ] || [ -z "${tag}" ] || [ "${tag}" = "<none>" ]; then
             continue
         fi
-        if docker image rm "${ref}" >/dev/null; then
+        if docker image rm "${ref}" </dev/null >/dev/null; then
             echo "removed ${ref}"
             removed=$((removed + 1))
         else
             echo "note: could not remove ${ref} (in use by a container?); kept" >&2
         fi
-    done < <(docker image ls --format '{{.Repository}}:{{.Tag}}' "${IMAGE_REPO}" || true)
+    done <<<"${listing}"
     echo "removed ${removed} old image tag(s)"
     docker image prune -f >/dev/null || echo "note: docker image prune failed" >&2
 }
