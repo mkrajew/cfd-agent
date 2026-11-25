@@ -1,6 +1,6 @@
 # M3 carry-over from M2
 
-Source: the M2 Task 17 live development series (runs 7-33, 2026-11-22 to 2026-11-25), recorded in `docs/journal/2026-11-25-m2-task-17-step2-live-development-series.md`, and the triage of its final series (runs `20261124-191508`, `-191832`, `-194334`, `-214411`, image `sha-27a8123`). This file lists what Task 17 left open as input for the M3 plan. Nothing here is decided: items are design decisions for the owner, and an ADR is needed where the design document changes, before anything is built. Sizes are rough (S small, M medium).
+Source: the M2 Task 17 live development series (runs 7-33, 2026-11-22 to 2026-11-25), recorded in `docs/journal/2026-11-25-m2-task-17-step2-live-development-series.md`, and the triage of its final series (runs `20261124-191508`, `-191832`, `-194334`, `-214411`, image `sha-27a8123`). This file lists what Task 17 left open as input for the M3 plan. Nothing here is decided except where an item says so: items are design decisions for the owner, and an ADR is needed where the design document changes, before anything is built. Sizes are rough (S small, M medium).
 
 ## Design decisions for the owner
 
@@ -43,9 +43,11 @@ Evidence: in run 20261125-111308 (gpt-5.4) the tracker counted all input at the 
 
 Evidence: in the same run Case Setup used 656k input tokens (about $2.17) and the Analyst 841k in 19 calls (about $2.79) without writing its quantities, because each turn re-sends the whole conversation. Proposal: summarise or truncate old tool results, and limit what a tool result returns.
 
-### 9. A commercial-model arm in the M3 campaign (budget decision for the owner)
+### 9. A commercial-model arm in the M3 campaign (decided by the owner: yes)
 
 Evidence: in one run (image sha-901dcf8) gpt-5.4 reached the Solver Runner on pipe-re500 with no retries, and its solution passed the Scorer when evaluated outside the pipeline (pressure drop error 0.58 %, profile error 0.12 %); its Analyst still stopped on the cost cap. gpt-oss-120b completed two pipe runs on older images: one passed the pressure-drop check and failed the profile for a post-processing reason, the other failed at 71 %. One run, a different image: not a controlled comparison. Proposal: decide whether a commercial-model arm belongs in the campaign; one run cost about $6 tracked, so the arm needs its own budget line.
+
+Decision (owner, in chat, 2026-11-25): the M3 campaign includes variants with commercial models beside gpt-oss-120b. Which models, how many runs per arm and the budget line are left to the M3 plan and the owner's approval under CLAUDE.md rule 4. Items 7 and 8 would lower the cost of such an arm.
 
 ### 10. Responses API support (S)
 
