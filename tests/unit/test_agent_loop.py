@@ -1724,23 +1724,147 @@ def seeded_attempt(ctx, files, pass_no=1, name="toy"):
     attempt = ctx.run.attempt_dir(name, 1, pass_no)
     carried = []
     for rel, text in files.items():
-        (attempt / rel).write_text(text, encoding="utf-8")
+        (attempt / rel).write_bytes(text.encode("utf-8"))  # no newline translation
         carried.append(f"{ctx.run.relative(attempt)}/{rel}")
     return SeededAttempt(attempt, carried)
 
 
 def test_a_pre_seeded_first_attempt_is_kept_and_announced(tmp_path):
-    ctx, backend = make_ctx(tmp_path, [reply(None, check())])
+    steps = [write_a(path="attempts/toy-p1-1/a.py", content="x = 2\n"), reply(None, check())]
+    ctx, backend = make_ctx(tmp_path, steps)
     ctx.pass_no, ctx.fix_request = 1, FIX
     seeded = seeded_attempt(ctx, {"a.py": "x = 1\n"})
     stage = ToyStage([GateResult(True, [])])
     assert run_stage(stage, ctx, seeded=seeded).ok
     assert stage.gate_dirs == [seeded.path]
-    assert (seeded.path / "a.py").read_text(encoding="utf-8") == "x = 1\n"  # not wiped
+    assert (seeded.path / "a.py").read_text(encoding="utf-8") == "x = 2\n"  # kept, then edited
     opening = backend.calls[0].messages[1]["content"]
     assert "attempts/toy-p1-1/a.py" in opening
     assert "already in the attempt directory" in opening
     assert opening.index("Fix requested by") < opening.index("attempts/toy-p1-1/a.py")
+
+
+def test_a_fix_pass_that_changes_no_seeded_file_is_rejected(tmp_path):
+    steps = [
+        reply(None, check("k1")),  # nothing written: the gate would pass, but must not count
+        write_a(path="attempts/toy-p1-2/a.py", content="x = 2\n"),
+        reply(None, check("k2")),
+    ]
+    ctx, backend = make_ctx(tmp_path, steps)
+    ctx.pass_no, ctx.fix_request = 1, FIX
+    seeded = seeded_attempt(ctx, {"a.py": "x = 1\n"})
+    stage = ToyStage([GateResult(True, []), GateResult(True, [])])
+    outcome = run_stage(stage, ctx, seeded=seeded)
+    assert outcome.ok and outcome.attempts == 2
+    first = ctx.record.stages[0].attempts[0]
+    assert not first.ok
+    (message,) = first.errors
+    assert "the residuals did not fall" in message and "no file was changed" in message
+    assert "the same work would fail the same way" in message
+    assert stage.promoted == [ctx.run.attempt_dir("toy", 2, 1)]
+
+
+def test_rewriting_a_seeded_file_with_the_same_text_is_not_a_change(tmp_path):
+    steps = [
+        write_a(path="attempts/toy-p1-1/a.py", content="x = 1\n"),
+        reply(None, check("k1")),
+        reply(None, check("k2")),
+    ]
+    ctx, _ = make_ctx(tmp_path, steps, limits=RunLimits(max_attempts_per_stage=2))
+    ctx.pass_no, ctx.fix_request = 1, FIX
+    seeded = seeded_attempt(ctx, {"a.py": "x = 1\n"})
+    outcome = run_stage(ToyStage([GateResult(True, []), GateResult(True, [])]), ctx, seeded=seeded)
+    assert not outcome.ok and outcome.attempts == 2
+    assert all("no file was changed" in a.errors[0] for a in ctx.record.stages[0].attempts)
+
+
+def test_a_new_file_in_a_fix_pass_is_a_change(tmp_path):
+    steps = [write_a(path="attempts/toy-p1-1/b.py", content="y = 1\n"), reply(None, check())]
+    ctx, _ = make_ctx(tmp_path, steps)
+    ctx.pass_no, ctx.fix_request = 1, FIX
+    seeded = seeded_attempt(ctx, {"a.py": "x = 1\n"})
+    assert run_stage(ToyStage([GateResult(True, [])]), ctx, seeded=seeded).ok
+
+
+def test_the_rejected_gate_result_keeps_its_data_and_passed_text(tmp_path):
+    class Data(ToyStage):
+        def execute_and_gate(self, ctx, attempt_dir):
+            return GateResult(True, [], data={"found": 1})
+
+        def passed_text(self, result):
+            return f"found {result.data['found']}"
+
+    steps = [reply(None, check("k1")), reply(None, check("k2"))]
+    ctx, backend = make_ctx(tmp_path, steps, limits=RunLimits(max_attempts_per_stage=2))
+    ctx.pass_no, ctx.fix_request = 1, FIX
+    seeded = seeded_attempt(ctx, {"a.py": "x = 1\n"})
+    run_stage(Data([]), ctx, seeded=seeded)
+    attempt = ctx.record.stages[0].attempts[0]
+    assert not attempt.ok and "no file was changed" in attempt.errors[0]
+    seen = [m["content"] for m in backend.calls[1].messages if m["role"] == "tool"]
+    assert "found 1" in seen[-1]  # the data of the gate result reached passed_text
+
+
+def _fingerprints(tmp_path, files=None):
+    """The loop's view of the writable files of a seeded attempt directory."""
+    ctx, _ = make_ctx(tmp_path, [])
+    ctx.pass_no, ctx.fix_request = 1, FIX
+    seeded = seeded_attempt(ctx, files or {"a.py": "x = 1\n"})
+    run = loop._StageRun(ToyStage([]), ctx)
+    run.attempt_dir = seeded.path
+    return run, seeded.path
+
+
+def test_a_symlinked_file_or_directory_is_not_followed_when_looking_for_changes(tmp_path):
+    run, attempt = _fingerprints(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.py").write_text("s = 1\n", encoding="utf-8")
+    try:
+        (attempt / "link.py").symlink_to(outside / "secret.py")
+        (attempt / "linkdir").symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symbolic links are not available")
+    assert set(run._writable_files()) == {"a.py"}
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no FIFOs on this platform")
+def test_a_fifo_with_a_writable_name_is_never_opened(tmp_path):
+    run, attempt = _fingerprints(tmp_path)
+    os.mkfifo(attempt / "pipe.py")  # reading it would block the host for ever
+    assert set(run._writable_files()) == {"a.py"}
+
+
+def test_an_oversize_file_is_marked_not_read_and_a_change_of_it_counts(tmp_path, monkeypatch):
+    monkeypatch.setattr(loop, "FINGERPRINT_MAX_BYTES", 100)
+    reads = []
+    real_open = loop.os.fdopen
+    monkeypatch.setattr(loop.os, "fdopen", lambda *a, **k: reads.append(a) or real_open(*a, **k))
+    run, attempt = _fingerprints(tmp_path, {"a.py": "x = 1\n", "big.py": "#" * 500})
+    before = run._writable_files()
+    assert before["big.py"].startswith("large:")  # not "absent", not a content hash
+    assert before["a.py"] != before["big.py"] and len(reads) == 1  # only the small file was read
+    (attempt / "big.py").write_bytes(b"#" * 600)
+    assert run._writable_files() != before  # the size is in the marker
+
+
+def test_an_unreadable_file_gets_a_marker_that_is_not_absence(tmp_path, monkeypatch):
+    run, attempt = _fingerprints(tmp_path)
+
+    def refuse(*args, **kwargs):
+        raise PermissionError("no")
+
+    monkeypatch.setattr(loop.os, "open", refuse)
+    marker = run._writable_files()["a.py"]
+    assert marker.startswith("unreadable:")
+
+
+def test_a_failing_gate_in_a_fix_pass_keeps_its_own_message(tmp_path):
+    ctx, _ = make_ctx(tmp_path, [reply(None, check())], limits=ONE_TRY)
+    ctx.pass_no, ctx.fix_request = 1, FIX
+    seeded = seeded_attempt(ctx, {"a.py": "x = 1\n"})
+    run_stage(ToyStage([GateResult(False, ["real problem"])]), ctx, seeded=seeded)
+    assert ctx.record.stages[0].attempts[0].errors == ["real problem"]
 
 
 def test_the_attempt_after_a_seeded_one_is_prepared_in_the_usual_way(tmp_path):
@@ -1825,13 +1949,54 @@ def test_a_stage_with_a_schema_gets_one_structured_call_without_tools(tmp_path):
 
 
 def test_an_unusable_structured_reply_is_given_to_the_stage_as_none(tmp_path):
-    steps = [reply(None, check("k1")), reply("not json at all")]
+    steps = [reply(None, check("k1")), reply("not json at all"), reply("still not json")]
     ctx, _ = make_ctx(tmp_path, steps, limits=ONE_TRY)
     stage = StructuredStage([GateResult(False, ["bad"])])
     outcome = run_stage(stage, ctx)
     assert stage.taken == [None]
     assert ctx.record.stages[0].attempts[0].diagnosis is None
     assert outcome.route is not None and outcome.route.target == "case_setup"
+
+
+def test_an_invalid_structured_reply_is_asked_for_once_more_with_the_parse_error(tmp_path):
+    steps = [reply(None, check("k1")), reply("**Diagnosis:** too coarse"), structured()]
+    ctx, backend = make_ctx(tmp_path, steps, limits=ONE_TRY)
+    stage = StructuredStage([GateResult(False, ["bad"])])
+    outcome = run_stage(stage, ctx)
+    assert len(backend.calls) == 3
+    retry = backend.calls[2]
+    assert retry.response_schema is Cause and retry.tools is None
+    shown = retry.messages[-1]["content"]
+    assert retry.messages[-1]["role"] == "user"
+    assert "does not match schema" in shown and "only the JSON object" in shown
+    assert [p.model_dump() for p in stage.taken] == [{"cause": "too coarse", "target": "mesh"}]
+    assert ctx.record.stages[0].attempts[0].diagnosis == "too coarse"
+    assert outcome.route is not None and outcome.route.target == "mesh"
+
+
+def test_a_diagnosis_that_stays_invalid_keeps_the_raw_reply_for_the_stage(tmp_path):
+    class Keeping(StructuredStage):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.raw: list[str] = []
+
+        def take_unparsed_diagnosis(self, raw):
+            self.raw.append(raw)
+            return raw
+
+    long = "Lower endTime. " * 400
+    steps = [reply(None, check("k1")), reply("first markdown"), reply(long)]
+    ctx, backend = make_ctx(tmp_path, steps, limits=ONE_TRY)
+    stage = Keeping([GateResult(False, ["bad"])])
+    run_stage(stage, ctx)
+    assert len(backend.calls) == 3  # one retry, not more
+    assert stage.taken == [None]
+    assert stage.raw == [long.strip()[: loop.MAX_REASON_CHARS]]
+    assert ctx.record.stages[0].attempts[0].diagnosis == long.strip()[: loop.MAX_REASON_CHARS]
+
+
+def test_the_default_stage_ignores_an_unparsed_diagnosis():
+    assert ToyStage([]).take_unparsed_diagnosis("anything") is None
 
 
 def test_a_structured_diagnosis_does_not_spend_a_turn_of_the_attempt(tmp_path):

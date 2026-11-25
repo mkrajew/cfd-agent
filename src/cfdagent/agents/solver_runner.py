@@ -205,6 +205,7 @@ class SolverRunnerStage(Stage):
         self._copies: dict[Path, int] = {}  # attempt directory -> runs started in it
         self._ran = False  # the failure judged last is one of a run that happened
         self._diagnosis: SolverDiagnosis | None = None  # the reply to the last diagnosis turn
+        self._raw_diagnosis: str | None = None  # its text, when it never became valid JSON
 
     # ------------------------------------------------------------------ the agent's task
 
@@ -303,6 +304,7 @@ class SolverRunnerStage(Stage):
         spec = self._spec(ctx)
         solver = self._solver(spec)
         self._diagnosis = None  # a diagnosis belongs to the failure that was judged before it
+        self._raw_diagnosis = None
         run = self._last.get(attempt_dir)
         if run is None:
             self._ran = False
@@ -389,9 +391,16 @@ class SolverRunnerStage(Stage):
 
     def take_diagnosis(self, parsed: BaseModel | None) -> str | None:
         self._diagnosis = parsed if isinstance(parsed, SolverDiagnosis) else None
+        self._raw_diagnosis = None
         if self._diagnosis is None:
             return None
         return self._diagnosis.diagnosis.strip() or None
+
+    def take_unparsed_diagnosis(self, raw: str) -> str | None:
+        """The model answered in prose twice: its words are still its diagnosis, and the fix
+        request carries them with the gate text (the target stays Case Setup)."""
+        self._raw_diagnosis = raw.strip() or None
+        return self._raw_diagnosis
 
     def route_after_failure(self, ctx: StageContext, errors: list[str]) -> RouteRequest | None:
         """The fix request of a failed gate of a run that happened (ADR-0006): to the stage that
@@ -402,12 +411,18 @@ class SolverRunnerStage(Stage):
         headline = _clip(errors[0].partition("\n")[0], 400)
         diagnosis = self._diagnosis
         if diagnosis is None:
+            raw = self._raw_diagnosis
+            gate_text = "\n".join(errors)
             return RouteRequest(
                 source=STAGE,
                 target="case_setup",
                 origin="gate",
-                reason=f"the solver run failed the gate: {headline}",
-                instruction="\n".join(errors),
+                reason=f"the solver run failed the gate: {headline}",  # the text: instruction
+                instruction=(
+                    f"Gate: {_clip(gate_text, GATE_TEXT_CHARS)} Solver Runner: {raw}"
+                    if raw
+                    else gate_text
+                ),
             )
         gate_text = "\n".join(errors)
         advice = diagnosis.instruction.strip()

@@ -361,6 +361,49 @@ def test_a_success_with_all_required_checks_and_extra_ones_is_accepted(tmp_path)
     assert len(ctx.record.critic_verdict.checks) == 5
 
 
+def test_a_verdict_with_empty_checks_and_empty_reasons_is_told_both_lists_are_empty():
+    data = json.loads(verdict_json("failed", reasons=[]))
+    data["checks"] = []
+    (message,) = verdict_problems(CriticVerdict.model_validate(data))
+    assert "`checks` and `reasons` are both empty" in message
+    for name in REQUIRED_CHECKS:
+        assert name in message  # the names that `checks` must list
+    assert "evidence" in message and "at least one" in message
+
+
+def test_the_empty_lists_message_is_only_for_empty_lists():
+    reasonless = make_verdict(verdict="failed", reasons=[])  # four checks, all passed
+    (message,) = verdict_problems(reasonless)
+    assert "both empty" not in message and "no check failed" in message
+
+
+def test_a_near_empty_summary_is_asked_for_once_more(tmp_path):
+    steps = [reply("  "), reply("Everything was read; the run looks sound."), reply(verdict_json())]
+    ctx, backend = make_ctx(tmp_path, steps)
+    populate(ctx.run)
+    assert run_critic(ctx, TASK).ok
+    assert len(backend.calls) == 3
+    asked = backend.calls[1].messages[-1]
+    assert asked["role"] == "user" and "summary" in asked["content"]
+    assert backend.calls[2].response_schema is CriticVerdict  # then the verdict is requested
+
+
+def test_an_empty_summary_is_asked_for_only_once(tmp_path):
+    steps = [reply(""), reply(""), reply(verdict_json())]
+    ctx, backend = make_ctx(tmp_path, steps)
+    populate(ctx.run)
+    assert run_critic(ctx, TASK).ok
+    assert len(backend.calls) == 3  # the second blank reply goes on to the verdict
+    assert [c.response_schema for c in backend.calls] == [None, None, CriticVerdict]
+
+
+def test_a_summary_of_a_normal_length_is_not_asked_for_again(tmp_path):
+    ctx, backend = make_ctx(tmp_path, [reply("Read all the files; fine."), reply(verdict_json())])
+    populate(ctx.run)
+    assert run_critic(ctx, TASK).ok
+    assert len(backend.calls) == 2
+
+
 def test_a_verdict_that_is_not_a_success_needs_a_failed_check_or_a_reason():
     reasonless = make_verdict(verdict="failed", reasons=[])
     assert verdict_problems(reasonless) and "reason" in verdict_problems(reasonless)[0]

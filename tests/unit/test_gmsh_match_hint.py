@@ -174,3 +174,35 @@ def test_a_degenerate_box_does_not_hide_the_real_nearest_box(match):
     ]
     message = _error(match, FACE, patches)
     assert "nearest box: patch 'real' locator 1" in message
+
+
+# ------------------------------------------------------------------ a surface in two patches
+
+
+def test_overlap_names_the_locator_of_each_patch(match):
+    surfaces = {1: (0, 0, 0, 0, 1, 1), 2: (1, 0, 0, 1, 1, 1)}
+    patches = [
+        _patch("inlet", _plane("x", 0.0)),
+        _patch("wall", _plane("y", 9.0), _box(-1, -1, -1, 2, 2, 2)),  # the box is locator 2
+        _patch("outlet", _plane("x", 1.0)),
+    ]
+    message = _error(match, surfaces, patches)
+    assert "surface tag 1, bounding box (" in message
+    assert "is matched by more than one patch: 'inlet' (locator 1, plane), " in message
+    assert "'wall' (locator 2, box)" in message
+    assert "'wall' (locator 2, box), 'outlet' (locator 1, plane)" in message  # tag 2
+
+
+def test_overlap_explains_that_a_box_selects_every_surface_inside_it(match):
+    surfaces = {1: (0, 0, 0, 0, 1, 1)}
+    patches = [_patch("a", _box(-1, -1, -1, 2, 2, 2)), _patch("b", _plane("x", 0.0))]
+    message = _error(match, surfaces, patches)
+    assert "a box selects every surface whose whole bounding box lies inside it" in message
+    assert "a box that encloses the whole solid selects every face" in message
+    assert "shrink that patch's box" in message
+    assert message.count("a box selects every surface") == 1  # said once, however many overlaps
+
+
+def test_no_overlap_sentence_without_an_overlap(match):
+    message = _error(match, FACE, [_patch("wall", _plane("x", 5.0))])
+    assert "every surface whose whole bounding box" not in message

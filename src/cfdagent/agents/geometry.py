@@ -186,7 +186,9 @@ class GeometryStage(KnowledgeTools, Stage):
             "(such as an axis) gets no patch. Units are metres.\n\n"
             "The script runs with the attempt directory as its working directory; every path in "
             f"it is relative to that directory. It writes {STEP_NAME} and {MANIFEST_FILE_NAME} "
-            f"there, and the only file it may read is the plan, {CASESPEC_FROM_ATTEMPT}."
+            f"there, and the only file it may read is the plan, {CASESPEC_FROM_ATTEMPT}: "
+            f'open("{CASESPEC_FROM_ATTEMPT}"). Never derive that path from __file__ (the '
+            "script's parent directory is not the run directory)."
         )
 
     def execute_and_gate(self, ctx: StageContext, attempt_dir: Path) -> GateResult:

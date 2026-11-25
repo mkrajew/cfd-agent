@@ -48,9 +48,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -65,10 +67,12 @@ from cfdagent.agents.tools import (
     truncate_utf8,
 )
 from cfdagent.errors import AgentInputError, ToolFailure, as_gate
+from cfdagent.gates import GateResult
 from cfdagent.llm.client import (
     ChatResult,
     LLMError,
     LLMTransportError,
+    StructuredOutputError,
     ToolCall,
     TruncatedOutputError,
     Usage,
@@ -77,6 +81,7 @@ from cfdagent.llm.client import (
 )
 from cfdagent.llm.cost import CostLimitExceeded
 from cfdagent.record import AttemptRecord, StageRecord, redact
+from cfdagent.rundir import DEFAULT_WRITE_BYTES, MAX_DEPTH, UnsafePath
 
 CONTEXT_CHAR_LIMIT = 200_000  # estimated size of the messages above which old tool output goes
 KEEP_LAST_MESSAGES = 6  # never elided
@@ -123,9 +128,55 @@ TURNS_LEFT_NOTE = (
 MAX_REASON_CHARS = 1500
 MAX_ECHOED_ERROR_CHARS = 600
 DIAGNOSIS_TOOL_ANSWER = "not run: this turn is for the diagnosis; reply with plain text"
+DIAGNOSIS_INVALID = (
+    "Your last reply could not be used: {problem}. This turn has no tools: reply again with only "
+    "the JSON object that matches the required schema, with no markdown and no other text."
+)
+UNCHANGED_FIX_PASS = (
+    "this pass was asked to change the files of this stage because {reason}, but no file was "
+    "changed; the same work would fail the same way: change what the fix request names, then "
+    "call check_stage"
+)
 DIAGNOSIS_RESUME = (
     "Your diagnosis is recorded. Continue with attempt {n} of {limit}, in {directory}."
 )
+
+
+FINGERPRINT_MAX_BYTES = DEFAULT_WRITE_BYTES  # a larger file is fingerprinted by size and mtime
+FINGERPRINT_CHUNK = 65536
+
+
+def _fingerprint(path: Path) -> str:
+    """A hash of the content of the regular file ``path``, or a marker (``large:`` or
+    ``unreadable:``, with size and modification time) when it is too big or cannot be read. Never
+    follows a link, never blocks on a FIFO, never reads more than ``FINGERPRINT_MAX_BYTES``."""
+    try:
+        info = os.lstat(path)
+        marker = f"{info.st_size}:{info.st_mtime_ns}"
+        if not stat.S_ISREG(info.st_mode):
+            return f"unreadable:{marker}"
+        if info.st_size > FINGERPRINT_MAX_BYTES:
+            return f"large:{marker}"
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(path, flags)
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                return f"unreadable:{marker}"
+            digest = hashlib.sha256()
+            total = 0
+            with os.fdopen(fd, "rb", closefd=False) as handle:
+                while chunk := handle.read(FINGERPRINT_CHUNK):
+                    total += len(chunk)
+                    if total > FINGERPRINT_MAX_BYTES:  # it grew after the lstat
+                        return f"large:{marker}"
+                    digest.update(chunk)
+            return digest.hexdigest()
+        finally:
+            os.close(fd)
+    except OSError:
+        return f"unreadable:{path.name}"
 
 
 @dataclass(frozen=True)
@@ -220,6 +271,7 @@ class ModelConversation:
         self.abort: str | None = None  # why the stage must stop, if it must
         self.logged = 0  # messages already written to the transcript
         self.last_problem: str | None = None  # what the last unusable reply was reported as
+        self.last_error: LLMError | None = None  # the error behind ``last_problem``
         self.last_errors: list[str] = []  # the errors of the last failed attempt
         self.log_attempt: int | None = None  # transcript label override (the diagnosis turn)
         self.record = StageRecord(name=stage_name, ok=False, pass_no=ctx.pass_no)
@@ -292,6 +344,7 @@ class ModelConversation:
         """
         _elide_old_outputs(self.messages)
         self.last_problem = None
+        self.last_error = None
         retries = 0
         while True:
             if self._time_left() <= 0:
@@ -322,6 +375,7 @@ class ModelConversation:
                 self._bill(exc.usage, prompt_chars, len(raw))
                 self._log(sent, None, error=f"{type(exc).__name__}: {exc}")
                 if self.abort is None:
+                    self.last_error = exc
                     self.last_problem = self._unusable_text(exc)
                     self.messages.append({"role": "user", "content": self.last_problem})
                 return None
@@ -380,6 +434,12 @@ class _StageRun(ModelConversation):
         self.no_retry = False  # the stage ended because the stage said a retry cannot help
         # failed attempt, question, schema of a structured reply (None: free text)
         self.diagnosis_due: tuple[AttemptRecord, str, type[BaseModel] | None] | None = None
+        # A pass that a fix request started must change at least one file of its own (see
+        # ``_unchanged_fix_pass``): the files at the start of the attempt, and whether any attempt
+        # of the pass has changed them yet.
+        self.tracking_changes = False
+        self.files_at_start: dict[str, str] = {}
+        self.files_changed = False
         self.blank_replies = 0  # blank replies in a row, answered with a nudge
         self.blank_streak_start = 0  # index of the first blank reply of the current streak
         self.did_work = False  # the model has sent a tool call or text in this attempt
@@ -438,7 +498,60 @@ class _StageRun(ModelConversation):
         for tool in extra:
             registry.add(tool)
         self.registry = registry
+        if self.tracking_changes:
+            self.files_at_start = self._writable_files()
         return carried
+
+    def _writable_files(self) -> dict[str, str]:
+        """The files of the attempt directory that the stage's scope lets the agent write, as
+        path inside the directory -> a fingerprint of the content.
+
+        The directory is hostile input (``rundir``): the walk lists entries without following
+        links, descends only into real directories (to ``MAX_DEPTH``), and never opens anything
+        but a regular file. A FIFO, a device or a link is left out. A file is opened with
+        ``O_NOFOLLOW`` and ``O_NONBLOCK``, checked again with ``fstat`` and hashed in chunks;
+        one larger than ``FINGERPRINT_MAX_BYTES`` or one that cannot be read gets a marker built
+        from its size and modification time, so that it is never read whole and never taken for
+        an absent file."""
+        found: dict[str, str] = {}
+        root = self.attempt_dir
+        stack = [(root, 0)]
+        while stack:
+            directory, depth = stack.pop()
+            try:
+                entries = list(os.scandir(directory))
+            except OSError:
+                continue
+            for entry in entries:
+                path = Path(entry.path)
+                try:
+                    if entry.is_symlink() or getattr(entry, "is_junction", lambda: False)():
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        if depth < MAX_DEPTH:
+                            stack.append((path, depth + 1))
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue  # a FIFO, socket or device
+                    if not self.stage.scope.can_write(self.ctx.run.relative(path)):
+                        continue
+                except (OSError, UnsafePath):
+                    continue
+                found[path.relative_to(root).as_posix()] = _fingerprint(path)
+        return found
+
+    def _unchanged_fix_pass(self, result: GateResult) -> GateResult:
+        """``result``, or a failure when it passed in a pass that a fix request started and no file
+        the agent may write has changed since the pass began: the same files would fail again for
+        the same reason that sent the run back. The comparison is made before the gate runs, so
+        the files a gate writes do not count. Only a pass that was seeded with the stage's earlier
+        files is checked (repair mode ``in_place``); in mode ``fresh`` nothing is seeded, there is
+        no baseline, and the check does not apply."""
+        if result.ok and self.tracking_changes and not self.files_changed:
+            reason = short(self.ctx.fix_request.reason.strip(), 400) if self.ctx.fix_request else ""
+            message = UNCHANGED_FIX_PASS.format(reason=reason or "of the request")
+            return replace(result, ok=False, errors=[message])
+        return result
 
     def _seeded_directory(self, seeded: SeededAttempt) -> Path:
         """The directory of a seeded first attempt, after checking that it is the one the loop would
@@ -468,8 +581,11 @@ class _StageRun(ModelConversation):
         if self._time_left() <= 0:
             self.abort = self._wall_clock_reason()
             return "The run's time budget is used up; the stage stops here."
+        if self.tracking_changes and not self.files_changed:
+            self.files_changed = self._writable_files() != self.files_at_start
         # An AgentInputError from the gate is the agent's work being wrong: a failed attempt.
         result = as_gate(lambda: self.stage.execute_and_gate(self.ctx, self.attempt_dir))
+        result = self._unchanged_fix_pass(result)
         seconds = max(0.0, self.ctx.clock() - self.attempt_started)
         self.attempts += 1
         errors = [] if result.ok else [str(e) for e in result.errors]
@@ -518,6 +634,13 @@ class _StageRun(ModelConversation):
     # ------------------------------------------------------------------ the loop
 
     def run(self, seeded: SeededAttempt | None = None) -> StageOutcome:
+        # Only a stage that was seeded with its earlier files has files that "the request names".
+        self.tracking_changes = bool(
+            self.ctx.fix_request is not None
+            and self.ctx.pass_no >= 1
+            and seeded is not None
+            and seeded.carried
+        )
         self._start_attempt(seeded=seeded)
         parts = [self.stage.opening_message(self.ctx)]
         if self.ctx.fix_request is not None:
@@ -658,6 +781,17 @@ class _StageRun(ModelConversation):
         self.log_attempt = attempt.n
         try:
             result = self._ask(response_schema=schema, with_tools=False)
+            invalid = self.last_error
+            if (
+                result is None
+                and schema is not None
+                and isinstance(invalid, StructuredOutputError)
+                and self.abort is None
+            ):
+                # A reply that is not the structured answer (markdown instead of JSON) is shown
+                # its parse error and asked once more.
+                self.messages[-1]["content"] = DIAGNOSIS_INVALID.format(problem=short(invalid))
+                result = self._ask(response_schema=schema, with_tools=False)
         finally:
             self.log_attempt = None
             self.turns = turns_before
@@ -672,6 +806,12 @@ class _StageRun(ModelConversation):
         if schema is not None:
             parsed = result.parsed if result is not None else None
             text = self.stage.take_diagnosis(parsed if isinstance(parsed, schema) else None)
+            error = self.last_error
+            if result is None and not text and isinstance(error, StructuredOutputError):
+                # Still not valid: the model's own words are kept rather than dropped.
+                raw = error.raw_text.strip()[:MAX_REASON_CHARS]
+                if raw:
+                    text = self.stage.take_unparsed_diagnosis(raw)
         else:
             text = (result.content or "").strip() if result is not None else ""
         if text:
