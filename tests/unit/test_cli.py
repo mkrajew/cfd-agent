@@ -251,6 +251,22 @@ def test_another_model_gets_no_effort_unless_one_is_asked_for(
     models = fake_run_task.calls[0]["config"].models
     assert {m.deployment for m in models.values()} == {"Llama-3.3-70B-Instruct"}
     assert {m.reasoning_effort for m in models.values()} == {None}
+    assert {m.request_logprobs for m in models.values()} == {False}
+
+
+def test_only_the_default_model_requests_logprobs(runner, root, fake_run_task, task_file):
+    assert invoke(runner, "run", str(task_file)).exit_code == 0
+    assert invoke(runner, "run", str(task_file), "--model", "gpt-oss-120b").exit_code == 0
+    result = invoke(
+        runner, "run", str(task_file), "--model", "gpt-5.4", "--reasoning-effort", "medium"
+    )
+    assert result.exit_code == 0, result.output
+    for call, expected in zip(fake_run_task.calls, (True, True, False), strict=True):
+        models = call["config"].models.values()
+        assert {m.request_logprobs for m in models} == {expected}
+    assert {m.reasoning_effort for m in fake_run_task.calls[2]["config"].models.values()} == {
+        "medium"
+    }
 
 
 def test_the_default_model_keeps_the_default_effort(runner, root, fake_run_task, task_file):

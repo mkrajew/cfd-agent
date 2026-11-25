@@ -763,6 +763,15 @@ def test_requests_logprobs_only_when_tools_are_sent():
     assert "logprobs" not in sent_json(requests[1])
 
 
+def test_a_model_without_logprobs_gets_tools_but_no_logprobs():
+    client, requests = make_client_from_body(dropped_body())
+    client.chat(
+        MESSAGES, ModelConfig(deployment="d", request_logprobs=False), tools=[LIST_DIR_TOOL]
+    )
+    sent = sent_json(requests[0])
+    assert sent["tools"] and "logprobs" not in sent
+
+
 def test_recovers_call_dropped_by_the_service():
     result = chat_tools(dropped_body())
     (call,) = result.tool_calls

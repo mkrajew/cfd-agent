@@ -14,6 +14,9 @@ class ModelConfig(BaseModel):
     top_p: float | None = None
     max_tokens: int = 4096
     reasoning_effort: Literal["low", "medium", "high"] | None = None
+    # Ask for the generated tokens with every tool request, so that a call the service parsed as
+    # blank can be recovered (`recover_dropped_calls`). Some models reject the parameter.
+    request_logprobs: bool = True
 
 
 class LLMSettings(BaseModel):

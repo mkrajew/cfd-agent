@@ -508,6 +508,10 @@ def _build_config(
             changes["reasoning_effort"] = effort.value
         elif model != DEFAULT_DEPLOYMENT:
             changes["reasoning_effort"] = None  # the default effort belongs to the default model
+        if model is not None and model != DEFAULT_DEPLOYMENT:
+            # The recovery of dropped calls from raw tokens is for the default model; other models
+            # may reject the parameter.
+            changes["request_logprobs"] = False
         models = {name: cfg.model_copy(update=changes) for name, cfg in config.models.items()}
         config = config.model_copy(update={"models": models})
     if effort is not None and effort.value == "high":
