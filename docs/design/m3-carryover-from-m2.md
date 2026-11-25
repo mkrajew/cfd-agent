@@ -45,7 +45,7 @@ Evidence: in the same run Case Setup used 656k input tokens (about $2.17) and th
 
 ### 9. A commercial-model arm in the M3 campaign (budget decision for the owner)
 
-Evidence: gpt-5.4 passed the Scorer on pipe-re500 without retries (pressure drop error 0.58 %, profile error 0.12 %, evaluated outside the pipeline), where gpt-oss-120b did not (n = 1 each side). Proposal: decide whether a commercial-model arm belongs in the campaign; one run cost about $6 tracked, so the arm needs its own budget line.
+Evidence: in one run (image sha-901dcf8) gpt-5.4 reached the Solver Runner on pipe-re500 with no retries, and its solution passed the Scorer when evaluated outside the pipeline (pressure drop error 0.58 %, profile error 0.12 %); its Analyst still stopped on the cost cap. gpt-oss-120b completed two pipe runs on older images: one passed the pressure-drop check and failed the profile for a post-processing reason, the other failed at 71 %. One run, a different image: not a controlled comparison. Proposal: decide whether a commercial-model arm belongs in the campaign; one run cost about $6 tracked, so the arm needs its own budget line.
 
 ### 10. Responses API support (S)
 
