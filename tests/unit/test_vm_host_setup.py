@@ -182,6 +182,7 @@ def test_the_installs_that_matter_for_security_come_before_the_network_steps():
         "write_env",
         "install_wrapper",
         "pull_image",
+        "remove_old_images",
     ]
     positions = [main.index(name) for name in order]
     assert positions == sorted(positions)
@@ -204,7 +205,25 @@ def env(tmp_path: Path) -> dict[str, str]:
         'echo "systemd-analyze $*" >> "$STUB_CALLS"\n[ -z "$STUB_ANALYZE_FAIL" ]\n',
     )
     stub_executable(
-        stubs, "docker", 'echo "docker $*" >> "$STUB_CALLS"\n[ -z "$STUB_DOCKER_FAIL" ]\n'
+        stubs,
+        "docker",
+        'echo "docker $*" >> "$STUB_CALLS"\n'
+        '[ -z "$STUB_DOCKER_FAIL" ] || exit 1\n'
+        'case "$1 $2" in\n'
+        '  "image ls") [ -z "$STUB_DOCKER_LS_FAIL" ] || exit 1\n'
+        '    printf "%s" "$STUB_DOCKER_IMAGES" ;;\n'
+        '  "image rm") [ -z "$STUB_DOCKER_RM_FAIL" ] ;;\n'
+        "esac\n",
+    )
+    stub_executable(
+        stubs,
+        "df",
+        'case "$*" in\n'
+        '  *k*) printf "Filesystem 1024-blocks Used Available Capacity Mounted on\\n'
+        '/dev/sda1 100 1 %s 1%% /\\n" "${STUB_DF_AVAIL_KB:-50000000}" ;;\n'
+        '  *) printf "Filesystem Size Used Avail Use%% Mounted on\\n'
+        '/dev/sda1 62G 12G %s 17%% /\\n" "${STUB_DF_AVAIL_HUMAN:-48G}" ;;\n'
+        "esac\n",
     )
     return {
         "PATH": f"{stubs}:/usr/local/bin:/usr/bin:/bin",
@@ -460,6 +479,130 @@ def test_finish_succeeds_when_the_image_was_pulled(env):
     result = run_function(env, f"{SETTINGS}; COMMIT={SHA}; write_env; pull_image; finish")
     assert result.returncode == 0, result.stderr
     assert "image        pulled" in result.stdout
+
+
+# --- removing old images, free disk space ---------------------------------------------------------
+
+REPO_IMAGE = "ghcr.io/mkrajew/cfd-agent"
+NEW_TAG = f"{REPO_IMAGE}:sha-0123456"
+LISTING = "\n".join(
+    [
+        NEW_TAG,
+        f"{REPO_IMAGE}:sha-aaaaaaa",
+        f"{REPO_IMAGE}:sha-bbbbbbb",
+        f"{REPO_IMAGE}:latest",
+        f"{REPO_IMAGE}:<none>",
+        f"{REPO_IMAGE}-other:sha-ccccccc",
+        "ghcr.io/other/cfd-agent:sha-ddddddd",
+        "<none>:<none>",
+    ]
+)
+FINISH = f"{SETTINGS}; COMMIT={SHA}; write_env; pull_image; remove_old_images; finish"
+
+
+def prune_old(env, extra="", listing=LISTING):
+    env["STUB_DOCKER_IMAGES"] = listing
+    return run_function(env, f"{SETTINGS}; COMMIT={SHA}; {extra} pull_image; remove_old_images")
+
+
+def docker_calls(env):
+    return [call for call in calls(env) if call.startswith("docker ")]
+
+
+def test_old_tags_of_the_repository_are_removed_by_tag_and_the_new_image_is_kept(env):
+    result = prune_old(env)
+    assert result.returncode == 0, result.stderr
+    log = docker_calls(env)
+    removed = [call for call in log if call.startswith("docker image rm")]
+    assert removed == [
+        f"docker image rm {REPO_IMAGE}:sha-aaaaaaa",
+        f"docker image rm {REPO_IMAGE}:sha-bbbbbbb",
+        f"docker image rm {REPO_IMAGE}:latest",
+    ]
+    assert f"docker image ls --format {{{{.Repository}}}}:{{{{.Tag}}}} {REPO_IMAGE}" in log
+    assert f"docker pull {NEW_TAG}" in log
+    # Dangling images only, after the removals; nothing is forced and no container is touched.
+    assert log[-1] == "docker image prune -f"
+    assert not any(re.search(r"\s(-a|--all|-f|--force)(\s|$)", c) for c in removed)
+    assert not any(c.startswith(("docker rm ", "docker container", "docker system")) for c in log)
+    assert "sha256" not in "\n".join(log)
+
+
+def test_images_of_other_repositories_are_never_removed(env):
+    prune_old(env)
+    removed = [call for call in docker_calls(env) if call.startswith("docker image rm")]
+    assert not any("cfd-agent-other" in call or "ghcr.io/other" in call for call in removed)
+    assert not any(f"{REPO_IMAGE}:<none>" in call for call in removed)
+
+
+def test_nothing_is_removed_when_the_image_pull_failed(env):
+    env["STUB_DOCKER_FAIL"] = "1"
+    result = prune_old(env)
+    assert result.returncode == 0, result.stderr
+    assert docker_calls(env) == [f"docker pull {NEW_TAG}"]
+
+
+def test_a_pulled_image_of_another_repository_removes_nothing(env):
+    images = (
+        "registry.example.invalid/team/img:abc",
+        f"{REPO_IMAGE}@sha256:{'a' * 64}",
+        f"{REPO_IMAGE}:sha-aaaaaaa@sha256:{'a' * 64}",
+    )
+    for image in images:
+        Path(env["STUB_CALLS"]).unlink(missing_ok=True)
+        result = prune_old(env, f"IMAGE_ARG={image};")
+        assert result.returncode == 0, result.stderr
+        assert not any(call.startswith("docker image") for call in docker_calls(env)), image
+
+
+def test_a_tag_that_is_still_in_use_is_reported_and_does_not_stop_the_script(env):
+    env["STUB_DOCKER_RM_FAIL"] = "1"
+    result = prune_old(env)
+    assert result.returncode == 0, result.stderr
+    assert f"could not remove {REPO_IMAGE}:sha-aaaaaaa" in result.stderr
+    attempts = [c for c in docker_calls(env) if c.startswith("docker image rm")]
+    assert len(attempts) == 3, "one failure does not stop the others"
+    assert docker_calls(env)[-1] == "docker image prune -f"
+
+
+def test_nothing_is_removed_when_the_images_cannot_be_listed(env):
+    env["STUB_DOCKER_LS_FAIL"] = "1"
+    result = prune_old(env)
+    assert result.returncode == 0, result.stderr
+    assert "could not list" in result.stderr
+    assert not any(c.startswith("docker image rm") for c in docker_calls(env))
+
+
+def test_nothing_is_removed_when_the_pulled_image_is_missing_from_the_listing(env):
+    listing = f"{REPO_IMAGE}:sha-aaaaaaa\n{REPO_IMAGE}:latest"
+    result = prune_old(env, listing=listing)
+    assert result.returncode == 0, result.stderr
+    assert "is not in the local image list" in result.stderr
+    assert not any(c.startswith("docker image rm") for c in docker_calls(env))
+
+
+def test_cleanup_with_no_old_images_only_prunes_dangling_ones(env):
+    prune_old(env, listing=NEW_TAG)
+    log = docker_calls(env)
+    assert not any(call.startswith("docker image rm") for call in log)
+    assert log[-1] == "docker image prune -f"
+
+
+def test_the_summary_shows_the_free_disk_space(env):
+    result = run_function(env, FINISH, STUB_DOCKER_IMAGES=NEW_TAG)
+    assert result.returncode == 0, result.stderr
+    assert "/dev/sda1 62G 12G 48G 17% /" in result.stdout
+    assert "WARNING" not in result.stdout
+
+
+def test_the_summary_warns_when_less_than_10_gib_is_free(env):
+    env["STUB_DF_AVAIL_HUMAN"] = "9.0G"
+    low = run_function(env, FINISH, STUB_DF_AVAIL_KB=str(10 * 1024 * 1024 - 1))
+    assert low.returncode == 0, low.stderr
+    assert "WARNING" in low.stdout
+    assert "less than 10 GiB" in low.stdout
+    ok = run_function(env, FINISH, STUB_DF_AVAIL_KB=str(10 * 1024 * 1024))
+    assert "WARNING" not in ok.stdout
 
 
 def test_the_venv_is_judged_by_pip_not_python():

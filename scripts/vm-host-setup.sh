@@ -28,7 +28,9 @@
 #   4. builds /opt/cfdagent-host (venv) and pip-installs the repository there, host dependencies only
 #      (no toolchain extra: CadQuery, Gmsh and OpenFOAM live in the image);
 #   5. writes /etc/cfdagent/env and the /usr/local/bin/cfdagent wrapper that loads it;
-#   6. pulls the image.
+#   6. pulls the image, then removes the other tags of ghcr.io/mkrajew/cfd-agent (by tag, never an
+#      image in use) and prunes dangling images, so repeated refreshes do not fill the OS disk; the
+#      summary shows `df -h /` and warns below 10 GiB free. Nothing is removed if the pull failed.
 # The security items come first, so a failure of the network-dependent steps (PyPI, GHCR) leaves them
 # in place; run the script again after such a failure.
 # No secret is read, written or printed: the values are endpoints and an image name.
@@ -51,6 +53,7 @@ STATE_DIR="${CFDAGENT_SETUP_STATE_DIR:-/var/lib/cfdagent}"
 ENV_OWNER="${CFDAGENT_SETUP_ENV_OWNER:-root}"
 SSH_DROPIN="20-cfdagent-ssh-extra.conf"
 ACTIVE_MAX_SECONDS=$((4 * 3600))
+LOW_DISK_KIB=$((10 * 1024 * 1024)) # warn when / has less free space than this (10 GiB)
 # Files of infra/vm that this script installs; the checkout must contain all of them.
 REQUIRED_VM_FILES=(
     idle-shutdown.sh
@@ -393,7 +396,69 @@ pull_image() {
     fi
 }
 
+# Remove the other tags of the sandbox image repository once the new image is in place: every host
+# refresh pulls a new ~3 GB image, and 16 of them filled the 64 GB OS disk. Only tags of IMAGE_REPO
+# are removed, one `docker image rm <repo:tag>` each (never by image ID, one ID can carry several
+# tags, and never with --force, so an image that a container uses stays), then dangling images are
+# pruned. Nothing is removed when the pull failed or the pulled image is not from IMAGE_REPO.
+remove_old_images() {
+    local keep ref tag listing removed=0
+    keep="$(image_reference)"
+    if [ "${PULL_FAILED}" = 1 ]; then
+        echo "note: the image pull failed, so old images are kept" >&2
+        return 0
+    fi
+    case "${keep}" in
+        *@*)
+            info "old images are not removed: ${keep} is a digest reference"
+            return 0
+            ;;
+        "${IMAGE_REPO}":*) ;;
+        *)
+            info "old images are not removed: ${keep} is not a tag of ${IMAGE_REPO}"
+            return 0
+            ;;
+    esac
+    if ! listing="$(docker image ls --format '{{.Repository}}:{{.Tag}}' "${IMAGE_REPO}")"; then
+        echo "note: could not list the images of ${IMAGE_REPO}; old images are kept" >&2
+        return 0
+    fi
+    # The image just pulled must be in the list, or "every other tag" would be everything.
+    if ! grep -qxF "${keep}" <<<"${listing}"; then
+        echo "note: ${keep} is not in the local image list; old images are kept" >&2
+        return 0
+    fi
+    info "old images of ${IMAGE_REPO} (keeping ${keep})"
+    while IFS= read -r ref || [ -n "${ref}" ]; do
+        case "${ref}" in
+            "${IMAGE_REPO}":*) ;;
+            *) continue ;;
+        esac
+        tag="${ref#"${IMAGE_REPO}":}"
+        if [ "${ref}" = "${keep}" ] || [ -z "${tag}" ] || [ "${tag}" = "<none>" ]; then
+            continue
+        fi
+        if docker image rm "${ref}" </dev/null >/dev/null; then
+            echo "removed ${ref}"
+            removed=$((removed + 1))
+        else
+            echo "note: could not remove ${ref} (in use by a container?); kept" >&2
+        fi
+    done <<<"${listing}"
+    echo "removed ${removed} old image tag(s)"
+    docker image prune -f >/dev/null || echo "note: docker image prune failed" >&2
+}
+
+# Free space on the OS disk, in KiB (empty when df gives nothing usable).
+free_disk_kib() {
+    local kib
+    kib="$(df -Pk / 2>/dev/null | awk 'NR == 2 { print $4 }' || true)"
+    case "${kib}" in '' | *[!0-9]*) return 0 ;; esac
+    echo "${kib}"
+}
+
 summary() {
+    local free_kib
     echo
     echo "cfd-agent host is set up"
     echo "  repository   ${REPO_REF}, commit ${COMMIT:-unknown}, in ${SRC_DIR}"
@@ -406,6 +471,13 @@ summary() {
         echo "  image        NOT PULLED; see the error above, then run this script again"
     else
         echo "  image        pulled"
+    fi
+    echo "  disk         free space on /:"
+    df -h / 2>/dev/null | sed -e 's/^/    /' || true
+    free_kib="$(free_disk_kib)"
+    if [ -n "${free_kib}" ] && [ "${free_kib}" -lt "${LOW_DISK_KIB}" ]; then
+        echo "  WARNING      less than 10 GiB free on /: free space before the next run" \
+            "(docker image ls, ~/runs; the OS disk is 64 GB)"
     fi
     echo
     echo "next: cfdagent-iptables status; systemctl list-timers 'cfdagent-*'; see docs/runbooks/vm-host.md"
@@ -444,6 +516,7 @@ main() {
     write_env
     install_wrapper
     pull_image
+    remove_old_images
     finish
 }
 
