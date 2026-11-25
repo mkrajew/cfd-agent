@@ -275,6 +275,18 @@ def in_pass_one(steps: list[dict], stage: str) -> list[dict]:
     return json.loads(text)
 
 
+def with_a_changed_file(steps: list[dict]) -> list[dict]:
+    """The same conversation, with a comment line added to the first file it writes: a fix pass
+    that changes no file is rejected (the work would fail the same way)."""
+    steps = json.loads(json.dumps(steps))
+    for step in steps:
+        for call in step.get("tool_calls") or []:
+            if call["name"] == "write_file":
+                call["arguments"]["content"] += "\n// changed in the fix pass\n"
+                return steps
+    raise AssertionError("the conversation writes no file")
+
+
 def steps_with_one_fix_loop(steps: list[dict]) -> list[dict]:
     """Planner, Geometry, Mesh and Case Setup, then (after the fake gate's route back) the Case
     Setup again, the Solver Runner and the Analyst, all in pass 1."""
@@ -290,7 +302,7 @@ def steps_with_one_fix_loop(steps: list[dict]) -> list[dict]:
         + geometry
         + mesh
         + case_setup
-        + in_pass_one(case_setup, "case_setup")
+        + with_a_changed_file(in_pass_one(case_setup, "case_setup"))
         + solver
         + in_pass_one(analyst, "analyst")
         + critic
