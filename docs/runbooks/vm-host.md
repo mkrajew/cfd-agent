@@ -106,6 +106,13 @@ is running); builds `/opt/cfdagent-host` and pip-installs the repository (host d
 `toolchain` extra); writes `/etc/cfdagent/env` (mode 0640, group of the admin user, including the installed
 `CFDAGENT_COMMIT`) and the `/usr/local/bin/cfdagent` wrapper; pulls the image.
 
+**Disk space.** Each image is about 3 GB and the OS disk is 64 GB: on 2026-11-25 sixteen images left behind by
+successive refreshes filled it, every run failed with `ENOSPC` and the Azure VM agent stopped answering
+`az vm run-command` (only SSH still worked). After a successful pull the script therefore removes the other tags of
+`ghcr.io/mkrajew/cfd-agent` (one `docker image rm <repo>:<tag>` each, never by image ID and never forced, so an
+image that a container uses stays) and prunes dangling images. It removes nothing when the pull failed, and never
+touches other repositories. The summary prints `df -h /` and warns when less than 10 GiB is free.
+
 The security items (firewall, SSH limits, shutdown) are installed before the steps that depend on PyPI and
 GHCR, so a network failure there leaves them in place. **A re-run is safe** at any time and after any failure;
 it is also how you move to a later ref. Until the CLI of Task 21 is merged the wrapper points to a console
