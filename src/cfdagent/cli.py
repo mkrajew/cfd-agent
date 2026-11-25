@@ -71,6 +71,8 @@ STATUS_FILE = "status.json"
 LOG_FILE = "run.log"
 LAUNCHER_PREFIX = ".launch-"
 MAX_TASK_BYTES = 64 * 1024
+# Upper bound of --max-cost-usd: a guard against a typo, well inside the project envelope.
+MAX_COST_CAP_USD = 10.0
 KEEP_RUNS = 10
 HEARTBEAT_STALE_S = 300.0
 POLL_INTERVAL_S = 1.0
@@ -486,6 +488,7 @@ def _build_config(
     benchmark_id: str | None,
     repair_mode: RepairMode | None = None,
     task_set: Literal["development", "generality"] = "development",
+    max_cost_usd: float | None = None,
 ) -> Any:
     from cfdagent.config import DEFAULT_DEPLOYMENT, HIGH_EFFORT_STRUCTURED_TOKENS, RunConfig
     from cfdagent.llm.cost import PRICING
@@ -515,6 +518,13 @@ def _build_config(
         config = config.model_copy(update={"benchmark_id": benchmark_id, "task_set": task_set})
     if repair_mode is not None:
         config = config.model_copy(update={"repair_mode": repair_mode.value})
+    if max_cost_usd is not None:
+        if not math.isfinite(max_cost_usd) or not 0 < max_cost_usd <= MAX_COST_CAP_USD:
+            _usage_error(
+                f"--max-cost-usd must be greater than 0 and at most {MAX_COST_CAP_USD:g} USD"
+            )
+        limits = config.limits.model_copy(update={"max_cost_usd": max_cost_usd})
+        config = config.model_copy(update={"limits": limits})
     return config
 
 
@@ -527,6 +537,7 @@ def _child_command(
     run_id: str,
     repair_mode: RepairMode | None = None,
     allow_generality: bool = False,
+    max_cost_usd: float | None = None,
 ) -> list[str]:
     argv = [sys.executable, "-m", "cfdagent", "run"]
     if task_file is not None:
@@ -541,6 +552,8 @@ def _child_command(
         argv += ["--repair-mode", repair_mode.value]
     if allow_generality:
         argv.append("--allow-generality")
+    if max_cost_usd is not None:
+        argv += ["--max-cost-usd", repr(max_cost_usd)]
     if no_upload:
         argv.append("--no-upload")
     argv += ["--run-id", run_id]
@@ -599,6 +612,14 @@ def run(
             "the failed attempt's files).",
         ),
     ] = None,
+    max_cost_usd: Annotated[
+        float | None,
+        typer.Option(
+            "--max-cost-usd",
+            help="LLM cost cap of this run in USD (default 1). For comparison runs of a more "
+            "expensive model.",
+        ),
+    ] = None,
     allow_generality: Annotated[
         bool,
         typer.Option(
@@ -632,7 +653,7 @@ def run(
         task = _read_task_file(task_file)
     else:
         task, task_set = _benchmark_task(str(benchmark), allow_generality)
-    config = _build_config(model, reasoning_effort, benchmark, repair_mode, task_set)
+    config = _build_config(model, reasoning_effort, benchmark, repair_mode, task_set, max_cost_usd)
     root = runs_root()
 
     if detach:
@@ -654,6 +675,7 @@ def run(
             new_id,
             repair_mode,
             allow_generality,
+            max_cost_usd,
         )
         _detach(argv, root, new_id)
         typer.echo(new_id)

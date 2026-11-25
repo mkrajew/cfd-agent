@@ -303,6 +303,24 @@ def test_an_unpriced_model_is_a_usage_error(runner, root, fake_run_task, task_fi
     assert fake_run_task.calls == []
 
 
+def test_max_cost_sets_the_run_cost_cap(runner, root, fake_run_task, task_file):
+    assert invoke(runner, "run", str(task_file)).exit_code == 0
+    assert fake_run_task.calls[0]["config"].limits.max_cost_usd == 1.0  # the default stays
+    result = invoke(runner, "run", str(task_file), "--max-cost-usd", "6")
+    assert result.exit_code == 0, result.output
+    assert fake_run_task.calls[1]["config"].limits.max_cost_usd == 6.0
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "11", "lots"])
+def test_an_invalid_or_too_large_max_cost_is_a_usage_error(
+    runner, root, fake_run_task, task_file, value
+):
+    result = invoke(runner, "run", str(task_file), "--max-cost-usd", value)
+    assert result.exit_code == 2, result.output
+    assert "Traceback" not in result.output
+    assert fake_run_task.calls == []
+
+
 def test_an_invalid_effort_is_a_usage_error(runner, root, fake_run_task, task_file):
     result = invoke(runner, "run", str(task_file), "--reasoning-effort", "extreme")
     assert result.exit_code == 2
@@ -1108,6 +1126,8 @@ def test_detach_passes_the_options_on_and_never_the_benchmark_to_a_file(
         "low",
         "--repair-mode",
         "in_place",
+        "--max-cost-usd",
+        "2.5",
         "--no-upload",
         "--detach",
     )
@@ -1118,6 +1138,7 @@ def test_detach_passes_the_options_on_and_never_the_benchmark_to_a_file(
     assert argv[argv.index("--model") + 1] == "Llama-3.3-70B-Instruct"
     assert argv[argv.index("--reasoning-effort") + 1] == "low"
     assert argv[argv.index("--repair-mode") + 1] == "in_place"
+    assert argv[argv.index("--max-cost-usd") + 1] == "2.5"
     assert "--no-upload" in argv
     assert "bench-one" not in run_id  # the id comes from the task text
     for path in root.rglob("*"):
