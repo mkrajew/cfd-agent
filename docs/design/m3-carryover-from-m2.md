@@ -37,7 +37,7 @@ Evidence: the review of PR #110 (opened at the time of writing) left two known l
 
 ### 7. Record cached tokens and price them at the cached rate (S)
 
-Evidence: in run 20261125-111308 (gpt-5.4) the tracker counted all input at the full price and the client records no cached tokens, so the tracked $6.0034 is an upper bound and the cost cap fired earlier than the real bill warranted. Proposal: read the cached-token count from the response usage, store it in the run record, and price it at the cached rate.
+Evidence: in run 20261125-111308 (gpt-5.4) the tracker counted all input at the full price and the client records no cached tokens, so the tracked $6.0034 is an upper bound, and the cost cap may have fired before the real bill reached the limit. Proposal: read the cached-token count from the response usage, store it in the run record, and price it at the cached rate.
 
 ### 8. Reduce context growth in Case Setup and Analyst (M)
 
