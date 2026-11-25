@@ -32,3 +32,21 @@ Evidence: the review of PR #110 (opened at the time of writing) left two known l
 
 - The Planner's resource retry (ADR-0008) did not fire in run 194334, because the rejection mixed a volume error with the resource error; consider whether mixed rejections should also get the retry.
 - Each item above rests on one run (n = 1); they show a failure class, not a rate.
+
+## From the stronger-model comparison run (2026-11-25)
+
+### 7. Record cached tokens and price them at the cached rate (S)
+
+Evidence: in run 20261125-111308 (gpt-5.4) the tracker counted all input at the full price and the client records no cached tokens, so the tracked $6.0034 is an upper bound and the cost cap fired earlier than the real bill warranted. Proposal: read the cached-token count from the response usage, store it in the run record, and price it at the cached rate.
+
+### 8. Reduce context growth in Case Setup and Analyst (M)
+
+Evidence: in the same run Case Setup used 656k input tokens (about $2.17) and the Analyst 841k in 19 calls (about $2.79) without writing its quantities, because each turn re-sends the whole conversation. Proposal: summarise or truncate old tool results, and limit what a tool result returns.
+
+### 9. A commercial-model arm in the M3 campaign (budget decision for the owner)
+
+Evidence: gpt-5.4 passed the Scorer on pipe-re500 without retries (pressure drop error 0.58 %, profile error 0.12 %, evaluated outside the pipeline), where gpt-oss-120b did not (n = 1 each side). Proposal: decide whether a commercial-model arm belongs in the campaign; one run cost about $6 tracked, so the arm needs its own budget line.
+
+### 10. Responses API support (S)
+
+Evidence: gpt-6.2-sol accepts function tools only through the Responses API or without reasoning, so it could not be used. Proposal: add Responses API support to `llm/` if newer models are needed.
