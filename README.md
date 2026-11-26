@@ -99,8 +99,8 @@ velocities of Ghia et al. (1982). The maximum absolute errors are 0.0049 for u a
 `ghcr.io/mkrajew/cfd-agent:sha-901dcf8`), model `gpt-oss-120b` with medium reasoning effort, repair
 mode `in_place` (`--repair-mode in_place`; the default is `fresh`), default run limits. The pipeline
 now has the Critic, cross-stage fix loops and a solver convergence gate. Each of the five development
-benchmarks was run 3 times (n = 3 per benchmark, 15 runs), with no code or prompt change during the
-series. "Passed" means the deterministic Scorer compared the results **against reference data** that
+benchmarks was run 3 times (n = 3 per benchmark, 15 runs). All 15 run records show the same image
+and prompt versions; a change to the VM set-up script was merged while the series ran. "Passed" means the deterministic Scorer compared the results **against reference data** that
 the agents cannot read.
 
 | Benchmark | Runs | Completed | Passed the Scorer | Where the runs that did not complete ended |
@@ -111,6 +111,9 @@ the agents cannot read.
 | Cylinder, Re 20 | 3 | 0 | 0 | Case Setup (2), Planner |
 | Cylinder, Re 100 | 3 | 0 | 0 | Case Setup (2), Geometry |
 
+One of the two Case Setup ends at Re 100 came before any attempt: the plan check had accepted a
+solver that the pipeline does not run, and the run stopped on an internal error.
+
 - The three passing runs had maximum absolute errors of 0.0035 to 0.030 (u on the vertical
   centreline) and 0.0075 to 0.019 (v on the horizontal centreline), against a threshold of 0.05.
 - The completed Re 1000 run failed the comparison: errors 0.072 (u) and 0.069 (v), threshold 0.05.
@@ -120,11 +123,12 @@ the agents cannot read.
   Re 1000 run that failed the comparison, and "partial" for a Re 100 run that passed it. A Critic
   verdict is therefore not evidence of correctness. On a task without reference data a result is
   assessed by physical checks only.
-- Tracked model cost of the 15 runs was $1.93 (an upper bound: cached tokens are counted at the full
-  price), $0.02 to $0.37 per run. The four completed runs took 9 to 48 minutes.
+- Tracked model cost of the 15 runs was $1.93 (run records at list prices), $0.02 to $0.37 per run. The four completed runs took 9 to 48 minutes.
 - A first attempt at the series was lost because the VM disk filled up; its four runs are
   infrastructure failures and are not counted.
 - n = 3 per benchmark with one model is an observation, not a success rate.
+- Prompts, notes and checks were developed against live runs of these same five benchmarks (as
+  general rules), so the passes are not evidence about unseen tasks.
 - The OpenFOAM tutorials are searchable by the agents, and some are close relatives of the
   benchmarks. A pass partly measures retrieval and adaptation of a stock set-up, and says little
   about unfamiliar problems. The generality test set, meant to measure that, is not written yet.

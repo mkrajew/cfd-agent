@@ -73,9 +73,9 @@ Source: 15 runs on one frozen build (image `sha-901dcf8`, gpt-oss-120b, medium e
 
 Evidence: runs 201441 and 212511 ended in Geometry after three attempts. In one a surface was matched by no patch (a box locator slightly smaller than the surface it should contain); in the other, surfaces were matched by more than one patch (a box locator that also contained neighbouring faces). The same class was seen in Task 17. Proposal: make a manifest that covers every surface exactly once easier to write than hand-typed box coordinates, for example by letting the script pick faces and deriving the locators from them.
 
-### 12. The trial run fails with "Could not find rho" in an incompressible case (S)
+### 12. Force function object set-up fails in the trial run, including "Could not find rho" in an incompressible case (M)
 
-Evidence: runs 201843 (in a pass after a fix loop) and 212736 ended in Case Setup with `Could not find rho:rho in database`; in the quoted output the error follows the start of a force function object. Hypothesis, not checked: the function object looks for a density field that an incompressible solver does not have. Proposal: confirm the cause; then state in a general note and in the completeness check what a force function object needs with an incompressible solver, and make the retry message directive.
+Evidence: runs 201843 (in a pass after a fix loop), 212736 and 235035 ended in Case Setup. The three trial runs of the failing pass each stopped on a different problem, one at a time, in or right after the start of a force function object: missing entries (patch list, reference velocity, origin), inconsistent coordinate axes (for a zero-length-axis message the recorded error does not say where) and, as the last error of 201843 and 212736, `Could not find rho:rho in database`. A missing reference velocity was also seen in Task 17. Hypothesis for the density message, not checked: the function object looks for a density field that an incompressible solver does not have. Proposal: confirm that cause; state in a general note what a force function object needs, with an incompressible solver in particular; and let the completeness check report all missing or inconsistent function-object entries at once, before the trial run, with a directive message.
 
 ### 13. The Planner suggests a solver that the pipeline does not run (S)
 
@@ -95,7 +95,7 @@ Evidence: run 210425 failed in the Analyst; all three attempts were rejected wit
 
 ### 17. The Critic disagrees with the Scorer (M)
 
-Evidence: in 2 of 4 completed runs. In run 194518 the Critic reported success and the Scorer failed the results. In run 220416 the Critic ended on "partial" over a boundary type listed in the boundary manifest, and the Scorer passed the results; two of its earlier send-backs used physical expectations that the reference data do not support. Proposal: measure the Critic as a result of its own (agreement in both directions); require each failed check to cite a number or a file entry; look at what the Critic can know about OpenFOAM patch and boundary-condition types; consider independent checks it can compute instead of recalled expectations (under the generality rule). The Critic stays blind to reference data.
+Evidence: in 2 of 4 completed runs. In run 194518 the Critic reported success and the Scorer failed the results. In run 220416 the Critic ended on "partial" over a boundary type listed in the boundary manifest, and the Scorer passed the results; one of its earlier send-backs relied on a symmetry expectation that the reference data do not support (its other physical objections concern the profiles of earlier passes, which were not checked). Proposal: measure the Critic as a result of its own (agreement in both directions); require each failed check to cite a number or a file entry; look at what the Critic can know about OpenFOAM patch and boundary-condition types; consider independent checks it can compute instead of recalled expectations (under the generality rule). The Critic stays blind to reference data.
 
 ### 18. The series loop script reports a meaningless exit code (S)
 
@@ -112,4 +112,4 @@ Evidence: the `exit=` field of the loop script that drove the series is meaningl
 Source: `docs/journal/2026-11-26-m2-close-out.md`.
 
 - For item 7: Cost Management billed $2.63 for all gpt-5.4 usage (the comparison run and its smoke calls), while the record of the run alone tracked $6.00. The run was therefore stopped by its $6 cap at less than half of it in billed terms. Without cached-token pricing, a cap on a model with cached-input discounts stops runs early.
-- Blob write operations cost $1.71 of the $27.54. Four of 84 runs hold about 87 % of the 325,815 blobs. Not examined: which files these are and whether they all need to be uploaded one by one.
+- Blob write operations cost $1.71 of the $27.54. Four of 84 runs hold about 87 % of the 325,815 blobs; that they caused most of the write cost is an inference. Not examined: which files these are and whether they all need to be uploaded one by one.
