@@ -111,7 +111,7 @@ the agents cannot read.
 | Cylinder, Re 20 | 3 | 0 | 0 | Case Setup (2), Planner |
 | Cylinder, Re 100 | 3 | 0 | 0 | Case Setup (2), Geometry |
 
-One of the two Case Setup ends at Re 100 came before any attempt: the plan check had accepted a
+One of the two Case Setup ends for the cylinder at Re 100 came before any attempt: the plan check had accepted a
 solver that the pipeline does not run, and the run stopped on an internal error.
 
 - The three passing runs had maximum absolute errors of 0.0035 to 0.030 (u on the vertical

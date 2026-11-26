@@ -44,7 +44,7 @@ In 12 of the 15 runs at least one Planner attempt was rejected because `geometry
 
 ## 2026-11-25 observation: force function object set-up failed one entry at a time
 
-The table above gives only the last error. In three runs all three Case Setup trial runs of the failing pass stopped in, or right after the start of, a force function object, on a different problem each time: 212736 a missing `patches` entry, then a missing `magUInf`, then `Could not find rho:rho`; 201843 (pass 1) a missing `origin`, then a zero-length coordinate axis (the recorded error does not say where), then `Could not find rho:rho`; 235035 a missing `magUInf`, then a missing `origin`, then incomplete coordinate axes.
+The table above gives only the last error. In three runs each of the three Case Setup trial runs of the failing pass stopped on a different problem; eight of these nine trial runs stopped in, or right after the start of, a force function object, and for the ninth, a zero-length coordinate axis, the recorded error does not say where: 212736 a missing `patches` entry, then a missing `magUInf`, then `Could not find rho:rho`; 201843 (pass 1) a missing `origin`, then a zero-length coordinate axis, then `Could not find rho:rho`; 235035 a missing `magUInf`, then a missing `origin`, then incomplete coordinate axes.
 
 ## 2026-11-25 experiment: cost of Task 19
 
