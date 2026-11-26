@@ -4,6 +4,30 @@ Source: the M1 close-out (2026-11-12, main `eae8031` plus the journal PR #73) an
 
 The earlier list, `docs/design/m1-carryover-from-m0-review.md`, has a status table; its open items (calibration, residual gate weaknesses, streaming parse) are repeated below where they matter for M2.
 
+## Status at the M2 close-out (2026-11-26)
+
+The text below this table is the list as written on 2026-11-12 and is not updated. M2 was closed on 2026-11-26 as a **partial result** (owner's decision, `docs/journal/2026-11-26-m2-close-out.md`). "Done" means that the work was built and merged, not that the failure class has gone away. Task numbers are those of `docs/superpowers/plans/2026-11-14-m2-robustness-and-full-benchmark-set.md`; "M3 *n*" is item *n* of `docs/design/m3-carryover-from-m2.md`.
+
+| Item | Status | Detail |
+|---|---|---|
+| 1. In-place repair | Done (Task 8) | ADR-0005, `--repair-mode`; the default stays `fresh`, the acceptance series used `in_place` (owner, 2026-11-22). The Task 17 comparison had n = 3 per mode and shows no difference in completion rate (1 of 3 each) |
+| 2. Case Setup omissions, turn budget | Done (Task 9) | Directive check messages; Case Setup turn limit 60. Case Setup is still a frequent end point of runs (Task 19) |
+| 3. Mesh and geometry script errors | Done (Tasks 9, 10), failures remain | Explicit input paths, Gmsh and CadQuery notes. Geometry still ended runs in Tasks 17 and 19 (M3 11) |
+| 4. `residualControl` and the Solver Runner gate | Done (Task 12) | ADR-0006 supersedes ADR-0004. The drift check when `residualControl` ends a run is open (M3 3) |
+| 5. Critic and cross-stage fix loops | Done (Tasks 11, 14, 15) | ADR-0007. The Critic disagreed with the Scorer in 2 of 4 completed acceptance runs (M3 17) |
+| 6. Calibration of four benchmarks | Done (Tasks 3-5); generality set partly done | All four hand-written solutions pass the Scorer; the Re 20 drag reference was changed with the owner's approval (D4). Generality storage and run guard done (Task 6); its content (Task 7, D5) is not done: **moved to M3**. Its hand-written calibration is also M3 |
+| 7. Effort-high experiment | M3 | Task 9 raised the Planner structured-reply limit for high effort. The experiment belongs to row 3 of the M3 matrix (design section 14.1) |
+| 8. Curated knowledge notes | Done (Task 10) | The generality families without a close stock tutorial go with Task 7 (M3) |
+| 9. Reasoning round-trip | Dropped | A low-priority experiment, to be run only if blank or poor turns reappear; it was not run in M2. No M2 journal entry reports blank replies as the cause of a failure; the transcripts were not searched for them at close-out |
+| 10. Steadiness gate for time-marched steady cases | Done (Task 12) | |
+| 11. Streaming convergence checks | M3 | See also M3 1 and 2 (runtime estimate and projection) |
+| 12. Self-consistent but wrong CaseSpec | Done (Tasks 13, 14), gap remains | Stated-Reynolds check and a Critic check against the task text. A wrong planned volume passed the Planner's gates in the acceptance series (M3 5) |
+| 13. Residual gate weaknesses | Partly done, rest deferred | Done: a container killed for lack of memory costs an attempt (Task 13). The trial-run Courant limit of 10 (R38) was kept (D9, Task 18). Deferred, with the reasons of Task 13: the key-dimension check (`KeyDimension` has only a free-text name, so the gate cannot tell what to measure; the Critic checks dimensions against the task); rulings R25, R28, R31, R32 and R33 (left to the Critic and to observation in live runs); solver warning thresholds. Also deferred out of Task 13: an out-of-memory kill during the convergence check is still an internal error, if the whole executor container is killed for lack of memory during the solver run, the failure is not routed back to Mesh or Case Setup, and some wordings of a stated Reynolds number are not covered |
+| 14. Repeats and a success-rate datapoint | Done (Tasks 17, 19) | 3 runs per benchmark on one frozen build: 3 of 15 passed the Scorer, all on one benchmark. n = 3 is not a rate; statistics are the M3 campaign |
+| 15. Utility allowlist and executor growth | Deferred | No utility and no `run_utility` timeout parameter was added: the calibrations (Tasks 4, 5) needed none. `createPatch` stays deferred |
+| 16. Service-side defect, vendor report | Dropped from M2, owner's call | No report to the vendor was made in M2; the unit tests with recorded token lists and `scripts/probe_blank_replies.py` remain the early warning |
+| 17. Release hygiene | Done | Done for `v0.1.0` in M1; the version is raised to `0.2.0` in the M2 close-out (Task 20). The tag follows the merge and needs the owner's approval (D10) |
+
 ## What the evidence says about where runs fail
 
 From the 27 live runs (the pipeline, prompts and tools changed between series, so these are observations, not rates; the run lists are examples, not exhaustive):

@@ -91,7 +91,7 @@ The command-line interface (`uv run cfdagent ...` on a development machine, plai
 
 ```bash
 cfdagent run --benchmark cavity-re100                   # from the repository root: benchmarks/ is read relative to the working directory
-cfdagent run task.md [--detach] [--no-upload] [--model <deployment>] [--reasoning-effort low|medium|high]
+cfdagent run task.md [--detach] [--no-upload] [--model <deployment>] [--reasoning-effort low|medium|high] [--repair-mode fresh|in_place] [--max-cost-usd <usd>]   # repair mode of a retry: fresh (default) or in_place (ADR-0005); cost cap default $1
 cfdagent status <run-id>                                # state, stage, cost
 cfdagent logs <run-id> --follow                         # stage events until the run has ended
 cfdagent list --limit 10                                # recent runs
