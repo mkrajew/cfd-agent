@@ -52,3 +52,64 @@ Decision (owner, in chat, 2026-11-25): the M3 campaign includes variants with co
 ### 10. Responses API support (S)
 
 Evidence: gpt-6.2-sol accepts function tools only through the Responses API or without reasoning, so it could not be used. Proposal: add Responses API support to `llm/` if newer models are needed.
+
+## M3 order of work (decided by the owner, 2026-11-26)
+
+Decision (owner, in chat, 2026-11-26; given in Polish, recorded in English in `docs/journal/2026-11-26-m2-close-out.md`): M2 is closed now as a partial result and the project moves to M3, in this order:
+
+1. M3 starts with the fixes there are to implement.
+2. Then each of the five development benchmarks is run **once** on the stronger model, gpt-5.4.
+3. Only after that do the further tests follow.
+
+Which items of this file make up step 1, the per-run cost cap and the budget line of step 2 are not decided; they belong to the M3 plan, and spending is subject to CLAUDE.md rule 4. One run per benchmark is a first observation, not a success rate.
+
+**Task 7 of the M2 plan (generality test set content, D5) was not done in M2 and moves to M3.** The M2 plan places it at the start of M3, before the freeze. The rules stay: the owner writes the task texts, and the set is never run by the pipeline before the frozen M3 release (design section 9.1).
+
+## From the Task 19 acceptance series
+
+Source: 15 runs on one frozen build (image `sha-901dcf8`, gpt-oss-120b, medium effort, `in_place`), `docs/journal/2026-11-25-m2-task-19-acceptance-series.md`. Run ids start with `20261125-`. The M2 done rule was not met. The items are failure classes to fix with general rules; counts are from one series and are not rates. Nothing here is decided.
+
+### 11. The boundary manifest does not cover all surfaces of a solid (S)
+
+Evidence: runs 201441 and 212511 ended in Geometry after three attempts. In one a surface was matched by no patch (a box locator slightly smaller than the surface it should contain); in the other, surfaces were matched by more than one patch (a box locator that also contained neighbouring faces). The same class was seen in Task 17. Proposal: make a manifest that covers every surface exactly once easier to write than hand-typed box coordinates, for example by letting the script pick faces and deriving the locators from them.
+
+### 12. The trial run fails with "Could not find rho" in an incompressible case (S)
+
+Evidence: runs 201843 (in a pass after a fix loop) and 212736 ended in Case Setup with `Could not find rho:rho in database`; in the quoted output the error follows the start of a force function object. Hypothesis, not checked: the function object looks for a density field that an incompressible solver does not have. Proposal: confirm the cause; then state in a general note and in the completeness check what a force function object needs with an incompressible solver, and make the retry message directive.
+
+### 13. The Planner suggests a solver that the pipeline does not run (S)
+
+Evidence: in run 204837 the plan gate accepted a solver that the pipeline does not run, and the run ended at the start of Case Setup as an `internal_error`, with no attempt made. Proposal: the plan gate rejects such a solver and names the supported ones, so that it costs the Planner an attempt instead of ending the run.
+
+### 14. An invented boundary-condition (patchField) type (S)
+
+Evidence: run 230217 ended in Case Setup; the third trial run stopped on a patchField type that OpenFOAM v2512 does not have. Proposal: put the valid types that the solver message lists into the retry message, or check type names before the trial run; add a general note that a patch name or a role in the plan is not a patchField type.
+
+### 15. `none` used as a discretisation scheme (S)
+
+Evidence: run 231427 ended in Case Setup on `Unknown discretisation type none`, in a `snGradSchemes` entry. Proposal: a completeness check that rejects `none` where a scheme is required and names a valid generic entry.
+
+### 16. The Analyst summary does not state convergence (S)
+
+Evidence: run 210425 failed in the Analyst; all three attempts were rejected with the same message, that `analysis.md` does not mention convergence. Proposal: find out why the message was not acted on; give `analysis.md` a required convergence section with a fixed heading, or let the pipeline supply the convergence numbers to it. See also item 4.
+
+### 17. The Critic disagrees with the Scorer (M)
+
+Evidence: in 2 of 4 completed runs. In run 194518 the Critic reported success and the Scorer failed the results. In run 220416 the Critic ended on "partial" over a boundary type listed in the boundary manifest, and the Scorer passed the results; two of its earlier send-backs used physical expectations that the reference data do not support. Proposal: measure the Critic as a result of its own (agreement in both directions); require each failed check to cite a number or a file entry; look at what the Critic can know about OpenFOAM patch and boundary-condition types; consider independent checks it can compute instead of recalled expectations (under the generality rule). The Critic stays blind to reference data.
+
+### 18. The series loop script reports a meaningless exit code (S)
+
+Evidence: the `exit=` field of the loop script that drove the series is meaningless, because `$?` was read after `$(date)`. The script is not in the repository. Proposal: store `$?` in a variable directly after the run command; keep the series loop as a tested script in the repository.
+
+### Also seen in the acceptance series (not decided)
+
+- In 12 of 15 runs at least one Planner attempt was rejected because `geometry.volume_m3` was not a value returned by a calculator call; in run 234827 all three attempts failed and the last error was this one.
+- The calculator rule does not make the volume right: in run 220035 the plan held the volume of the outer box without the body removed from it, and Geometry then failed on the mismatch although the solids of its last two attempts had the right volume (item 5).
+- After the disk of the VM filled up in the lost first attempt, two run records stayed in the state `running`.
+
+## From the M2 spend report
+
+Source: `docs/journal/2026-11-26-m2-close-out.md`.
+
+- For item 7: Cost Management billed $2.63 for all gpt-5.4 usage (the comparison run and its smoke calls), while the record of the run alone tracked $6.00. The run was therefore stopped by its $6 cap at less than half of it in billed terms. Without cached-token pricing, a cap on a model with cached-input discounts stops runs early.
+- Blob write operations cost $1.71 of the $27.54. Four of 84 runs hold about 87 % of the 325,815 blobs. Not examined: which files these are and whether they all need to be uploaded one by one.
