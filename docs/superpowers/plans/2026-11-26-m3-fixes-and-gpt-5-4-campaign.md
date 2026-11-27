@@ -8,7 +8,7 @@
 
 **Tech Stack:** unchanged from M2: Python 3.12, uv, pydantic v2, typer, openai SDK + azure-identity + azure-storage-blob, Docker sandbox, OpenFOAM ESI v2512, Gmsh, CadQuery, numpy, pytest, ruff, GitHub Actions.
 
-**Spec:** `docs/design/2026-10-28-cfd-agent-design.md` (sections 6.2, 6.5, 6.10, 9.1, 9.2, 11, 12, 14) as amended by `docs/adr/0010-m3-one-run-per-benchmark-on-gpt-5-4.md` (proposed with this plan). Inputs: `docs/design/m3-carryover-from-m2.md` (items 1-18, "carry-over N" below), the journal entries of 2026-11-25 and 2026-11-26, `docs/release-notes/v0.2.0.md`, `docs/runbooks/m2-runs.md`. Format model: `docs/superpowers/plans/2026-11-14-m2-robustness-and-full-benchmark-set.md`.
+**Spec:** `docs/design/2026-10-28-cfd-agent-design.md` (sections 6.2, 6.5, 6.10, 9.1, 9.2, 11, 12, 14) as amended by `docs/adr/0010-m3-one-run-per-benchmark-on-gpt-5-4.md` (accepted 2026-11-27). Inputs: `docs/design/m3-carryover-from-m2.md` (items 1-18, "carry-over N" below), the journal entries of 2026-11-25 and 2026-11-26, `docs/release-notes/v0.2.0.md`, `docs/runbooks/m2-runs.md`. Format model: `docs/superpowers/plans/2026-11-14-m2-robustness-and-full-benchmark-set.md`.
 
 ## Global Constraints
 
@@ -20,7 +20,7 @@
 - Blind evaluation: no agent, the Critic included, can read `benchmarks/` or `results/comparison.json`; the Scorer runs only after the Critic step and never triggers a retry. No file an agent can read, and no run id, names a benchmark.
 - Generality set: texts written by the owner; **never run by the pipeline before the frozen release**; nothing learned from it flows into `src/`, `docker/` or `scripts/`. This plan holds no reference data for it, and no task before Task 9 may add any outside `benchmarks/generality/`.
 - No secrets, keys, tokens, subscription IDs, IP addresses or e-mail addresses in the repository. No simulation results or transcripts in git.
-- Azure: CLAUDE.md rule 4. Announce in chat before spending. Explicit owner approval for anything outside `rg-cfdagent`, deleting the resource group, storage account or `runs` container, **any task or campaign estimated above $5** (D3 gives it for the campaign), and anything beyond the **M3 envelope of $45**. The M0-M2 remainder and the reserve are not part of M3.
+- Azure: CLAUDE.md rule 4. Announce in chat before spending. Explicit owner approval for anything outside `rg-cfdagent`, deleting the resource group, storage account or `runs` container, **any task or campaign estimated above $5** (D3 gives it for the campaign), and anything beyond the **M3 envelope of about $60** (raised by the owner from $45 on 2026-11-27, about $15 from the reserve; the checks use $60). The M0-M2 remainder and the rest of the reserve are not part of M3.
 - **No session edits `.claude/settings.json`.** The deny rule on `benchmarks/generality/**` is lifted and restored by the owner by hand.
 - Workflow: conventional commits; one branch per task (`feat/m3-<slug>`, `fix/...`, `infra/...`, `docs/...`), each from the current `main`; every task is a PR with what, why, how verified and Azure cost impact; the main session merges after green CI and approving reviews (ADR-0009). Commit trailer and PR footer as in CLAUDE.md rule 2.
 - Lean workflow (owner-approved): subagents on Sonnet (implementers `high`, reviewers `xhigh`); minor review findings deferred to a list, at most two fix rounds per review; `cfd-reviewer` only for physics, prompts, notes, tool code, agent-facing messages and benchmarks.
@@ -33,17 +33,21 @@
 
 ## Decisions for the owner
 
-| # | What | Recommendation | Blocks |
+D1-D5 were decided by the owner on 2026-11-27; the others are open.
+
+| # | What | Decision or recommendation | Blocks |
 |---|---|---|---|
-| D1 | **ADR-0010** (drafted with this plan, Proposed): the narrowed M3 scope, what "statistics ready for the report" now means, a freeze tag, no `cfdagent bench`, the run rules (when a run may be repeated), the generality rules | Approve | Tasks 2-11 |
-| D2 | **Per-run cost cap** for gpt-5.4 (`--max-cost-usd`; the CLI allows at most $10) | **$8**, counted at the billed price list after Task 2 (a run can pass it by at most one model call). Trade-off: with $8, if every run hit its cap only three runs would start within D3. A cap of about $5.50 would let all five development benchmarks start even then (a capped run costs a little more than its cap, and $5.50 leaves room for up to $0.60 each), but it would cut off a run at the top of the guessed cost range. If the service reports no cached-token count (Task 2, live check), use $10, treat tracked cost as an upper bound and revisit D3 | Tasks 8, 10 |
-| D3 | **Campaign LLM budget** inside the $45 M3 envelope. Also the rule-4 approval for a campaign estimated above $5 | **$30** of tracked model cost. The campaign script does not start a run whose cap would take the total above it. Before Task 10, Cost Management is checked against the $45. A second generality task will probably need one more decision then (see Budget) | Tasks 8, 10 |
-| D4 | **Fix list** (section "Fixes") | In: carry-over 7, 8, 12, 13, the cheap parts of 1 and 3, a campaign script (covers 18), a wall-clock option. The rest stays out | Tasks 2-6 |
-| D5 | **Campaign configuration** | gpt-5.4, medium effort, `in_place`, **wall clock 240 min** per run (M2 used 120; see Task 7 Step 6), 2 Critic rounds, everything else default (3 attempts per stage, 10 fix loops, 4 ranks). Know this about the Critic: the Scorer runs only if the final pass completes, so a send-back can turn a complete solution into a failed, unscored run (as in M2 run 201843). The alternative, 0 rounds (the Critic only reports), costs less and always scores a complete solution, but tests a different system; if chosen, Task 6 adds `--max-critic-rounds` | Task 8 |
-| D6 | **Generality tasks:** how many and which families; the owner writes the texts | Two, if the budget allows (families and solver limits in Task 9) | Task 9 |
+| D1 | **ADR-0010**: the narrowed M3 scope, what "statistics ready for the report" now means, a freeze tag, no `cfdagent bench`, the run rules (when a run may be repeated), the generality rules | **Decided 2026-11-27: approved** (ADR-0010 Accepted) | Tasks 2-11 |
+| D2 | **Per-run cost cap** for gpt-5.4 (`--max-cost-usd`; the CLI allows at most $10) | **Decided 2026-11-27: $10** (recommended was $8), counted at the billed price list after Task 2 (a run can pass it by at most one model call). With $10 and D3 at $50, if every run hit its cap only four of the five development runs would start; a budget of about $52.40 would let all five start even then. If the service reports no cached-token count (Task 2, live check), treat tracked cost as an upper bound and revisit D3 with the owner | Tasks 8, 10 |
+| D3 | **Campaign LLM budget** and the M3 envelope. Also the rule-4 approval for a campaign estimated above $5 | **Decided 2026-11-27: $50** of tracked model cost (recommended was $30), inside an M3 envelope that the owner raised from $45 to **about $60**, about $15 from the reserve. The campaign script does not start a run whose cap would take the total above $50. Before Task 10, Cost Management is checked against the $60 (see Budget) | Tasks 8, 10 |
+| D4 | **Fix list** (section "Fixes") | **Decided 2026-11-27: approved.** In: carry-over 7, 8, 12, 13, the cheap parts of 1 and 3, a campaign script (covers 18), a wall-clock option. The rest stays out | Tasks 2-6 |
+| D5 | **Campaign configuration** | **Decided 2026-11-27: approved.** gpt-5.4, medium effort, `in_place`, **wall clock 240 min** per run (M2 used 120; see Task 7 Step 6), 2 Critic rounds, everything else default (3 attempts per stage, 10 fix loops, 4 ranks). Known consequence of the Critic: the Scorer runs only if the final pass completes, so a send-back can turn a complete solution into a failed, unscored run (as in M2 run 201843) | Task 8 |
+| D6 | **Generality tasks:** how many and which families; the owner writes the texts | Open. Recommended: two; the raised budget covers both. The owner said on 2026-11-27 that their tasks also run on the better model (gpt-5.4). Families and solver limits in Task 9 | Task 9 |
 | D7 | **Generality references, acceptance thresholds, and the fixed list and order** of the tasks (D5 of M2) | Approve before the first generality run; nothing of it changes afterwards | Task 10 |
 | D8 | **Freeze tag `v0.3.0`** | Approve when Task 7 is green | Tasks 8, 10 |
 | D9 | After M3: the idle environment keeps costing about $8.6 a month | Decide at close-out (Task 11) | nothing |
+
+**The owner's words of 2026-11-27**, translated from Polish (the repository is English only): "Raise the budget for one run to $10, raise the budget for the campaign to $50. Later my tasks also on the better model. I approve the rest, start." Asked whether the $50 covers only the model or all of M3, the owner chose the model alone; the question had stated that this means all of M3 up to about $60, with about $15 taken from the reserve.
 
 ## What preparing this plan showed (read before D2-D5)
 
@@ -125,7 +129,7 @@ The owner can write the generality task texts at any time, but **keeps them outs
 
 | When | What the owner does |
 |---|---|
-| Task 1 | Approves the plan, ADR-0010 and D2-D5 |
+| Task 1 | Approved the plan, ADR-0010 and D1-D5 on 2026-11-27, with D2 raised to $10 and D3 to $50 |
 | Task 3 | Hears what the measurement of the gpt-5.4 transcript showed |
 | Task 7 | Approves the tag `v0.3.0` (D8); hears the VM timing of the hand-written transient case |
 | Task 8 | Told after the canary and after the series; decides whether a stopped run is invalid; sees the table and plots (milestone approval point) |
@@ -135,7 +139,7 @@ The owner can write the generality task texts at any time, but **keeps them outs
 
 ## Budget
 
-M3 envelope: **$45** (design 14.2). M3 spend = Cost Management actual cost of `rg-cfdagent` from 2026-11-27 (M2's snapshot of $27.54 ends on 2026-11-26; later charges for earlier days count to M2). Prices: VM $0.208/h; fixed items about $8.6/month (disk about $4.8, public IP about $3.65, storage about $0.1; `docs/runbooks/m2-runs.md`); gpt-5.4 per 1M tokens $2.50 input, $0.25 cached input, $15.00 output.
+M3 envelope: **about $60** (design 14.2; raised by the owner from $45 on 2026-11-27, about $15 from the reserve). It covers everything M3 spends; the model budget of $50 (D3) is a part of it. M3 spend = Cost Management actual cost of `rg-cfdagent` from 2026-11-27 (M2's snapshot of $27.54 ends on 2026-11-26; later charges for earlier days count to M2). Prices: VM $0.208/h; fixed items about $8.6/month (disk about $4.8, public IP about $3.65, storage about $0.1; `docs/runbooks/m2-runs.md`); gpt-5.4 per 1M tokens $2.50 input, $0.25 cached input, $15.00 output.
 
 **Cost per gpt-5.4 run: $2-6, central $3.** This is a guess from one observation: $2.63 billed for a run that stopped in the Analyst (smoke calls included). A complete run adds the rest of the Analyst and the Critic, and each fix loop re-runs stages.
 
@@ -144,18 +148,19 @@ M3 envelope: **$45** (design 14.2). M3 spend = Cost Management actual cost of `r
 | Fixed infrastructure, 3 weeks (upper: 4 weeks) | - | $6.0 | $8.6 |
 | Task 2 live check (3 small calls, VM only if needed), Task 3 one blob download | - | under $0.1 | $0.1 |
 | Task 7 VM refresh, scripted replay, one hand-written case on the VM (no LLM) | up to 2 h | $0.3 | $0.5 |
-| Task 8 development campaign: LLM | 5 runs | $15 | with Task 10: $30 (D3) |
-| Task 10 generality campaign: LLM | 1-2 runs | $6 (2 runs) | in the $30 above |
+| Task 8 development campaign: LLM | 5 runs | $15 | with Task 10: $50 (D3) |
+| Task 10 generality campaign: LLM | 1-2 runs | $6 (2 runs) | in the $50 above |
 | VM for Tasks 8 and 10 | 5-12 h | $1.5 | $2.5 |
 | Blob storage writes | - | $0.3 | $1.0 |
 | Task 9 hand-written calibration (local Docker) | - | $0 | $0 |
-| **Total** | | **about $29** | **about $42.7** of $45 |
+| **Total** | | **about $29** | **about $62.7**, above the $60 envelope (see below) |
 
-- **The VM upper figure is an expectation, not a bound.** If all seven runs took the full 240 minutes, the VM would run 28 h (about $5.8) and the upper total would be about $46. That is why Cost Management is checked before Task 10: actual M3 spend, plus the fixed items to the planned end, plus the generality runs at their cap and wall clock, must be at most $45.
-- The per-run cap (D2) limits one run, apart from one last model call; the campaign budget (D3) limits the sum. Before each run the script checks `spent + cap <= budget`. With $8 and $30, the fifth run starts only if the first four averaged at most $5.5, the sixth if the first five averaged at most $4.4, the seventh if the first six averaged at most $3.67. In the worst case (every run at its cap) only three runs start. When the script stops, the owner decides: a lower cap for the remaining runs, fewer generality tasks, or a higher budget if Cost Management shows room under $45.
-- **Expect one question before the generality runs.** The check there is stricter than the script's (Task 10 Step 1): it reserves a full cap, plus about $0.60 for one last call, for every listed generality task. With $30, $8 and two tasks it passes without a new decision only if the five development runs cost at most $12.80, below the central estimate of $15. At the central estimate the owner is then asked, before any generality result, to choose: a lower cap for the generality runs (two at $6 fit within $30), a D3 of about $32.20 (upper total about $44.9 of $45), or one generality task.
-- A run that stops on its cap is a result ("failed: cost limit"), not a reason to repeat it. With one run per task a cap stop turns the only observation into a statement about the budget, which is the argument for $8 (three times the billed cost of the one run so far) over $6.
-- If the VM, disk and IP stay after M3, the fixed items continue during M4 (D9).
+- **The upper total is above the envelope.** It assumes that the whole $50 model budget is spent and that every other item is at its upper figure ($12.7). The full $50 fits in $60 only if the other items cost at most $10 (central: $8.2). Within the guessed cost range the envelope holds: seven runs at $6 are $42, or $54.7 with the upper figures of the other items. If model costs run far above the guess, the $60 envelope, not the $50 model budget, becomes the binding limit. Anything above it needs the owner's approval (rule 4).
+- **The VM figures are expectations, not bounds.** If all seven runs took the full 240 minutes, the VM would run 28 h (about $5.8) and the upper total would be about $66. Cost Management is checked before Task 10: actual M3 spend, plus the fixed items to the planned end, plus the generality runs at their cap and wall clock, must be at most $60.
+- The per-run cap (D2) limits one run, apart from one last model call; the campaign budget (D3) limits the sum. Before each run the script checks `spent + cap <= budget`. With $10 and $50, the fifth run starts only if the first four spent at most $40 together (an average of $10), the sixth if the first five averaged at most $8, the seventh if the first six averaged at most $6.67. In the worst case (every run at its cap, each a little above $10) only four runs start, so one development benchmark would be left. When the script stops, the owner decides: a lower cap for the remaining runs, fewer generality tasks, or a higher budget if Cost Management shows room under $60.
+- **Before the generality runs** the check is stricter than the script's (Task 10 Step 1): it reserves a full cap, plus about $0.60 for one last call, for every listed generality task. With $50, $10 and two tasks, the model-budget part passes without a new decision if the five development runs cost at most $28.80 (central estimate: $15). The part against $60 reserves about $23 for two tasks (cap, last call and 240 VM minutes each), so it passes while the M3 spend so far plus the remaining fixed items is at most about $37. It can therefore fail first.
+- A run that stops on its cap is a result ("failed: cost limit"), not a reason to repeat it. With one run per task a cap stop turns the only observation into a statement about the budget; the owner set the cap at $10, the CLI's maximum and about 3.8 times the billed cost of the one run so far.
+- Of the $100 Azure credit, M0-M2 used $27.54 (snapshot of 2026-11-26). If M3 used all $60, about $12 would remain for everything after it. If the VM, disk and IP stay after M3, the fixed items continue during M4 (D9).
 
 ## File structure (new and changed)
 
@@ -201,10 +206,10 @@ docs/journal/m3-log.jsonl       the campaign log, copied from the VM
 ### Task 1: M3 plan and ADR-0010 (this PR)
 
 **Files:**
-- Create: `docs/superpowers/plans/2026-11-26-m3-fixes-and-gpt-5-4-campaign.md`, `docs/adr/0010-m3-one-run-per-benchmark-on-gpt-5-4.md` (status Proposed)
+- Create: `docs/superpowers/plans/2026-11-26-m3-fixes-and-gpt-5-4-campaign.md`, `docs/adr/0010-m3-one-run-per-benchmark-on-gpt-5-4.md` (written as Proposed; accepted 2026-11-27)
 
-- [ ] **Step 1:** The owner reviews the plan and ADR-0010 and answers D1-D5.
-- [ ] **Step 2:** After approval, in the same PR before the merge: set ADR-0010 to Accepted ("owner approval in chat", with the date), apply the design edits listed in ADR-0010 under "Changes to the design document", and add "(the M3 campaign runs on gpt-5.4, ADR-0010)" to the Project paragraph of `CLAUDE.md`. Record the answers to D2-D5 below the decisions table and carry any changed value into the tasks that use it.
+- [x] **Step 1:** The owner reviews the plan and ADR-0010 and answers D1-D5 (2026-11-27).
+- [ ] **Step 2:** After approval, in the same PR before the merge: set ADR-0010 to Accepted ("owner approval in chat", with the date), apply the design edits listed in ADR-0010 under "Changes to the design document", and add "(the M3 campaign runs on gpt-5.4, ADR-0010)" to the Project paragraph of `CLAUDE.md`. Record the answers to D2-D5 in the decisions table and carry any changed value into the tasks that use it. *Done on 2026-11-27 except the `CLAUDE.md` line, which is still open.*
 - [ ] **Step 3: Standard close** (docs only). Commit: `docs: M3 plan and ADR-0010`.
 
 ---
@@ -239,7 +244,7 @@ docs/journal/m3-log.jsonl       the campaign log, copied from the VM
 - [ ] **Step 2: Run** them. Expected: FAIL.
 - [ ] **Step 3: Implement** as in Interfaces.
 - [ ] **Step 4: Run** the unit suite. Expected: PASS.
-- [ ] **Step 5: Live check.** Write `tests/e2e/test_cached_tokens.py::test_gpt54_reports_cached_tokens` (marker `e2e`): send the same prompt of at least 2,000 tokens three times (`reasoning_effort="low"`, `max_tokens=1024`); every reply has `cached_tokens is not None`, and the second or third has `cached_tokens > 0`; the served model starts with `gpt-5.4`. Announce (rule 4, under $0.05), then run it: `uv run pytest -m e2e tests/e2e/test_cached_tokens.py -s` with `CFDAGENT_LLM_ENDPOINT` set and `az login`. If the signed-in account lacks the model role, run it on the VM instead (announce the VM start; stop it afterwards). Expected: PASS. **If the field is missing, stop and tell the owner (D2 fallback).** Put the observed counts (no endpoint) in the PR.
+- [ ] **Step 5: Live check.** Write `tests/e2e/test_cached_tokens.py::test_gpt54_reports_cached_tokens` (marker `e2e`): send the same prompt of at least 2,000 tokens three times (`reasoning_effort="low"`, `max_tokens=1024`); every reply has `cached_tokens is not None`, and the second or third has `cached_tokens > 0`; the served model starts with `gpt-5.4`. Announce (rule 4, under $0.05), then run it: `uv run pytest -m e2e tests/e2e/test_cached_tokens.py -s` with `CFDAGENT_LLM_ENDPOINT` set and `az login`. If the signed-in account lacks the model role, run it on the VM instead (announce the VM start; stop it afterwards). Expected: PASS. **If the field is missing, stop and tell the owner (D2: tracked cost is then an upper bound, and D3 is revisited).** Put the observed counts (no endpoint) in the PR.
 - [ ] **Step 6: Standard close.** Commit: `feat: bill cached input tokens at the cached price and record the served model`.
 
 ### Task 3: Context growth: measure, trim in batches, then act on the measurement (carry-over 8) [cfd]
@@ -389,7 +394,7 @@ Three independent changes, each with its own tests and commit (ADR-0009 allows o
 
 **Read:** `docs/runbooks/m3-campaign.md`, `infra/CLAUDE.md`, ADR-0010, the run rules above, the docstrings of `scripts/run_campaign.py` and `scripts/campaign_table.py`.
 
-- [ ] **Step 1: Announce** (rule 4): five runs, LLM about $15 (range $10-30), cap $8 each, campaign budget $30; VM 4-8 h, about $1-1.7 (use the values the owner chose in D2, D3, D5).
+- [ ] **Step 1: Announce** (rule 4): five runs, LLM about $15 (range $10-30), cap $10 each, campaign budget $50; VM 4-8 h, about $1-1.7 (D2, D3, D5).
 - [ ] **Step 2:** Start the VM. Confirm the frozen checkout: `sudo git -C /opt/cfdagent-src describe --tags` is `v0.3.0` and `sudo git -C /opt/cfdagent-src status --porcelain` is empty.
 - [ ] **Step 3: Canary.** The plan `m3-dev-canary.json` with `cavity-re100` only. This run **is** the `cavity-re100` observation and is not run again. Check its record: `tokens_in_cached > 0`; the served model is gpt-5.4; `repair_mode`, `wall_clock_s` and `max_cost_usd` are the plan's; `source_commit` is the tag's commit; no `internal_error`; upload complete. If a check fails, stop and tell the owner before spending more; a pipeline cause follows the run rules. If it stopped on its cost cap, that is its result: ask the owner about D2 before the next run.
 - [ ] **Step 4:** `m3-dev.json` with `cavity-re1000`, `pipe-re500`, `cylinder-re20`, `cylinder-re100`, in this order, same log. Start it early enough to end before 23:00 Europe/Warsaw (runbook). Nobody edits anything while it runs.
@@ -426,7 +431,7 @@ Three independent changes, each with its own tests and commit (ADR-0009 allows o
 
 **Read:** `docs/runbooks/m3-campaign.md`, `infra/CLAUDE.md`, ADR-0010, the run rules above, the journal entries of Task 8 (spend, `m3-log.jsonl`) and Task 9 (ids, order, closest tutorials).
 
-- [ ] **Step 1: Check the money, before the first generality run, for the whole list.** Two checks: the campaign budget covers every listed task at its cap and one last call (spend in the log + number of tasks × (cap + $0.60) is at most D3); and the M3 spend plus the fixed items to the planned end plus these runs at cap and wall clock is at most $45, counting as model cost the larger of Cost Management (scoped to `rg-cfdagent`, from 2026-11-27; it lags) and the tracked cost. If either fails, the owner decides **now, before any generality result**: a higher budget (within the $45), a lower cap for the generality runs, or dropping tasks from the end of the list; `scribe` records a task dropped here with its reason. **Announce:** one or two runs, about $3 each (range $2-6), cap $8; VM 1-4 h.
+- [ ] **Step 1: Check the money, before the first generality run, for the whole list.** Two checks: the campaign budget covers every listed task at its cap and one last call (spend in the log + number of tasks × (cap + $0.60) is at most D3); and the M3 spend plus the fixed items to the planned end plus these runs at cap, one last call and wall clock is at most $60, counting as model cost the larger of Cost Management (scoped to `rg-cfdagent`, from 2026-11-27; it lags) and the tracked cost. If either fails, the owner decides **now, before any generality result**: a higher budget (an envelope above $60 needs the owner's explicit approval), a lower cap for the generality runs, or dropping tasks from the end of the list; `scribe` records a task dropped here with its reason. **Announce:** one or two runs, about $3 each (range $2-6), cap $10; VM 1-4 h.
 - [ ] **Step 2:** Start the VM on the latest freeze tag and add only the data: `sudo git -C /opt/cfdagent-src fetch`, then `sudo git -C /opt/cfdagent-src checkout <Task 9 merge commit> -- benchmarks/generality`. Confirm that `sudo git -C /opt/cfdagent-src diff --name-only <freeze tag>` lists only paths under `benchmarks/generality/`.
 - [ ] **Step 3:** `m3-generality.json` with the ids in the order of D7, `--allow-generality` in `run_args`, same log. Run it. Apply the run rules; no rerun for a better result.
 - [ ] **Step 4:** Check every run's configuration, and let `cfd-reviewer` check the `post.py` and case set-up of every pass (both as Task 8 Step 6). Append the new log lines verbatim to `docs/journal/m3-log.jsonl`. Table, Scorer results and plots to the owner; each result with its closest tutorial. `scribe` records them separately from the development results (design 9.2). Deallocate.
@@ -445,7 +450,7 @@ Three independent changes, each with its own tests and commit (ADR-0009 allows o
 - Create: `docs/release-notes/v0.3.0.md`, `docs/design/m4-carryover-from-m3.md`
 
 - [ ] **Step 1:** The full table from `campaign_table.py` (every run, invalid ones too), stored in the journal, with every replaced, dropped or not-run generality task and its reason listed beside it and in the README (from the Task 9 and Task 10 entries; the table has rows for runs only); plots and result files stay out of git.
-- [ ] **Step 2:** Spend report: Cost Management scoped to `rg-cfdagent`, from 2026-11-27, against $45; tracked against billed cost per model (this also checks Task 2); fixed and variable items separately.
+- [ ] **Step 2:** Spend report: Cost Management scoped to `rg-cfdagent`, from 2026-11-27, against $60; tracked against billed cost per model (this also checks Task 2); fixed and variable items separately.
 - [ ] **Step 3: Owner decision D9:** keep the environment (about $8.6 a month), release only the public IP (about $3.65 a month, SSH access lost), or delete the VM, its disk and the IP and keep the storage account with the runs. Any deletion needs the owner's explicit approval.
 - [ ] **Step 4:** Confirm with the owner that the deny rule is restored. `scribe` milestone entry; `m4-carryover-from-m3.md`; release notes for `v0.3.0` (results with n per task, compared with reference data or physical checks only); the owner approves them before the GitHub release.
 - [ ] **Step 5: Standard close.** Commit: `docs: M3 complete, results and M4 carry-over`.
