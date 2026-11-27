@@ -119,7 +119,7 @@ Every run passes the same stages. After each stage a **deterministic gate** chec
 |---|---|---|---|
 | 1 | **Planner** | `CaseSpec` (strict JSON schema) | Schema-valid; all derived numbers (velocity from Re, entrance length, Courant-based Δt estimate…) computed with the calculator tool; resource estimate within limits (§6.8) |
 | 2 | **Geometry** (CadQuery) | Python script, `geometry.step`, **boundary manifest** | Script runs; solid valid; bounding box and key dimensions match `CaseSpec` within tolerance; every boundary face named in manifest with a locator (e.g. "inlet: plane x=0") |
-| 3 | **Mesh** (Gmsh) | Gmsh script, `.msh`, OpenFOAM `polyMesh` via `gmshToFoam` | `checkMesh` passes; **every patch named per manifest, no default/unnamed patches**; quality thresholds (non-orthogonality, skewness, aspect ratio); 2D cases are one cell thick with `empty` front/back |
+| 3 | **Mesh** (Gmsh) | Gmsh script, `.msh`, OpenFOAM `polyMesh` via `gmshToFoam` | `checkMesh` passes; **every patch named per manifest, no default/unnamed patches**; quality thresholds (non-orthogonality, skewness, aspect ratio); 2D cases are one cell thick with `empty` front/back; the plan's run-time estimate, scaled to the mesh's cell count, is within the run limit (ADR-0010) |
 | 4 | **Case Setup** | `0/`, `constant/`, `system/` | Dictionaries parse (`foamDictionary`); BC set consistent with patches; a short trial run starts without fatal error |
 | 5 | **Solver Runner** | Solved case, logs | Convergence (residual targets for steady; statistically periodic forces for unsteady); no divergence. On error: agent reads the log, diagnoses, proposes a concrete fix; orchestrator routes to stage 4 or 3 |
 | 6 | **Analyst** | Quantities of interest, plots, interpretation | All quantities computed with tools; mass-balance and convergence checks; physical plausibility checks (no reference data, see §9.2) |
@@ -206,6 +206,8 @@ cfdagent logs <run-id> [--follow]
 cfdagent list
 cfdagent bench --cases <all|names> --repeats N --models a,b
 ```
+`cfdagent bench` is not built in M3 (ADR-0010).
+
 The CLI is a thin layer over a core API (`run_task(task, config) -> RunResult`). No logic lives in the CLI, so IssueOps, a web UI or remote submission can call the same core later.
 
 A run survives SSH disconnects (`--detach`, re-attach via `logs --follow`).
@@ -281,15 +283,15 @@ A second set of tasks, of **flow types the system never saw during development**
 | *Optional:* differentially heated square cavity (natural convection, other physics and solver) | de Vahl Davis (1983) | Mean Nusselt number, maximum velocities, for Ra = 10³–10⁵ |
 
 Rules:
-- The **owner writes these tasks in the owner's own words**. Reference data and acceptance criteria are prepared by `cfd-reviewer` in M2.
+- The **owner writes these tasks in the owner's own words**. Reference data and acceptance criteria are prepared by `cfd-reviewer` in M2 (done at the start of M3, after the freeze; ADR-0010).
 - **No generality task is run before the frozen release** (§9.2). Nothing learned from them can flow back into prompts or code.
 - The set may also include new variants of the development families (e.g. cavity Re = 400, cylinder Re = 40) written by the owner.
 
 ### 9.2 Evaluation protocol **[Claude's call]**
 - **Blind evaluation.** No agent can read benchmark reference data or acceptance criteria during a run (they are not mounted in the executor sandbox and not in the knowledge base). Comparison happens only in the deterministic Scorer after the Critic's final verdict. Otherwise the system could iterate until it matched the reference, inflating the success rate.
-- **Headline metric:** **benchmark success rate** = share of runs that pass the deterministic acceptance criteria. Secondary metrics: error vs. reference, Critic verdict, Critic accuracy (agreement of Critic verdict with Scorer result — itself a finding), attempts per stage, failure stage taxonomy, tokens, cost, wall time.
+- **Headline metric:** **benchmark success rate** = share of runs that pass the deterministic acceptance criteria. Secondary metrics: error vs. reference, Critic verdict, Critic accuracy (agreement of Critic verdict with Scorer result — itself a finding), attempts per stage, failure stage taxonomy, tokens, cost, wall time. For M3, ADR-0010 replaces the success rate with a table of single observations.
 - **No models are trained or fine-tuned.** During development the system is debugged on the development tasks (§9); every fix obeys the generality rule (§6.3).
-- **Frozen release for M3.** Before the campaign, prompts, knowledge notes, image and configuration are frozen as a tagged release (e.g. `v1.0.0`); every M3 run records that tag. No code or prompt changes during the campaign. Results are reported separately for the development tasks and the generality test set (§9.1); the generality result is the main evidence for the hypothesis.
+- **Frozen release for M3.** Before the campaign, prompts, knowledge notes, image and configuration are frozen as a tagged release (e.g. `v1.0.0`); every M3 run records that tag. No code or prompt changes during the campaign. The one exception is the repair of a run that a defect of the pipeline's own code made invalid, under a new tag. The owner may change the money limits (cost cap, campaign budget); each change is recorded, and a cap at the command line's maximum can only be lowered (ADR-0010). Results are reported separately for the development tasks and the generality test set (§9.1); the generality result is the main evidence for the hypothesis.
 
 ## 10. Local development agents (Claude Code)
 
@@ -314,7 +316,7 @@ Other Claude Code files:
 
 ## 11. Research documentation and report
 
-- Sources: journal + ADRs (build process), run records and `cfdagent bench` statistics (experiments, collected automatically), this design document.
+- Sources: journal + ADRs (build process), run records and the campaign table (ADR-0010) (experiments, collected automatically), this design document.
 - `report-writer` process:
   1. **Material inventory** — what exists and **what is missing** (e.g. missing model comparison), so experiments can still be added.
   2. **General outline** — chapters, one-sentence purpose and key message each, proposed length → owner approval.
@@ -332,7 +334,7 @@ Other Claude Code files:
 | **M0 Foundations** | Repo, CI, Docker image (OpenFOAM ESI + Gmsh + CadQuery + Python stack), Bicep infra, LLM capability spike (§6.4) **run for the candidate models (gpt-oss-120b and Llama-3.3-70B-Instruct tested; qwen3-32b not deployable and excluded, see ADR-0002)**, benchmark references and thresholds fixed | Cavity passes CadQuery → Gmsh → OpenFOAM → post-processing **from hand-written scripts, no LLM**, locally and on the VM |
 | **M1 First autonomous run** | Orchestrator, agents 1–6, CLI, Blob upload, run record | Cavity Re = 100 from text to results with no human intervention |
 | **M2 Robustness + full benchmark set** | Fix loops, Critic, Scorer, knowledge base; generality test set prepared (owner's task texts, references, criteria) but **not run** | Pipe and cylinder (Re 20, Re 100) pass |
-| **M3 Experiment campaign** | Frozen release; `cfdagent bench`; first runs of the generality test set; matrix in §14.1 | Statistics ready for the report |
+| **M3 Experiment campaign** | Fixes; frozen release; one run of each development benchmark and one or two generality tests on gpt-5.4 (ADR-0010) | A table of observations, one row per run, ready for the report |
 | **M4 Report** | §11 process | PDF approved by the owner |
 
 ## 13. Growth path (not in scope now)
@@ -353,6 +355,8 @@ Other Claude Code files:
 - Runtime estimate per run (Claude's estimate, to be measured in M1): cavity minutes; pipe 10–30 min; cylinder Re = 100 (unsteady, ~20 shedding periods) ≈ 20–40 min; plus LLM time.
 
 ### 14.1 M3 experiment matrix **[Claude's call, accepted by the owner 2026-10-28]**
+Replaced by ADR-0010: M3 is one run per development benchmark and one or two generality tests on gpt-5.4. The matrix below is kept as the original plan.
+
 Priority order — lower rows are dropped first if money or time runs short:
 1. **gpt-oss-120b, reasoning medium:** all 5 development variants + the generality test set (3–4 tasks), 5 repeats each.
 2. **Model comparison:** Llama-3.3-70B only on a subset (cavity Re 100, cylinder Re 20, one generality task), 3 repeats. `qwen3-32b` is excluded (owner decision 2026-10-29, see ADR-0002).
@@ -366,10 +370,12 @@ The optional heated-cavity task is the first thing dropped inside row 1. Estimat
 | Phase | Envelope |
 |---|---|
 | M0–M2 development | ≤ $30 (raised to ≤ $35 by the owner on 2026-11-14, see the note below) |
-| M3 campaign | ≤ $45 |
+| M3 campaign | ≤ $45 (raised to about $60 by the owner on 2026-11-27, see the note below) |
 | Reserve | ≈ $25, never spent without a separate owner decision |
 
 Note, 2026-11-14: the owner raised the M0–M2 envelope from $30 to $35, taking $5 from the reserve (about $20 left). The table keeps the original figure; the M2 plan's budget section gives the reason.
+
+Note, 2026-11-27: the owner raised the M3 envelope from $45 to about $60, taking about $15 from the reserve (about $5 left), and set for the gpt-5.4 campaign a per-run cost cap of $10 and a budget of $50 of tracked model cost. The table keeps the original figure; ADR-0010 and the M3 plan's budget section give the details.
 
 - Inside an approved envelope, starting/stopping the VM and running tests/benchmarks need no per-action approval.
 - **Standing approval (owner's decision, 2026-11-14, replaces the earlier rule that creating or changing Azure resources always needs approval):** inside `rg-cfdagent` and the envelope, `az` commands including create, update, delete, role assignments and Bicep deployments run without per-command approval. The main session announces the task in chat first (what is done, with the cost estimate) and then works without further questions. Still needing explicit approval: anything outside `rg-cfdagent` or at subscription or Entra level, deleting the resource group, the storage account or the `runs` container, any task or campaign estimated above $5, and anything that would exceed the envelope.
