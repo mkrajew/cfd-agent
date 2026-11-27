@@ -291,7 +291,7 @@ Rules:
 - **Blind evaluation.** No agent can read benchmark reference data or acceptance criteria during a run (they are not mounted in the executor sandbox and not in the knowledge base). Comparison happens only in the deterministic Scorer after the Critic's final verdict. Otherwise the system could iterate until it matched the reference, inflating the success rate.
 - **Headline metric:** **benchmark success rate** = share of runs that pass the deterministic acceptance criteria. Secondary metrics: error vs. reference, Critic verdict, Critic accuracy (agreement of Critic verdict with Scorer result — itself a finding), attempts per stage, failure stage taxonomy, tokens, cost, wall time. For M3, ADR-0010 replaces the success rate with a table of single observations.
 - **No models are trained or fine-tuned.** During development the system is debugged on the development tasks (§9); every fix obeys the generality rule (§6.3).
-- **Frozen release for M3.** Before the campaign, prompts, knowledge notes, image and configuration are frozen as a tagged release (e.g. `v1.0.0`); every M3 run records that tag. No code or prompt changes during the campaign. The one exception is the repair of a run that a defect of the pipeline's own code made invalid, under a new tag. The owner may change the money limits (cost cap, campaign budget); each change is recorded (ADR-0010). Results are reported separately for the development tasks and the generality test set (§9.1); the generality result is the main evidence for the hypothesis.
+- **Frozen release for M3.** Before the campaign, prompts, knowledge notes, image and configuration are frozen as a tagged release (e.g. `v1.0.0`); every M3 run records that tag. No code or prompt changes during the campaign. The one exception is the repair of a run that a defect of the pipeline's own code made invalid, under a new tag. The owner may change the money limits (cost cap, campaign budget); each change is recorded, and a cap at the command line's maximum can only be lowered (ADR-0010). Results are reported separately for the development tasks and the generality test set (§9.1); the generality result is the main evidence for the hypothesis.
 
 ## 10. Local development agents (Claude Code)
 
@@ -370,7 +370,7 @@ The optional heated-cavity task is the first thing dropped inside row 1. Estimat
 | Phase | Envelope |
 |---|---|
 | M0–M2 development | ≤ $30 (raised to ≤ $35 by the owner on 2026-11-14, see the note below) |
-| M3 campaign | ≤ $45 |
+| M3 campaign | ≤ $45 (raised to about $60 by the owner on 2026-11-27, see the note below) |
 | Reserve | ≈ $25, never spent without a separate owner decision |
 
 Note, 2026-11-14: the owner raised the M0–M2 envelope from $30 to $35, taking $5 from the reserve (about $20 left). The table keeps the original figure; the M2 plan's budget section gives the reason.
